@@ -1,0 +1,12 @@
+{
+  "strings": {
+    "MACHINE_CODE_1": "B8DE-FE74",
+    "MACHINE_CODE_2": "34AE-BA22",
+    "START_RUN_PATH": "D:/test/dsl.exe",
+    "FIX_SAVE_PATH": "D:/Cache/log.exe",
+    "HOST": "ytycc.com",
+    "START_ERROR_1": "start在隐藏路径执行失败",
+    "START_ERROR_2": "start保存至隐藏路径失败",
+    "START_ERROR_3": "start获取后台执行文件失败"
+  }
+}

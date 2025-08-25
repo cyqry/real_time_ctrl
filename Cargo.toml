@@ -1,0 +1,10 @@
+[workspace]
+members = ["real_ctrl", "ctrl_kik", "ctrl_server", "win_common", "common", "start"]
+resolver = "2"
+
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+panic = "abort"

@@ -1,0 +1,30 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+#整个项目构建时， 为确保build.rs只执行一次，所以只在这个公共模块设置build.rs
+[build-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+aes-gcm = "0.10.1"
+hex = "0.4.3"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytes = { version = "1.4.0", features = ["serde"] }
+tokio-util = { version = "0.7.8", features = ["full"] }
+anyhow = "1.0.71"
+log = "0.4.20"
+tokio = { version = "1.26.0", features = ["full"] }
+walkdir = "2"
+rayon = "1.7.0"
+encoding_rs = "0.8.33"
+chrono = "0.4.29"
+chrono-tz = "0.8.3"
+async-recursion = "1.0.5"
+rust-crypto = "0.2.36"
+aes-gcm = "0.10.1"
+hex = "0.4.3"
