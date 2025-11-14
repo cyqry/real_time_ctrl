@@ -2,7 +2,7 @@ pipeline {
 	// 使用 Docker 代理而不是任意代理
     agent {
 		docker {
-			image 'rust:1-slim-buster' // 使用官方 Rust 镜像
+			image 'rust:1.80-bookworm' // 使用官方 Rust 镜像
             reuseNode true // 重用工作空间，避免文件复制
              // 会默认使用与宿主机 jenkins服务 相同用户的 UID/GID(可以使用 id jenkins 获得)来运行docker
              // 工作空间是docker内部的工作空间， 这里要保证的是宿主机 jenkins服务用户对/var/cache/cargo的所有权

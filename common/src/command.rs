@@ -176,6 +176,7 @@ impl FromStr for Command {
                     let save_path = save_path.trim_matches('"').to_string();
                     Ok(Command::Ctrl(Screen(save_path)))
                 }
+                #[cfg(target_os = "windows")]
                 ["screen"] => {
                     Ok(Command::Ctrl(Screen(DEFAULT_SCREEN_PATH.to_string())))
                 }
