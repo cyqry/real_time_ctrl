@@ -40,6 +40,7 @@ impl Context {
             now_cmd_id: Arc::new(RwLock::new(None)),
             kik_op: Arc::new(RwLock::new(None)),
             kik_map: Arc::new(RwLock::new(HashMap::new())),
+            kik_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -211,7 +212,7 @@ impl Context {
     }
 
 
-    pub(crate) fn set_kik_state(&self) -> _ {
+    pub(crate) fn set_kik_state(&self) {
         todo!()
     }
 }

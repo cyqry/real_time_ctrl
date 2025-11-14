@@ -121,7 +121,7 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
         ChannelType::Kik => {
             // kik连接的id直接是kikid
             let id = channel.clone().lock().await.get_id().to_string();
-            let id = context.set_kik_state();
+            context.set_kik_state();
             // 因为Kik连接断开了，所以万一在被控制，需要清理
             let _ = context.delete_kik_conn_if_id(id.as_str()).await;
         }
