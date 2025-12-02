@@ -1,0 +1,17 @@
+FROM rust:1.80-alpine
+
+# 安装必要的工具
+RUN apk add --no-cache \
+    openssh-client \
+    musl-dev
+
+# Musl 目标已经可用，无需额外安装
+# RUN rustup target add x86_64-unknown-linux-musl
+
+ARG USER_ID=117
+ARG GROUP_ID=123
+
+# Alpine 使用 busybox，useradd 语法略有不同
+RUN addgroup -g $GROUP_ID jenkinsgroup && \
+    adduser -D -u $USER_ID -G jenkinsgroup -s /bin/bash jenkins-docker
+CMD ["sh"]

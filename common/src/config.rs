@@ -1,11 +1,14 @@
 use crate::auth_util;
 use std::string::ToString;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Config {
     pub id: Id,
     pub server_host: String,
     pub server_port: String,
+    pub read_timeout: Duration,
+    pub write_timeout: Duration,
 }
 
 #[derive(Clone)]

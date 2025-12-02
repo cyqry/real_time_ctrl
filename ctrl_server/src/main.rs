@@ -1,11 +1,11 @@
-use crate::context::Context;
+use core::context::Context;
 use common::config::{Config, Id};
 use std::env;
+use std::time::Duration;
 use core::server;
 
-mod context;
-mod read_handle;
 mod core;
+mod handler;
 
 #[tokio::main]
 async fn main() {
@@ -20,6 +20,8 @@ async fn main() {
             },
             server_host: "0.0.0.0".to_string(),
             server_port: "9002".to_string(),
+            read_timeout: Duration::from_secs(45),
+            write_timeout: Duration::from_secs(45),
         },
     )
     .await

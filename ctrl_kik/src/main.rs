@@ -1,17 +1,15 @@
-#![windows_subsystem = "windows"]  //此宏不打开窗口，同时print也失效
-
+#![windows_subsystem = "windows"] //此宏不打开窗口，同时print也失效
 
 use crate::context::Context;
 use common::config::{Config, Id};
+use common::file_util::get_dir_size;
+use common::generated::encrypted_strings;
 use log::debug;
 use std::env;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::{join, time};
-use common::file_util::get_dir_size;
-use common::generated::encrypted_strings;
-
 
 mod cmd_runner;
 mod cmd_util;
@@ -21,11 +19,10 @@ mod kik_data_conn;
 mod read_handle;
 mod screen;
 
-
 #[tokio::test]
 async fn test() {
     use common::file_util;
-    use common::time_util::{Timer, self, TimeUnit};
+    use common::time_util::{self, TimeUnit, Timer};
     use std::time::Duration;
     use time_util::*;
     // let start = Instant::now();
@@ -37,7 +34,6 @@ async fn test() {
     println!("{}", file_util::get_dir_size(r"E:\D\").await.unwrap());
     println!("Elapsed time: {} ms", timer.elapsed(TimeUnit::Milliseconds));
 }
-
 
 #[tokio::main]
 async fn main() {
@@ -53,6 +49,8 @@ async fn main() {
         },
         server_host: "ytycc.com".to_string(),
         server_port: "9002".to_string(),
+        read_timeout: Duration::from_secs(45),
+        write_timeout: Duration::from_secs(45),
     };
 
     loop {

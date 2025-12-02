@@ -1,5 +1,5 @@
-use crate::context::Context;
-use crate::read_handle;
+use crate::core::context::Context;
+use crate::handler::read_handle;
 use anyhow::Error;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
@@ -55,7 +55,7 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, addr
 
     let e = loop {
         match timeout(
-            Duration::from_secs(45),
+            config.read_timeout,
             framed_arc.clone().lock().await.next(),
         )
         .await

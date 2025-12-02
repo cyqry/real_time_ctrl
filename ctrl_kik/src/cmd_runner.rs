@@ -108,7 +108,7 @@ pub async fn run(context: &Context, cmd: Command) -> Resp {
                 }
             })
         }
-        _ => Resp::Info("系统有问题，不支持该类型消息".to_string()),
+        _ => Resp::Info("暂不支持该类型消息".to_string()),
     }
 }
 

@@ -6,6 +6,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use common::generated::encrypted_strings;
 
@@ -31,6 +32,8 @@ async fn main() {
             },
             server_host: "ytycc.com".to_string(),
             server_port: "9002".to_string(),
+            read_timeout: Duration::from_secs(45),
+            write_timeout: Duration::from_secs(45),
         })
             .await
             .unwrap(),
