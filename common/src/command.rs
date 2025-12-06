@@ -103,9 +103,15 @@ impl BufSerializable for Command {
     }
 
     fn from_buf(mut bys: BytesMut) -> Option<Self> {
+        if bys.is_empty() {
+            return None;
+        }
         let first_code = bys.get_u8();
         match first_code {
             0 => {
+                if bys.is_empty() {
+                    return None;
+                }
                 let second_code = bys.get_u8();
                 match second_code {
                     0 => Some(Command::Sys(List)),
@@ -115,10 +121,19 @@ impl BufSerializable for Command {
                 }
             }
             1 => {
+                if bys.is_empty() {
+                    return None;
+                }
                 let second_code = bys.get_u8();
                 match second_code {
                     0 => {
+                        if bys.len() < 4 {
+                            return None;
+                        }
                         let src_len = bys.get_u32();
+                        if bys.len() < src_len as usize {
+                            return None;
+                        }
                         let src = bys.split_to(src_len as usize);
                         Some(Command::Ctrl(GetFile(
                             String::from_utf8(src.to_vec()).ok()?,
@@ -126,7 +141,13 @@ impl BufSerializable for Command {
                         )))
                     }
                     1 => {
+                        if bys.len() < 4 {
+                            return None;
+                        }
                         let src_len = bys.get_u32();
+                        if bys.len() < src_len as usize {
+                            return None;
+                        }
                         let src = bys.split_to(src_len as usize);
                         Some(Command::Ctrl(GetBigFile(
                             String::from_utf8(src.to_vec()).ok()?,
@@ -134,7 +155,13 @@ impl BufSerializable for Command {
                         )))
                     }
                     2 => {
+                        if bys.len() < 4 {
+                            return None;
+                        }
                         let src_len = bys.get_u32();
+                        if bys.len() < src_len as usize {
+                            return None;
+                        }
                         let src = bys.split_to(src_len as usize);
                         Some(Command::Ctrl(SetFile(
                             String::from_utf8(src.to_vec()).ok()?,
@@ -221,6 +248,9 @@ fn unknown<T>(s: &str) -> anyhow::Result<T> {
 
 #[test]
 fn test() {
+    println!("{}", (0 as *mut String).is_null()); //true
+    // let x = 0x10 as *mut String;
+    // unsafe { println!("{}", *x); }
     let parts: Vec<&str> = "etst est".split_ascii_whitespace().collect();
     let c: Command = "$ls sdfsdf -r".parse().unwrap();
     println!("{:?}", c);

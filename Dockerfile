@@ -1,5 +1,5 @@
-#docker build -t rust-1.80-mine /home
-FROM rust:1.80-bookworm
+#docker build -t rust-1.90-mine /home
+FROM rust:1.90-bookworm
 # 可以使用rust:1.80-alpine默认musl，但是下面命令的语法可能要变
 
 # 安装必要的工具（单行写法）

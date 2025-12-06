@@ -15,6 +15,8 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
+use common::command::Command;
+use crate::read_handle;
 
 #[derive(Clone)]
 pub struct Context {
@@ -24,23 +26,27 @@ pub struct Context {
 }
 
 #[derive(Clone)]
-struct DataChan {
+pub struct DataChan {
     tx: Sender<(String, BytesMut)>,
     rx: Arc<Mutex<Receiver<(String, BytesMut)>>>,
     //原子引用， 当前正在等待的id
-    wait_data: Arc<Mutex<*mut String>>,
+    wait_data: Arc<Mutex<usize>>,
 }
+
+
 
 impl Context {
     pub fn new() -> Self {
         let (tx, rx) = channel(5);
+        let rx = Arc::new(Mutex::new(rx));
+
         Context {
             id: Arc::new(Mutex::new(None)),
             kik_op: Arc::new(Mutex::new(None)),
             data_x: DataChan {
                 tx,
-                rx: Arc::new(Mutex::new(rx)),
-                wait_data: Arc::new(Mutex::new(null_mut())),
+                rx,
+                wait_data: Arc::new(Mutex::new(0)),
             },
         }
     }
@@ -48,22 +54,31 @@ impl Context {
         *(self.kik_op.clone().lock().await) = kik_op;
     }
     pub async fn send_data(&self, op: (String, BytesMut)) -> anyhow::Result<()> {
+
+        //只在 确为当前在等数据 或者 当前无在等数据时，可以写入此数据
         let can_send = unsafe {
-            let wait = self.data_x.wait_data.clone().lock().await;
-            !wait.is_null() && **wait.as_ref().unwrap() == op.0
+            let wait = self.data_x.wait_data.lock().await;
+            wait.eq(&0) || *((*wait) as *mut String).as_ref().unwrap() == op.0
         };
         if can_send {
-            Ok(self.data_x.tx.send(op).await?)
+            Ok(self.data_x.tx.send(op).await.expect("不可能没有读者!"))
         } else {
             //直接丢弃
-            Ok(())
+           Err(anyhow!("正在读"))
         }
     }
+
     pub async fn read_data(&self, key: String) -> anyhow::Result<BytesMut> {
         let wait_data_arc = self.data_x.wait_data.clone();
-        let key_ptr = Box::into_raw(Box::new(key));
-
-        *(wait_data_arc.clone().lock().await) = key_ptr;
+        
+  
+       let uint = {
+           //.await之前不能存在非Send的类型，所以这里需要将key_ptr销毁
+            let key_ptr = Box::into_raw(Box::new(key));
+           key_ptr as usize
+       };
+        //不想复制一份key，所以用原始指针
+        *(wait_data_arc.clone().lock().await) = uint;
 
         let ret = timeout(Duration::from_secs(360), async {
             loop {
@@ -75,7 +90,7 @@ impl Context {
 
                 //这里可以安全的无锁访问
                 unsafe {
-                    if k == *key_ptr {
+                    if k == *(uint as *mut String) {
                         return Ok(data);
                     }
                 }
@@ -86,11 +101,11 @@ impl Context {
 
         //确保这一步最后要执行
         unsafe {
-            //这里锁住，不会发生 另一个线程取原始指针内容 却取到已释放内容的问题
-            let ptr = wait_data_arc.clone().lock().await;
+            //锁住，使得这里不会发生 另一个线程取原始指针内容 却取到已释放内容的问题
+            let mut ptr = wait_data_arc.lock().await;
             // 回收内存
-            let _ = Box::from_raw(*ptr);
-            *ptr = null_mut();
+            let _ = Box::from_raw(*ptr as *mut String);
+            *ptr = 0;
         }
         ret?
     }

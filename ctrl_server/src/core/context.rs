@@ -128,6 +128,17 @@ impl Context {
             }
         };
     }
+    
+    
+    pub async fn clear_all_ctrl_data(&self) {
+        match *(self.ctrl_op.clone().write().await) {
+            None => {}
+            Some((ref _ctrl_conn, ref mut data_conns)) => {
+                data_conns.clear();
+            }
+        };
+    } 
+    
     pub async fn insert_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
         match *(self.ctrl_op.clone().write().await) {
             None => {}

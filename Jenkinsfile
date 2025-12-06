@@ -6,7 +6,7 @@ pipeline {
 	// docker run -u 指定用户id ，那么这里运行的容器内已uid为指定uid的用户运行，docker容器内要预先创建好这个uid的用户否则的话只有uid没有名字， 容器内程序若在挂载的目录创建文件或文件夹，在宿主机上的所属用户的uid等同于-u指定的用户id
     agent {
 		docker {
-			image 'rust-1.80-mine' // 使用官方 Rust 镜像
+			image 'rust-1.90-mine' // 使用 Rust 镜像
             reuseNode true // 重用工作空间，避免文件复制
              // 会默认使用与宿主机 jenkins服务 相同用户的 UID/GID(可以使用 id jenkins 获得)来运行docker
              // 工作空间是docker内部的工作空间， 这里要保证的是宿主机 jenkins服务用户对/var/cache/cargo的所有权 (使用chown -R jenkins /var/cache/cargo 将目录所有权改为jenkins)， 还要保证在docker容器内对应的用户 最好是${CARGO_PATH}整个目录的所有者

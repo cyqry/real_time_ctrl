@@ -369,6 +369,7 @@ pub async fn handle_init_message(
                     Some(old) => {
                         // 旧的ctrl关掉
                         old.lock().await.try_write_half_close().await;
+                        context.clear_all_ctrl_data().await;
                     }
                 };
                 //写回一个ctrl连接校验确认帧
@@ -389,27 +390,27 @@ pub async fn handle_init_message(
                         Frame::CtrlAuthReply(false).to_buf(),
                     ))
                     .await?;
-                time::sleep(Duration::from_secs(2)).await;
+                // time::sleep(Duration::from_secs(2)).await;
                 return Err(anyhow::Error::msg("校验失败"));
             }
         }
         Frame::CtrlDataConnReq(s) => {
             if s == config.id.encrypt() {
-                if context.exist_ctrl().await {
-                    context.insert_ctrl_data_conn(channel.clone()).await;
-                    channel.clone().lock().await.channel_type = ChannelType::CtrlData;
-                    //写回一个ctrl data 连接校验的确认帧
-                    channel
-                        .clone()
-                        .lock()
-                        .await
-                        .write_and_flush(&protocol::transfer_encode(
-                            Frame::CtrlDataConnAuthReply(true).to_buf(),
-                        ))
-                        .await?;
-                } else {
-                    return Err(anyhow::Error::msg("没有控制者却来了控制者数据连接"));
+                if !context.exist_ctrl().await {
+                    return Err(anyhow::Error::msg("没有此控制者，或者该控制连接已断开"));
                 }
+
+                channel.clone().lock().await.channel_type = ChannelType::CtrlData;
+                context.insert_ctrl_data_conn(channel.clone()).await;
+                //写回一个ctrl data 连接校验的确认帧
+                channel
+                    .clone()
+                    .lock()
+                    .await
+                    .write_and_flush(&protocol::transfer_encode(
+                        Frame::CtrlDataConnAuthReply(true).to_buf(),
+                    ))
+                    .await?;
             } else {
                 channel
                     .clone()
@@ -419,7 +420,7 @@ pub async fn handle_init_message(
                         Frame::CtrlDataConnAuthReply(false).to_buf(),
                     ))
                     .await?;
-                time::sleep(Duration::from_secs(2)).await;
+                // time::sleep(Duration::from_secs(2)).await;
                 return Err(anyhow::Error::msg("数据连接校验失败"));
             }
         }
@@ -439,10 +440,10 @@ pub async fn handle_init_message(
                     let kik = Kik::new(id.as_str(), kik_info.name.as_str(), channel.clone());
                     context
                         .kik_map
-                        .clone()
                         .write()
                         .await
                         .insert(id.clone(), kik.clone());
+                    push_event().await;
                     kik
                 }
                 //重连
@@ -450,7 +451,7 @@ pub async fn handle_init_message(
                     {
                         let arc = channel.clone();
                         let mut guard = arc.lock().await;
-                        //用人家带过来的id
+                        //用人家带过来的id，覆盖自动生成的
                         guard.set_id(id.clone());
                         guard.channel_type = ChannelType::Kik;
                     }
@@ -464,7 +465,7 @@ pub async fn handle_init_message(
                             kik
                         }
                         Some(kik) => {
-                            //有旧的就删了
+                            //有旧的连接就删了
                             match kik.set_kik_conn(channel.clone()).await {
                                 None => {}
                                 Some(old) => {
@@ -504,7 +505,6 @@ pub async fn handle_init_message(
         Frame::KikDataConnReq(id) => {
             // kikdata 连接的 kik_id在attr中
             channel
-                .clone()
                 .lock()
                 .await
                 .put("kik_id".to_string(), id.clone());
@@ -514,10 +514,9 @@ pub async fn handle_init_message(
                 }
                 Some(kik) => {
                     kik.insert_data_conn(channel.clone()).await;
-                    channel.clone().lock().await.channel_type = ChannelType::KikData;
+                    channel.lock().await.channel_type = ChannelType::KikData;
                     //将 kik id返回表示成功
                     channel
-                        .clone()
                         .lock()
                         .await
                         .write_and_flush(&protocol::transfer_encode(Frame::KikId(id).to_buf()))
@@ -537,4 +536,8 @@ pub async fn handle_init_message(
         }
     }
     Ok(())
+}
+
+async fn push_event() {
+    //todo 上线事件
 }

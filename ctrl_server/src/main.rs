@@ -1,10 +1,8 @@
 use core::context::Context;
 use common::config::{Config, Id};
 use std::{env, panic, thread};
-use std::backtrace::Backtrace;
 use std::time::Duration;
 use log::{debug, error, info, warn};
-use tracing_log::LogTracer;
 use core::server;
 
 mod core;

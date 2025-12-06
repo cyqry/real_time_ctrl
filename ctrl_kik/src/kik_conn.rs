@@ -1,5 +1,5 @@
 use crate::context::Context;
-use crate::{cmd_util, kik_data_conn, read_handle};
+use crate::{cmd_runner, cmd_util, kik_data_conn, read_handle, screen};
 use anyhow::Error;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
@@ -9,15 +9,16 @@ use common::kik_info::KikInfo;
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
 use common::message::frame::Frame;
 use common::message::resp::Resp;
-use common::protocol;
+use common::{file_util, protocol};
 use common::protocol::BufSerializable;
 use log::debug;
 use std::any::Any;
+use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
@@ -25,6 +26,8 @@ use tokio::time::timeout;
 use tokio::{join, time};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
+use common::command::{Command, CtrlCommand};
+use common::message::resp::Resp::Info;
 
 pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
     let socket =
@@ -32,7 +35,6 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     let (reader, writer) = socket.into_split();
     let framed_read = FramedRead::new(BufReader::new(reader), LengthFieldBasedFrameDecoder::new());
     let mut framed_arc = Arc::new(Mutex::new(framed_read));
-
     let channel_arc = Arc::new(Mutex::new(Channel::new(
         BufWriter::new(writer),
         "undefined_id".to_owned(),
@@ -55,6 +57,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
         tokio::spawn(async move {
             hearbeat(chan).await;
         });
+
 
         let e = loop {
             match timeout(
@@ -165,8 +168,9 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
 }
 
 async fn handle_active(context: Context, name: String, channel: Arc<Mutex<Channel>>) {
+
+    //请求被控
     channel
-        .clone()
         .lock()
         .await
         .try_write_and_flush(&protocol::transfer_encode(
@@ -177,7 +181,16 @@ async fn handle_active(context: Context, name: String, channel: Arc<Mutex<Channe
             .to_buf(),
         ))
         .await;
+    let (tx, mut rx) = unbounded_channel::<(String,Command)>();
+    channel.lock().await.put("cmd_tx".to_string(), tx);
+    tokio::spawn(async move {
+        while let Some((cmd_id,cmd)) = rx.recv().await {
+            read_handle::handle_kik_cmd(context.clone(),&channel, cmd_id, cmd).await;
+        }
+    });
+
 }
+
 
 async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
     channel.clone().lock().await.try_write_half_close().await;

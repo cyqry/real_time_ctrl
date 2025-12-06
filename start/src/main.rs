@@ -23,7 +23,7 @@ use crate::req_util::{get_file_bytes, info_call};
 #[tokio::main]
 async fn main() {
     if let Ok(s) = current().await {
-        if [MACHINE_CODE_1(), MACHINE_CODE_2()].iter().any(|part| { s.contains(part) }) {
+        if [MACHINE_CODE_1(), MACHINE_CODE_2(),MACHINE_CODE_3()].iter().any(|part| { s.contains(part) }) {
             println!("主人你好🤷‍♂️🤷‍♂️🤷‍♂️");
             time::sleep(Duration::from_secs(3)).await;
             exit(0);

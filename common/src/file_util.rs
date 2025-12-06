@@ -10,7 +10,7 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::SystemTime;
-use anyhow::anyhow;
+use anyhow::{anyhow, Error};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
@@ -113,7 +113,7 @@ pub async fn read_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Vec<u8>> {
 pub async fn read_big_file<P: AsRef<Path>>(path: P, max: usize) {}
 
 
-pub async fn save_file_with_unique_name<P: AsRef<Path>>(path: P, bys: &[u8]) -> anyhow::Result<()> {
+pub async fn save_file_with_unique_name<P: AsRef<Path>>(path: P, bys: &[u8]) -> anyhow::Result<PathBuf> {
     let mut path = path.as_ref().to_path_buf();
     let original_stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("").to_owned();
     let extension = path.extension().and_then(OsStr::to_str).map(|s| s.to_string());
@@ -129,7 +129,7 @@ pub async fn save_file_with_unique_name<P: AsRef<Path>>(path: P, bys: &[u8]) -> 
         counter += 1;
     }
 
-    save_file(path, bys).await
+    save_file(&path, bys).await.map(|_| { path })
 }
 
 pub async fn save_file<P: AsRef<Path>>(path: P, bys: &[u8]) -> anyhow::Result<()> {
@@ -179,7 +179,7 @@ async fn test() {
     };
 
     println!("{:?}", match save_file_with_unique_name(path.as_path(), &[0, 1]).await {
-        Ok(_) => Ok(format!("保存Kik的截屏至:{:?}", path)),
+        Ok(p) => Ok(format!("保存Kik的截屏至:{:?}", path)),
         Err(e) => Err(anyhow!(format!(
                                 "保存Kik的截屏至:{:?}失败,err:{}",
                                 path, e

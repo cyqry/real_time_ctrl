@@ -2,14 +2,12 @@
 
 use crate::context::Context;
 use common::config::{Config, Id};
-use common::file_util::get_dir_size;
-use common::generated::encrypted_strings;
 use log::debug;
-use std::env;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::{join, time};
+use common::generated::encrypted_strings::*;
 
 mod cmd_runner;
 mod cmd_util;
@@ -40,15 +38,15 @@ async fn main() {
     // env::set_var("RUST_LOG", "DEBUG");
     env_logger::init();
     //此lock在程序结束时会被操作系统回收，所以无需担心是否释放
-    let _ = single("D:\\Strawberry\\licenses.txt").await;
+    let _ = single(LOCK_FILE_PATH()).await;
     let context = Context::new();
     let config = Config {
         id: Id {
             username: "".to_string(),
             password: "".to_string(),
         },
-        server_host: "ytycc.com".to_string(),
-        server_port: "9002".to_string(),
+        server_host: HOST(),
+        server_port: PORT(),
         read_timeout: Duration::from_secs(45),
         write_timeout: Duration::from_secs(45),
     };

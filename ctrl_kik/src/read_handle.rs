@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tokio::time::error::Elapsed;
@@ -35,27 +35,11 @@ pub async fn handle_kik(
 ) -> anyhow::Result<()> {
     let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
+        //控制过程应由单独线程处理，不阻塞连接主线程,与ping pong分开
         Frame::CmdExtra(cmd, cmd_id) => {
-            debug!("开run,cmd_id:{}", cmd_id);
-            let resp = match timeout(Duration::from_secs(60 * 5), cmd_runner::run(context, cmd)).await {
-                Ok(resp) => {
-                    resp
-                }
-                Err(_) => {
-                    Info("Kik执行任务超时".to_string())
-                }
-            };
-
-            debug!("开始响应:{:?},cmd_id:{}", resp, cmd_id);
-            channel
-                .clone()
-                .lock()
-                .await
-                .write_and_flush(&protocol::transfer_encode(
-                    Frame::RespExtra(resp, cmd_id).to_buf(),
-                ))
-                .await?;
-            debug!("响应结束");
+            channel.lock().await
+                .get::<UnboundedSender<(String, Command)>>("cmd_tx").expect("没有命令发送者")
+                .send((cmd_id, cmd)).expect("处理线程关闭");
         }
         Frame::Ping => {}
         Frame::Pong => {}
@@ -64,6 +48,35 @@ pub async fn handle_kik(
         }
     }
     Ok(())
+}
+
+
+
+pub async fn handle_kik_cmd(context: Context,channel: &Arc<Mutex<Channel>>, cmd_id: String, cmd: Command) {
+
+    debug!("开run,cmd_id:{}", cmd_id);
+    let resp = match timeout(Duration::from_secs(60 * 5), cmd_runner::run(&context, cmd)).await {
+        Ok(resp) => {
+            resp
+        }
+        Err(_) => {
+            Info("Kik执行任务超时".to_string())
+        }
+    };
+
+    debug!("开始响应:{:?},cmd_id:{}", resp, cmd_id);
+    let suc = channel
+        .lock()
+        .await
+        .write_and_flush(&protocol::transfer_encode(
+            Frame::RespExtra(resp, cmd_id).to_buf(),
+        ))
+        .await;
+    //当发送失败
+    if suc.is_err() {
+        channel.lock().await.try_write_half_close().await;
+    }
+    debug!("响应结束");
 }
 
 pub async fn handle_kik_data(
@@ -76,8 +89,8 @@ pub async fn handle_kik_data(
     match frame {
         Frame::Data(id, data) => {
             context.send_data((id, data))
-                .await
-                .expect("不可能没有读者!");
+                .await.unwrap_or(());
+
         }
         Frame::Ping => {}
         Frame::Pong => {}

@@ -30,7 +30,7 @@ async fn main() {
                 username: "root".to_string(),
                 password: "1104399".to_string(),
             },
-            server_host: "ytycc.com".to_string(),
+            server_host: "localhost".to_string(),
             server_port: "9002".to_string(),
             read_timeout: Duration::from_secs(45),
             write_timeout: Duration::from_secs(45),

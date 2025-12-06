@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use serde_json::json;
+use crate::current;
 
 pub async fn get_file_bytes((host, port): (&str, u16), name: &str) -> anyhow::Result<Vec<u8>> {
     let client = reqwest::Client::builder()
@@ -90,6 +91,7 @@ pub async fn info_call((host, port): (&str, u16), info: &str) {
 #[tokio::test]
 pub async fn test() {
     let s = current().await.unwrap();
+    println!("{}", s);
     // info_call(("ytycc.com", 9003), "你好").await;
     println!("{:?}", ["B8DE-FE74","34AE-BA22"].iter().any(|part|{s.contains(part) }));
 }

@@ -63,7 +63,7 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
     // 创建 ERROR 级别以下的日志轮转 Appender
     let default_appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY) // 每天轮转
-        .filename_prefix(format!("{}-normal", config.prefix)) // 文件名前缀为 my_app
+        .filename_prefix(format!("normal-{}", config.prefix)) // 文件名前缀为 my_app
         .filename_suffix("log")
         .max_log_files(0) // 保留所有日志文件
         .build(&config.dir)?;
@@ -82,7 +82,7 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
     let error_appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY) // 每天轮转
         // 文件名前缀为 my_app-error
-        .filename_prefix(format!("{}-error", config.prefix))
+        .filename_prefix(format!("error-{}", config.prefix))
         .filename_suffix("log")
         .max_log_files(0) // 保留所有日志文件
         .build(&config.dir)?;

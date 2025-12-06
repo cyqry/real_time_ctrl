@@ -77,7 +77,7 @@ pub async fn execute(context: &Context, mut cmd: CtrlCommand) -> anyhow::Result<
                                 path = path.join("1.png");
                             };
                             match file_util::save_file_with_unique_name(path.as_path(), &data).await {
-                                Ok(_) => Ok(format!("保存Kik的截屏至:{:?}", save_path)),
+                                Ok(p) => Ok(format!("保存Kik的截屏至:{:?}", p)),
                                 Err(e) => Err(anyhow!(format!(
                                 "保存Kik的截屏至:{:?}失败,err:{}",
                                 save_path, e
