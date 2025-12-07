@@ -36,8 +36,8 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     let framed_read = FramedRead::new(BufReader::new(reader), LengthFieldBasedFrameDecoder::new());
     let mut framed_arc = Arc::new(Mutex::new(framed_read));
     let channel_arc = Arc::new(Mutex::new(Channel::new(
-        BufWriter::new(writer),
-        "undefined_id".to_owned(),
+        writer,
+        None,
         ChannelType::Unknown,
     )));
 

@@ -9,13 +9,11 @@ use common::message::resp;
 use common::message::resp::Resp::{DataId, Info};
 use common::protocol;
 use common::protocol::BufSerializable;
-use log::debug;
-use std::collections::HashMap;
+use log::{debug, info};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time;
 use tokio::time::timeout;
 use uuid::Uuid;
 use common::message::resp::Resp;
@@ -443,6 +441,7 @@ pub async fn handle_init_message(
                         .write()
                         .await
                         .insert(id.clone(), kik.clone());
+                    info!("【{}】上线，ip:{}",kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
                     push_event().await;
                     kik
                 }
@@ -541,3 +540,6 @@ pub async fn handle_init_message(
 async fn push_event() {
     //todo 上线事件
 }
+
+
+

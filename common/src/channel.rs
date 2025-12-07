@@ -6,6 +6,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
@@ -26,31 +28,41 @@ pub enum ChannelType {
 
 pub struct Channel {
     pub channel_type: ChannelType,
-    uuid: String,
+    id: String,
     writer: BufWriter<OwnedWriteHalf>,
+    addr: (io::Result<SocketAddr>, io::Result<SocketAddr>),
     attr: HashMap<String, Box<dyn Any + Send + Sync>>,
     create_time: Instant,
 }
 
 impl Channel {
-    pub fn new(writer: BufWriter<OwnedWriteHalf>, uuid: String, channel_type: ChannelType) -> Self {
+    pub fn new(writer: OwnedWriteHalf, id: Option<String>, channel_type: ChannelType) -> Self {
+        
         Channel {
-            uuid,
+            id: id.unwrap_or("undefined_id".to_string()),
             channel_type,
-            writer,
+            addr: (writer.local_addr(),writer.peer_addr()),
+            writer: BufWriter::new(writer),
             attr: HashMap::new(),
             create_time: time::Instant::now(),
         }
     }
 
+    pub fn get_local_addr(&self) -> &std::io::Result<SocketAddr> {
+        &self.addr.0
+    }
+    pub fn get_peer_addr(&self) -> &std::io::Result<SocketAddr> {
+        &self.addr.1
+    }
+    
     pub fn get_id(&self) -> &str {
-        if self.uuid == "undefined_id" {
+        if self.id == "undefined_id" {
             panic!("未初始化的id被取")
         }
-        self.uuid.as_str()
+        self.id.as_str()
     }
     pub fn set_id(&mut self, id: String) {
-        self.uuid = id;
+        self.id = id;
     }
 
     pub fn get_stream_info(&self) -> String {

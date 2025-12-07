@@ -5,23 +5,18 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
-use common::message::frame::Frame;
 use common::protocol;
-use common::protocol::BufSerializable;
-use log::{debug, trace};
+use log::{debug, error, info, trace};
 use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use std::time::Duration;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time;
+use tokio::sync::{Mutex};
+use tokio::{io, time};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
-use uuid::Uuid;
 
 pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     let listener =
@@ -33,14 +28,13 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_stream(context: Context, config: Config, stream: TcpStream, addr: SocketAddr) {
+async fn handle_stream(context: Context, config: Config, stream: TcpStream, local_addr: SocketAddr) {
     let (reader, writer) = stream.into_split();
     let framed_read = FramedRead::new(BufReader::new(reader), LengthFieldBasedFrameDecoder::new());
     let framed_arc = Arc::new(Mutex::new(framed_read));
-
     let channel_arc = Arc::new(Mutex::new(Channel::new(
-        BufWriter::new(writer),
-        "undefined_id".to_owned(),
+        writer,
+        None,
         ChannelType::Unknown,
     )));
 
@@ -66,14 +60,12 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, addr
                     match handle_read(&config, &context, channel, msg).await {
                         Ok(_) => {}
                         Err(e) => {
-                            debug!("处理消息时错误,err:{}", e);
                             break Some(e);
                         }
                     }
                     continue;
                 }
                 Some(Err(e)) => {
-                    println!("连接异常:{}", e);
                     break Some(anyhow::Error::new(e));
                 }
 
@@ -82,7 +74,6 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, addr
                 }
             },
             Err(e) => {
-                println!("超时未读断开");
                 match channel.clone().lock().await.write_half_close().await {
                     Ok(_) => {}
                     Err(_) => {}
@@ -103,8 +94,15 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, addr
     });
 }
 
-async fn handle_error(c: Arc<Mutex<Channel>>, error: Error) {
-    println!("handle_error:{}", error);
+async fn handle_error(chan: Arc<Mutex<Channel>>, error: Error) {
+    let remote_addr = chan.lock().await.get_peer_addr().as_ref().map(|addr| addr.to_string()).unwrap_or("未知远程地址".to_string());
+    if error.is::<io::Error>() {
+        println!("io错误，远程地址:{}，err:{}", remote_addr, error);
+    } else if error.is::<time::error::Elapsed>() {
+        println!("读取超时，远程地址:{}", remote_addr);
+    } else {
+        error!("处理连接错误，远程地址:{}，err:{}",remote_addr , error);
+    }
 }
 
 async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
@@ -174,4 +172,17 @@ async fn handle_read(
             read_handle::handle_init_message(config, context, channel, msg).await
         }
     };
+}
+
+
+
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpStream;
+    use tokio::time::error::Elapsed;
+
+    #[test]
+    fn test(){
+    }
 }

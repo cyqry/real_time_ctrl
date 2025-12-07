@@ -29,8 +29,8 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
     let mut framed_arc = Arc::new(Mutex::new(framed_read));
 
     let channel_arc = Arc::new(Mutex::new(Channel::new(
-        BufWriter::new(writer),
-        Uuid::new_v4().to_string(),
+        writer,
+        Some(Uuid::new_v4().to_string()),
         ChannelType::Unknown,
     )));
 
