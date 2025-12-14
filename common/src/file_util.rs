@@ -1,28 +1,41 @@
 use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::fs::Metadata;
 use std::future::Future;
 
+use anyhow::{anyhow, Context, Error};
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use chrono_tz::Asia::Shanghai;
+use futures::TryStreamExt;
+use get_chunk::stream::{FileStream, StreamExt};
+use get_chunk::ChunkSize;
 use rayon::iter::{ParallelBridge, ParallelIterator};
+use sha2::digest::{DynDigest, Update};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::SystemTime;
-use anyhow::{anyhow, Error};
-use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use tokio::{fs, io, join};
 use walkdir::WalkDir;
-use crate::{file_util, time_util};
+
+const DEFAULT_MAX_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[cfg(target_os = "windows")]
 pub async fn ls<P: AsRef<Path>>(
     path: P,
     r: bool,
-) -> anyhow::Result<Vec<(Option<String>, bool, Option<u64>, Option<String>, Option<String>)>> {
+) -> anyhow::Result<
+    Vec<(
+        Option<String>,
+        bool,
+        Option<u64>,
+        Option<String>,
+        Option<String>,
+    )>,
+> {
     use std::os::windows::fs::MetadataExt;
 
     let mut path = path.as_ref().to_path_buf();
@@ -46,16 +59,10 @@ pub async fn ls<P: AsRef<Path>>(
             },
         };
         let size = match metadata.is_dir() {
-            true => {
-                match r {
-                    true => {
-                        Some(get_dir_size(path).await?)
-                    }
-                    false => {
-                        None
-                    }
-                }
-            }
+            true => match r {
+                true => Some(get_dir_size(path).await?),
+                false => None,
+            },
             false => Some(metadata.file_size()),
         };
 
@@ -80,7 +87,7 @@ pub fn copy_and_rename<P: AsRef<Path>>(original_path: P) -> anyhow::Result<PathB
     // 确保输入的路径是一个文件
     let original_path = PathBuf::from(original_path.as_ref());
     if !original_path.is_file() {
-        return Err(anyhow!( "Provided path is not a file"));
+        return Err(anyhow!("Provided path is not a file"));
     }
 
     let mut new_filename = "_".to_owned();
@@ -109,14 +116,63 @@ pub async fn read_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Vec<u8>> {
     Ok(buffer)
 }
 
-//返回一个文件数据迭代器
-pub async fn read_big_file<P: AsRef<Path>>(path: P, max: usize) {}
+//返回一个文件数据异步迭代器
+/// 使用 `get_chunk` 库优雅实现大文件分片读取
+///
+/// 返回一个异步流，每次迭代产生一个 `Result<(std::ops::Range<u64>, Vec<u8>), io::Error>`
+pub async fn read_big_file<S: Into<Box<str>>>(
+    path: S,
+    max_chunk_size: usize,
+) -> io::Result<(
+    u64,
+    impl futures::Stream<Item = io::Result<(std::ops::Range<u64>, Vec<u8>)>>,
+)> {
+    // 1. 创建异步文件流
+    let mut file_stream = FileStream::new(path).await?;
 
+    // 2. 配置为固定字节分片模式（用户指定的 max_chunk_size）
+    //    你也可以选择 ChunkSize::Auto 让库自动优化
+    file_stream = file_stream.set_mode(ChunkSize::Bytes(max_chunk_size));
 
-pub async fn save_file_with_unique_name<P: AsRef<Path>>(path: P, bys: &[u8]) -> anyhow::Result<PathBuf> {
+    let file_size = file_stream.get_file_size() as u64;
+    let mut current_offset = 0u64;
+
+    // 3. 将库返回的数据块转换为 (Range<u64>, Vec<u8>) 格式
+    let stream = Box::pin(async_stream::try_stream! {
+        while let Some(data) = StreamExt::try_next(&mut file_stream).await? {
+            let chunk_size = data.len() as u64;
+            let start = current_offset;
+            let end = start + chunk_size;
+
+            // 产生分片区间([start,end))和数据
+            yield (start..end, data);
+
+            current_offset = end;
+
+            // 可选：提前结束，如果已经读取了特定大小（根据你的max参数逻辑）
+            // if current_offset >= max_chunk_size as u64 {
+            //     break;
+            // }
+        }
+    });
+
+    Ok((file_size, stream))
+}
+
+pub async fn save_file_with_unique_name<P: AsRef<Path>>(
+    path: P,
+    bys: &[u8],
+) -> anyhow::Result<PathBuf> {
     let mut path = path.as_ref().to_path_buf();
-    let original_stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("").to_owned();
-    let extension = path.extension().and_then(OsStr::to_str).map(|s| s.to_string());
+    let original_stem = path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_owned();
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|s| s.to_string());
 
     let mut counter = 1;
     while path.exists() {
@@ -129,7 +185,7 @@ pub async fn save_file_with_unique_name<P: AsRef<Path>>(path: P, bys: &[u8]) -> 
         counter += 1;
     }
 
-    save_file(&path, bys).await.map(|_| { path })
+    save_file(&path, bys).await.map(|_| path)
 }
 
 pub async fn save_file<P: AsRef<Path>>(path: P, bys: &[u8]) -> anyhow::Result<()> {
@@ -160,35 +216,6 @@ pub async fn save_file<P: AsRef<Path>>(path: P, bys: &[u8]) -> anyhow::Result<()
     Ok(())
 }
 
-#[tokio::test]
-async fn test() {
-    use std::time::Duration;
-    use time_util::*;
-    // let start = Instant::now();
-    // //8602103819
-    // println!("{}", get_dir_size(r"D:\Myjava").await.unwrap());
-    // println!("{:?}", start.elapsed());
-    // println!("{:?}", ls("E:", false).await);
-    let mut timer = Timer::new();
-    // println!("{}", get_dir_size(r"E:\D\").await.unwrap());
-    let save_path = "D:/MyTest/test".to_string();
-    let mut path = PathBuf::from(save_path.as_str());
-
-    if path.is_dir() {
-        path = path.join("1.png");
-    };
-
-    println!("{:?}", match save_file_with_unique_name(path.as_path(), &[0, 1]).await {
-        Ok(p) => Ok(format!("保存Kik的截屏至:{:?}", path)),
-        Err(e) => Err(anyhow!(format!(
-                                "保存Kik的截屏至:{:?}失败,err:{}",
-                                path, e
-                            ))),
-    });
-
-    println!("Elapsed time: {} ms", timer.elapsed(TimeUnit::Milliseconds));
-}
-
 //这个方法速度快了6,7倍,可以不是异步的，但是由于rust的无栈协程，这里必须是异步的才不会卡着其他的协程
 //一个方法不可以等待太久，除非其中占用时间的部分是await的
 pub async fn get_dir_size<P: AsRef<Path>>(path: P) -> io::Result<u64> {
@@ -217,7 +244,7 @@ pub async fn get_dir_size<P: AsRef<Path>>(path: P) -> io::Result<u64> {
 
 // #[async_recursion(?Send)] //这样这个闭包就非Send
 #[async_recursion] //这样标记递归闭包就是Send的
-//多线程递归统计大小,较快
+                   //多线程递归统计大小,较快
 pub async fn get_dir_size_b(path: PathBuf) -> io::Result<u64> {
     if path.is_file() {
         return Ok(path.metadata()?.len());
@@ -249,7 +276,7 @@ pub async fn get_dir_size_b(path: PathBuf) -> io::Result<u64> {
 }
 
 #[async_recursion] //这个宏貌似比直接写Box pin 性能更好
-//单线程递归统计大小
+                   //单线程递归统计大小
 pub async fn get_dir_size_t(path: PathBuf) -> io::Result<u64> {
     if path.is_file() {
         return Ok(path.metadata()?.len());
@@ -279,4 +306,156 @@ fn convert_system_time(time: SystemTime) -> String {
 
     // 格式化日期和时间
     datetime_beijing.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub async fn compute_hash<S: Into<Box<str>>>(path: S) -> anyhow::Result<Vec<u8>> {
+    let mut hasher = Sha256::new();
+    // 1. 创建异步文件流
+    let mut file_stream = FileStream::new(path)
+        .await?
+        .set_mode(ChunkSize::Bytes(DEFAULT_MAX_CHUNK_SIZE));
+
+    while let Some(data) = StreamExt::try_next(&mut file_stream).await? {
+        DynDigest::update(&mut hasher, data.as_ref());
+    }
+
+    Ok(hasher.finalize().to_vec())
+}
+
+pub async fn write_range_file<P: AsRef<std::path::Path>>(
+    path: P,
+    start: u64,
+    end: u64,
+    data: Vec<u8>,
+) -> anyhow::Result<()> {
+    if start > end {
+        return Err(anyhow::anyhow!(
+            "start ({}) cannot be greater than end ({})",
+            start,
+            end
+        ));
+    }
+    let expected_len = end - start + 1;
+    if data.len() as u64 != expected_len {
+        return Err(anyhow::anyhow!(
+            "Data length ({}) does not match range length ({})",
+            data.len(),
+            expected_len
+        ));
+    }
+
+    if let Some(parent_dir) = path.as_ref().parent() {
+        if !parent_dir.exists() {
+            fs::create_dir_all(parent_dir).await?;
+        }
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .await
+        .context("Failed to open/create file")?;
+
+    let metadata = file
+        .metadata()
+        .await
+        .context("Failed to get file metadata")?;
+    let current_size = metadata.len();
+
+    if current_size <= end {
+        // 扩展文件
+        let new_size = end + 1;
+        file.set_len(new_size)
+            .await
+            .context(format!("Failed to extend file to {} bytes", new_size))?;
+    }
+
+    file.seek(io::SeekFrom::Start(start))
+        .await
+        .context("Failed to seek to start position")?;
+
+    file.write_all(&data)
+        .await
+        .context("Failed to write data")?;
+
+    file.flush().await.context("Failed to flush data to disk")?;
+
+    Ok(())
+}
+
+pub async fn create_file(path: impl AsRef<Path>) -> anyhow::Result<File> {
+    if let Some(parent_dir) = path.as_ref().parent() {
+        if !parent_dir.exists() {
+            fs::create_dir_all(parent_dir).await?;
+        }
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .await?;
+    Ok(file)
+}
+
+pub async fn set_file_size(path: impl AsRef<Path>, size: u64) -> anyhow::Result<()> {
+    let metadata = fs::metadata(path.as_ref()).await?;
+    let current_size = metadata.len();
+
+    // 如果大小已经相等，直接返回
+    if current_size == size {
+        return Ok(());
+    }
+
+    // 设置文件大小
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .read(true) // 有些系统可能需要读权限
+        .open(path.as_ref())
+        .await?;
+
+    file.set_len(size).await?;
+
+    // 验证文件大小是否正确设置
+    let new_metadata = fs::metadata(path).await?;
+    if new_metadata.len() != size {
+        return Err(anyhow::anyhow!(
+            "设置文件大小失败: 期望 {} 字节, 实际 {} 字节",
+            size,
+            new_metadata.len()
+        ));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test() {
+    use crate::time_util::*;
+    use std::time::Duration;
+    // let start = Instant::now();
+    // //8602103819
+    // println!("{}", get_dir_size(r"D:\Myjava").await.unwrap());
+    // println!("{:?}", start.elapsed());
+    // println!("{:?}", ls("E:", false).await);
+    let mut timer = Timer::new();
+    // println!("{}", get_dir_size(r"E:\D\").await.unwrap());
+    let save_path = "D:/MyTest/test".to_string();
+    let mut path = PathBuf::from(save_path.as_str());
+
+    if path.is_dir() {
+        path = path.join("1.png");
+    };
+
+    println!(
+        "{:?}",
+        match save_file_with_unique_name(path.as_path(), &[0, 1]).await {
+            Ok(p) => Ok(format!("保存Kik的截屏至:{:?}", path)),
+            Err(e) => Err(anyhow!(format!("保存Kik的截屏至:{:?}失败,err:{}", path, e))),
+        }
+    );
+
+    println!("Elapsed time: {} ms", timer.elapsed(TimeUnit::Milliseconds));
 }

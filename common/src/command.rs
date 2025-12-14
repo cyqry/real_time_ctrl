@@ -1,10 +1,11 @@
-use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetFile};
+use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetBigFile, SetFile};
 use crate::command::LocalCommand::LocalExit;
 use crate::command::SysCommand::{List, Now, Use};
-use crate::protocol::BufSerializable;
+use crate::protocol::{BufSerializable, CmdOptions, ReqCmd};
+use anyhow::anyhow;
 use bytes::{Buf, BufMut, BytesMut};
 use std::str::FromStr;
-use anyhow::anyhow;
+use crate::message::frame::Frame;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -25,12 +26,10 @@ pub enum CtrlCommand {
     GetFile(String, String),
     GetBigFile(String, String),
     SetFile(String, String),
+    SetBigFile(String, u64, Vec<u8>, String),
     Ls(String),
     Screen(String),
 }
-
-#[cfg(target_os = "windows")]
-static DEFAULT_SCREEN_PATH: &str = "D:\\MyTest\\1.png";
 
 //todo Down kik
 #[derive(Debug, Clone)]
@@ -64,29 +63,37 @@ impl BufSerializable for Command {
                 match c {
                     GetFile(src, dst) => {
                         bytes_mut.put_u8(0);
-                        bytes_mut.put_u32(src.len() as u32);
+                        bytes_mut.put_u32(src.as_bytes().len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
                         bytes_mut.put_slice(dst.as_bytes());
                     }
                     GetBigFile(src, dst) => {
                         bytes_mut.put_u8(1);
-                        bytes_mut.put_u32(src.len() as u32);
+                        bytes_mut.put_u32(src.as_bytes().len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
                         bytes_mut.put_slice(dst.as_bytes());
                     }
                     SetFile(src, dst) => {
                         bytes_mut.put_u8(2);
-                        bytes_mut.put_u32(src.len() as u32);
+                        bytes_mut.put_u32(src.as_bytes().len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
                         bytes_mut.put_slice(dst.as_bytes());
                     }
-                    Ls(path) => {
+                    SetBigFile(src, size, hash, dst) => {
                         bytes_mut.put_u8(3);
+                        bytes_mut.put_u32(src.as_bytes().len() as u32);
+                        bytes_mut.put_slice(src.as_bytes());
+                        bytes_mut.put_u64(size.clone());
+                        bytes_mut.put_u32(hash.len() as u32);
+                        bytes_mut.put_slice(hash);
+                        bytes_mut.put_slice(dst.as_bytes());
+                    }
+                    Ls(path) => {
+                        bytes_mut.put_u8(4);
                         bytes_mut.put_slice(path.as_bytes());
                     }
-
                     Screen(path) => {
-                        bytes_mut.put_u8(4);
+                        bytes_mut.put_u8(5);
                         bytes_mut.put_slice(path.as_bytes());
                     }
                 }
@@ -168,8 +175,38 @@ impl BufSerializable for Command {
                             String::from_utf8(bys.to_vec()).ok()?,
                         )))
                     }
-                    3 => Some(Command::Ctrl(Ls(String::from_utf8(bys.to_vec()).ok()?))),
-                    4 => Some(Command::Ctrl(Screen(String::from_utf8(bys.to_vec()).ok()?))),
+                    3 => {
+                        if bys.len() < 4 {
+                            return None;
+                        }
+                        let src_len = bys.get_u32();
+                        if bys.len() < src_len as usize {
+                            return None;
+                        }
+                        let target_path =
+                            String::from_utf8(bys.split_to(src_len as usize).to_vec()).ok()?;
+                        if bys.len() < 8 {
+                            return None;
+                        }
+                        let size = bys.get_u64();
+                        if bys.len() < 4 {
+                            return None;
+                        }
+                        let hash_len = bys.get_u32();
+                        if bys.len() < hash_len as usize {
+                            return None;
+                        }
+                        let hash = bys.split_to(hash_len as usize).to_vec();
+                        Some(Command::Ctrl(SetBigFile(
+                            target_path,
+                            size,
+                            hash,
+                            String::from_utf8(bys.to_vec()).ok()?,
+                        )))
+                    }
+
+                    4 => Some(Command::Ctrl(Ls(String::from_utf8(bys.to_vec()).ok()?))),
+                    5 => Some(Command::Ctrl(Screen(String::from_utf8(bys.to_vec()).ok()?))),
                     _ => None,
                 }
             }
@@ -179,86 +216,17 @@ impl BufSerializable for Command {
     }
 }
 
-#[cfg(target_os = "windows")]
-impl FromStr for Command {
-    type Err = anyhow::Error;
-
-    fn from_str(mut s: &str) -> Result<Self, Self::Err> {
-        s = s.trim();
-        if s.is_empty() {
-            panic!("parse empty");
-        }
-        if s.starts_with("$") {
-            let parts: Vec<&str> = s[1..].split_whitespace().collect();
-
-            match parts.as_slice() {
-                ["sys_now"] => Ok(Command::Sys(Now)),
-                ["sys_list"] => Ok(Command::Sys(List)),
-                ["sys_use", value] => {
-                    let val = value.trim_matches('"').to_string();
-                    Ok(Command::Sys(Use(val)))
-                }
-                ["local_exit"] => Ok(Command::Local(LocalExit)),
-                // todo 对于文件路径，我希望使用""包裹的参数，都对其进行转义，未使用""包裹的参数，无需转义;只有一边有"符号的是错误的语法
-                ["screen", save_path] => {
-                    let save_path = save_path.trim_matches('"').to_string();
-                    Ok(Command::Ctrl(Screen(save_path)))
-                }
-                ["screen"] => {
-                    Ok(Command::Ctrl(Screen(DEFAULT_SCREEN_PATH.to_string())))
-                }
-                ["getfile", src, "to", dest, ..]
-                | ["setfile", src, "to", dest, ..]
-                | ["getbigfile", src, "to", dest, ..] => {
-                    let src = src.trim_matches('"').to_string();
-                    let dest = dest.trim_matches('"').to_string();
-
-                    if parts[0] == "getfile" {
-                        Ok(Command::Ctrl(GetFile(src, dest)))
-                    } else if parts[0] == "setfile" {
-                        Ok(Command::Ctrl(SetFile(src, dest)))
-                    } else {
-                        Ok(Command::Ctrl(GetBigFile(src, dest)))
-                    }
-                }
-                ["ls", dir, args @ .. ] => {
-                    let dir = dir.trim_matches('"').to_string();
-                    match args.len() {
-                        0 => {
-                            Ok(Command::Ctrl(Ls(dir)))
-                        }
-                        _ => {
-                            //先不做特殊处理
-                            let v: Vec<&str> = std::iter::once(dir.as_str()).chain(args.iter().cloned()).collect();
-                            Ok(Command::Ctrl(Ls(v.join(" "))))
-                        }
-                    }
-                }
-                _ => unknown(s),
-            }
-        } else {
-            Ok(Command::Exec(s.to_string()))
-        }
-    }
-}
-
-fn unknown<T>(s: &str) -> anyhow::Result<T> {
-    Err(anyhow!(format!("Unknown command: {}", s)))
-}
-
 #[test]
 fn test() {
-    println!("{}", (0 as *mut String).is_null()); //true
-    // let x = 0x10 as *mut String;
-    // unsafe { println!("{}", *x); }
-    let parts: Vec<&str> = "etst est".split_ascii_whitespace().collect();
-    let c: Command = "$ls sdfsdf -r".parse().unwrap();
-    println!("{:?}", c);
-    match parts.as_slice() {
-        //  _ @ ..  是一种 匹配模式,匹配剩余的元素
-        ["etst", s, others @ ..] => {
-            println!("{}", others.len()); // 0
-        }
-        _ => {}
-    }
+    println!("{:?}", Frame::from_buf(
+        Frame::Cmd(ReqCmd::new("sfdid".to_string(), CmdOptions::default().with_timeout(false), Command::Ctrl(CtrlCommand::SetBigFile(
+            "werwrwerw".to_string(),
+            232,
+            vec![12, 3, 4, 5, 3, 6, 66, 12],
+            "".to_string(),
+        ))))
+
+            .to_buf(),
+    )
+        .unwrap());
 }

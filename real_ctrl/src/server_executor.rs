@@ -1,6 +1,7 @@
-use crate::context::Context;
+use crate::context::{id, Context};
 use common::command::{Command, SysCommand};
 use common::message::resp::Resp;
+use common::protocol::{CmdOptions, ReqCmd};
 
 pub async fn execute(context: &Context, cmd: SysCommand) -> anyhow::Result<String> {
     match context
@@ -8,7 +9,7 @@ pub async fn execute(context: &Context, cmd: SysCommand) -> anyhow::Result<Strin
         .clone()
         .write()
         .await
-        .req(&Command::Sys(cmd))
+        .req(&ReqCmd::new(id(), CmdOptions::default(), Command::Sys(cmd)))
         .await?
     {
         Resp::Info(info) => Ok(info),

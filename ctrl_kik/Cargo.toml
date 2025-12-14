@@ -22,7 +22,7 @@ image = "0.24.7"
 scrap = "0.5"
 fs4 = { version = "0.6", features = ["tokio-async"] }
 uuid = { version = "1.4.1", features = ["v4", ] }
+
 [target.'cfg(windows)'.dependencies]
 whoami = "1.4.1"
 winapi = {version="0.3.9",features = ["processthreadsapi", "winbase", "winnt","synchapi","wingdi","windef","winuser"]}
-

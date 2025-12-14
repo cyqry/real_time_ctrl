@@ -21,7 +21,7 @@ use tokio_util::codec::FramedRead;
 pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     let listener =
         TcpListener::bind(format!("{}:{}", config.server_host, config.server_port)).await?;
-    debug!("开启服务,监听{}的{}端口",config.server_host,config.server_port);
+    info!("开启服务,监听{}的{}端口",config.server_host,config.server_port);
     loop {
         let (stream, addr) = listener.accept().await?;
         tokio::spawn(handle_stream(context.clone(), config.clone(), stream, addr));

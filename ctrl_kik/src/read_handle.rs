@@ -6,11 +6,11 @@ use common::command::{Command, SysCommand};
 use common::config::Config;
 use common::kik::Kik;
 use common::message::frame::Frame;
-use common::message::frame::Frame::{Cmd, CmdExtra, Resp};
+use common::message::frame::Frame::{Cmd, Resp};
 use common::message::resp;
 use common::message::resp::Resp::{DataId, Info};
 use common::protocol;
-use common::protocol::BufSerializable;
+use common::protocol::{BufSerializable, CmdOptions};
 use log::debug;
 use std::any::Any;
 use std::collections::HashMap;
@@ -30,16 +30,19 @@ fn default_error() -> anyhow::Error {
 pub async fn handle_kik(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
-    msg: BytesMut,
-    tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    msg: BytesMut
 ) -> anyhow::Result<()> {
     let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
         //控制过程应由单独线程处理，不阻塞连接主线程,与ping pong分开
-        Frame::CmdExtra(cmd, cmd_id) => {
-            channel.lock().await
-                .get::<UnboundedSender<(String, Command)>>("cmd_tx").expect("没有命令发送者")
-                .send((cmd_id, cmd)).expect("处理线程关闭");
+        Frame::Cmd(req_cmd) => {
+            channel
+                .lock()
+                .await
+                .get::<UnboundedSender<(String, CmdOptions, Command)>>("cmd_tx")
+                .expect("没有命令发送者")
+                .send(req_cmd.split())
+                .expect("处理线程关闭");
         }
         Frame::Ping => {}
         Frame::Pong => {}
@@ -50,17 +53,20 @@ pub async fn handle_kik(
     Ok(())
 }
 
-
-
-pub async fn handle_kik_cmd(context: Context,channel: &Arc<Mutex<Channel>>, cmd_id: String, cmd: Command) {
-
+pub async fn handle_kik_cmd(
+    context: Context,
+    channel: &Arc<Mutex<Channel>>,
+    cmd_id: String,
+    cmd_options: CmdOptions,
+    cmd: Command,
+) {
     debug!("开run,cmd_id:{}", cmd_id);
-    let resp = match timeout(Duration::from_secs(60 * 5), cmd_runner::run(&context, cmd)).await {
-        Ok(resp) => {
-            resp
-        }
-        Err(_) => {
-            Info("Kik执行任务超时".to_string())
+    let resp = {
+        let runner = cmd_runner::run(&context, cmd);
+        if cmd_options.timeout() {
+            timeout(Duration::from_secs(60 * 5), runner).await.unwrap_or_else(|_| Info("Kik执行任务超时".to_string()))
+        } else {
+            runner.await
         }
     };
 
@@ -68,8 +74,8 @@ pub async fn handle_kik_cmd(context: Context,channel: &Arc<Mutex<Channel>>, cmd_
     let suc = channel
         .lock()
         .await
-        .write_and_flush(&protocol::transfer_encode(
-            Frame::RespExtra(resp, cmd_id).to_buf(),
+        .write_and_flush(&protocol::transfer_encode_frame(
+            Frame::RespExtra(resp, cmd_id),
         ))
         .await;
     //当发送失败
@@ -82,15 +88,12 @@ pub async fn handle_kik_cmd(context: Context,channel: &Arc<Mutex<Channel>>, cmd_
 pub async fn handle_kik_data(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
-    msg: BytesMut,
-    tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    msg: BytesMut
 ) -> anyhow::Result<()> {
     let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
         Frame::Data(id, data) => {
-            context.send_data((id, data))
-                .await.unwrap_or(());
-
+            context.send_data((id, data)).await.unwrap_or(());
         }
         Frame::Ping => {}
         Frame::Pong => {}

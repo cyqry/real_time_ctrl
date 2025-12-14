@@ -10,7 +10,7 @@ use common::ltc_codec::LengthFieldBasedFrameDecoder;
 use common::message::frame::Frame;
 use common::message::resp::Resp;
 use common::{file_util, protocol};
-use common::protocol::BufSerializable;
+use common::protocol::{BufSerializable, CmdOptions};
 use log::debug;
 use std::any::Any;
 use std::ptr::null_mut;
@@ -173,19 +173,19 @@ async fn handle_active(context: Context, name: String, channel: Arc<Mutex<Channe
     channel
         .lock()
         .await
-        .try_write_and_flush(&protocol::transfer_encode(
+        .try_write_and_flush(&protocol::transfer_encode_frame(
             Frame::KikReq(KikInfo {
                 id: context.id.clone().lock().await.clone(),
                 name,
-            })
-            .to_buf(),
+            }),
         ))
         .await;
-    let (tx, mut rx) = unbounded_channel::<(String,Command)>();
+    let (tx, mut rx) = unbounded_channel::<(String, CmdOptions, Command)>();
     channel.lock().await.put("cmd_tx".to_string(), tx);
+    //todo 将这个线程的句柄交给连接控制主线程，方便随时杀掉；为了随时重新开新处理线程，这个线程其实应该得到命令时懒加载
     tokio::spawn(async move {
-        while let Some((cmd_id,cmd)) = rx.recv().await {
-            read_handle::handle_kik_cmd(context.clone(),&channel, cmd_id, cmd).await;
+        while let Some((cmd_id,cmd_options, cmd)) = rx.recv().await {
+            read_handle::handle_kik_cmd(context.clone(), &channel, cmd_id,cmd_options, cmd).await;
         }
     });
 
@@ -210,13 +210,12 @@ async fn handle_read(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    auth_tx: &mut Sender<Box<dyn Any + Send + Sync>>,
 ) -> anyhow::Result<()> {
     let channel_type = channel.clone().lock().await.channel_type.clone();
     match channel_type {
-        ChannelType::Kik => read_handle::handle_kik(context, channel, msg, tx).await,
-        ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg, tx).await,
-        ChannelType::Unknown => read_handle::handle_init_message(context, channel, msg, tx).await,
+        ChannelType::Kik => read_handle::handle_kik(context, channel, msg).await,
+        ChannelType::Unknown => read_handle::handle_init_message(context, channel, msg, auth_tx).await,
         _ => {
             //todo 日志收集而不是 panic!
             panic!("不支持的")

@@ -4,7 +4,35 @@ resolver = "2"
 
 
 [profile.release]
-strip = true
+strip = false
 lto = true
 opt-level = "z"
-panic = "abort"
+
+
+#[profile.ctrl_kik-release]
+#inherits = "release"
+#cargo-features = ["trim-paths"]
+#debug = 0
+#lto = true
+#strip = "symbols" # 比 `strip = true` 更彻底
+#codegen-units = 1
+#opt-level = "z"
+#panic = "abort"
+#trim-paths = "all"
+#
+#[profile.start-release]
+#inherits = "release"
+#debug = 0
+#lto = "fat"
+#strip = "symbols" # 比 `strip = true` 更彻底
+#codegen-units = 1
+#opt-level = "s"
+#panic = "abort"
+#trim-paths = "all"
+#
+#
+#[profile.real_ctrl-release]
+#inherits = "release"
+#strip = false
+#lto = true
+#opt-level = "z"

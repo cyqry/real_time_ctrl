@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use common::generated::encrypted_strings;
+use common::generated::encrypted_strings::HOST;
 
 mod context;
 mod ctrl_conn;
@@ -18,6 +19,7 @@ mod direct_executor;
 mod dispatch;
 mod local_executor;
 mod server_executor;
+mod input_command;
 
 #[tokio::main]
 async fn main() {
@@ -30,7 +32,7 @@ async fn main() {
                 username: "root".to_string(),
                 password: "1104399".to_string(),
             },
-            server_host: "localhost".to_string(),
+            server_host: HOST(),
             server_port: "9002".to_string(),
             read_timeout: Duration::from_secs(45),
             write_timeout: Duration::from_secs(45),

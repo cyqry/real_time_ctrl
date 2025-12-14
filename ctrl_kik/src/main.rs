@@ -38,7 +38,7 @@ async fn main() {
     // env::set_var("RUST_LOG", "DEBUG");
     env_logger::init();
     //此lock在程序结束时会被操作系统回收，所以无需担心是否释放
-    let _ = single(LOCK_FILE_PATH()).await;
+    let f = single(LOCK_FILE_PATH()).await; // 须要给一个变量名不能用let _ = xxx，(注意: let _ = xxx 当下与  _ = xxx 行为一致，会在这一行结束就释放变量) ，免得rust这里直接回收了
     let context = Context::new();
     let config = Config {
         id: Id {

@@ -146,8 +146,8 @@ async fn handle_active(id: &Id, channel: Arc<Mutex<Channel>>) -> anyhow::Result<
         .clone()
         .lock()
         .await
-        .write_and_flush(&protocol::transfer_encode(
-            Frame::CtrlAuthReq(id.encrypt()).to_buf(),
+        .write_and_flush(&protocol::transfer_encode_frame(
+            Frame::CtrlAuthReq(id.encrypt()),
         ))
         .await?;
     Ok(())

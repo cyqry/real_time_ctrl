@@ -4,9 +4,10 @@ use bytes::{Buf, BufMut, BytesMut};
 use common::channel::Channel;
 use common::command::Command;
 use common::config::Config;
+use common::message::frame::Frame;
 use common::message::resp::Resp;
 use common::protocol;
-use common::protocol::BufSerializable;
+use common::protocol::{BufSerializable, ReqCmd};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI16, AtomicU16, Ordering};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct Context {
@@ -59,6 +61,32 @@ impl Context {
 
     pub fn get_data_rx(&self) -> Arc<Mutex<Receiver<(String, BytesMut)>>> {
         self.data_x.1.clone()
+    }
+
+    pub async fn send_data(&self, v: &[u8]) -> anyhow::Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.send_data_with_id(id.clone(), v).await?;
+        Ok(id)
+    }
+
+    pub async fn send_data_with_id(&self, data_id: String, v: &[u8]) -> anyhow::Result<()> {
+
+        match self.find_ctrl_data().await {
+            None => Err(anyhow::Error::msg("应用数据传输通道未初始化!")),
+            Some(data_conn) => {
+                let mut bytes_mut = BytesMut::with_capacity(v.len());
+                bytes_mut.put_slice(v);
+
+                let mut guard = data_conn
+                    .lock()
+                    .await;
+                guard .write_and_flush(&protocol::transfer_encode_frame(
+                        Frame::Data(data_id, bytes_mut),
+                    ))
+                    .await?;
+                Ok(())
+            }
+        }
     }
 
     pub async fn wait_data(&self, data_id: &str) -> anyhow::Result<Vec<u8>> {
@@ -133,7 +161,7 @@ impl Agent {
         Err(re)
     }
 
-    pub async fn req(&mut self, cmd: &Command) -> anyhow::Result<Resp> {
+    pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<Resp> {
         let mut re = anyhow::Error::msg("unreachable!");
         //由于编译器无法确定这个for是否至少有一次循环，所以需要re变量初始化
         for _ in 0..3 {
@@ -167,4 +195,8 @@ impl Agent {
         }
         Err(re)
     }
+}
+
+pub fn id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }

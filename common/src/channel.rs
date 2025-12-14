@@ -114,6 +114,7 @@ impl Channel {
         };
     }
     pub async fn write_and_flush(&mut self, bys: &[u8]) -> anyhow::Result<()> {
+        
         let w = self.writer.write_all(bys).await?;
         self.writer.flush().await?;
         Ok(w)

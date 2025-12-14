@@ -2,16 +2,16 @@ use crate::command::Command;
 use crate::kik_info::KikInfo;
 use crate::message::frame::Frame::*;
 use crate::message::resp::Resp;
-use crate::protocol::BufSerializable;
+use crate::protocol::{BufSerializable, ReqCmd};
 use bytes::{Buf, BufMut, BytesMut};
 use log::debug;
 use std::io::Read;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Frame {
     CmdExtra(Command, String),
     RespExtra(Resp, String),
-    Cmd(Command),
+    Cmd(ReqCmd),
     Resp(Resp),
 
     CtrlAuthReply(bool),
@@ -162,7 +162,7 @@ impl BufSerializable for Frame {
                 let id = String::from_utf8(bys.split_to(id_len as usize).to_vec()).ok()?;
                 Some(Data(id, bys))
             }
-            11 => Some(Cmd(Command::from_buf(bys)?)),
+            11 => Some(Cmd(ReqCmd::from_buf(bys)?)),
             10 => Some(Resp(Resp::from_buf(bys)?)),
             9 => Some(CtrlAuthReq(String::from_utf8(bys.to_vec()).ok()?)),
             8 => {

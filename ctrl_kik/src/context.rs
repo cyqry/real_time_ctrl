@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -27,8 +27,8 @@ pub struct Context {
 
 #[derive(Clone)]
 pub struct DataChan {
-    tx: Sender<(String, BytesMut)>,
-    rx: Arc<Mutex<Receiver<(String, BytesMut)>>>,
+    tx: UnboundedSender<(String, BytesMut)>,
+    rx: Arc<Mutex<UnboundedReceiver<(String, BytesMut)>>>,
     //原子引用， 当前正在等待的id
     wait_data: Arc<Mutex<usize>>,
 }
@@ -37,7 +37,8 @@ pub struct DataChan {
 
 impl Context {
     pub fn new() -> Self {
-        let (tx, rx) = channel(5);
+        //由于我们一定要及时处理tcp消息，不及时处理会导致tcp发送方发消息阻塞，所以这里不能用有限容量通道
+        let (tx, rx) = unbounded_channel();
         let rx = Arc::new(Mutex::new(rx));
 
         Context {
@@ -61,7 +62,7 @@ impl Context {
             wait.eq(&0) || *((*wait) as *mut String).as_ref().unwrap() == op.0
         };
         if can_send {
-            Ok(self.data_x.tx.send(op).await.expect("不可能没有读者!"))
+            Ok(self.data_x.tx.send(op).expect("不可能没有读者!"))
         } else {
             //直接丢弃
            Err(anyhow!("正在读"))
@@ -110,10 +111,10 @@ impl Context {
         ret?
     }
 
-    pub fn get_data_rx(&self) -> Arc<Mutex<Receiver<(String, BytesMut)>>> {
+    pub fn get_data_rx(&self) -> Arc<Mutex<UnboundedReceiver<(String, BytesMut)>>> {
         self.data_x.rx.clone()
     }
-    pub fn get_data_tx(&self) -> Sender<(String, BytesMut)> {
+    pub fn get_data_tx(&self) -> UnboundedSender<(String, BytesMut)> {
         self.data_x.tx.clone()
     }
     pub async fn get_kik(&self) -> Option<Kik> {
@@ -178,8 +179,8 @@ impl Context {
                 c.clone()
                     .lock()
                     .await
-                    .write_and_flush(&protocol::transfer_encode(
-                        Frame::Data(data_id.clone(), bytes_mut).to_buf(),
+                    .write_and_flush(&protocol::transfer_encode_frame(
+                        Frame::Data(data_id.clone(), bytes_mut),
                     ))
                     .await?;
                 Ok(data_id)

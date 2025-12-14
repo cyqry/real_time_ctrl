@@ -8,8 +8,8 @@ use common::message::frame::Frame;
 use common::message::resp;
 use common::message::resp::Resp::{DataId, Info};
 use common::protocol;
-use common::protocol::BufSerializable;
-use log::{debug, info};
+use common::protocol::{BufSerializable, ReqCmd};
+use log::{debug, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -28,11 +28,10 @@ pub async fn handle_ctrl(
     msg: BytesMut,
 ) -> anyhow::Result<()> {
     let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
-    let cmd_id = Uuid::new_v4().to_string();
-
-    match frame {
-        Frame::Cmd(cmd) => {
+    match frame.clone() {
+        Frame::Cmd(req) => {
             debug!("handel ctrl cmd");
+            let (cmd_id,cmd_options,cmd) = req.split();
             //保证方法结束时 set none cmd_id了,这里判断一下目前流程来说其实一般没用，除非ctrl连接重连并快速发命令
             if !context.set_now_cmd_id_if_none(cmd_id.clone()).await {
                 channel
@@ -150,10 +149,11 @@ pub async fn handle_ctrl(
                                                 .clone()
                                                 .lock()
                                                 .await
-                                                .try_write_and_flush(&protocol::transfer_encode(
-                                                    Frame::CmdExtra(cmd, cmd_id.clone()).to_buf(),
+                                                .try_write_and_flush(&protocol::transfer_encode_frame(
+                                                   Frame::Cmd(ReqCmd::new(cmd_id.clone(), cmd_options.clone(), cmd.clone())),
                                                 ))
                                                 .await;
+                                            println!("发送了{:?}", ReqCmd::new(cmd_id.clone(), cmd_options.clone(), cmd));
 
                                             let rx_arc = kik_conn
                                                 .lock()
@@ -163,18 +163,27 @@ pub async fn handle_ctrl(
                                                 )
                                                 .expect("不可能没有rx")
                                                 .clone();
+
                                             let mut resp_op = None;
 
                                             //正常数据超时等待时间为5分钟
+
                                             let mut duration = Duration::from_secs(60 * 5);
                                             for _ in 0..3 {
-                                                match timeout(duration, rx_arc.clone().lock().await.recv()).await {
+                                                let res =
+                                                    if cmd_options.timeout() {
+                                                        timeout(duration, rx_arc.clone().lock().await.recv()).await
+                                                    } else {
+                                                        Ok(rx_arc.clone().lock().await.recv().await)
+                                                    };
+
+                                                match res {
                                                     Ok(Some((resp, resp_cmd_id))) => {
                                                         if resp_cmd_id != cmd_id {
-                                                            //说明过期或异常响应
                                                             //虽然send前判断了过期id不再来，但是可能判断后发生了超时修改了id再发，这里依然拿到了过期响应，于是尝试重读下一个
                                                             //只有这里continue,因为只有这里重试读,并且这次读等的时间短一点
-                                                            //todo 极其偶然需要记录日志
+                                                            //极其偶然需要记录日志
+                                                            warn!("得到过期响应或异常响应");
                                                             duration = duration / 2;
                                                             continue;
                                                         } else {
@@ -190,8 +199,10 @@ pub async fn handle_ctrl(
                                                         resp_op = Some(Resp::Info("被控端执行命令超时".to_string()));
                                                     }
                                                 };
+
                                                 break;
                                             }
+
                                             if resp_op.is_some() {
                                                 channel.clone().lock().await
                                                     .write_and_flush(&protocol::resp(resp_op.unwrap()))
@@ -241,24 +252,16 @@ pub async fn handle_ctrl_data(
     let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
         Frame::Data(id, data) => {
-            match context.get_kik().await {
-                None => {
-                    //ctrl data过来，kik不在线，就不管
-                }
-                Some(kik) => {
-                    match kik.find_data_conn().await {
-                        None => {
-                            //未找到kik的data_conn，也不管
-                        }
-                        Some(c) => {
-                            c.lock()
-                                .await
-                                .try_write_and_flush(&protocol::transfer_encode(
-                                    Frame::Data(id, data).to_buf(),
-                                ))
-                                .await;
-                        }
-                    }
+            //ctrl data过来，如果kik不在线，就不管
+            if let Some(kik) = context.get_kik().await {
+                //如果未找到kik的data_conn，也不管
+                if let Some(data_c) = kik.find_data_conn().await {
+                    data_c.lock()
+                        .await
+                        .try_write_and_flush(&protocol::transfer_encode_frame(
+                            Frame::Data(id, data),
+                        ))
+                        .await;
                 }
             }
         }
@@ -286,8 +289,8 @@ pub async fn handle_kik_data(
                 Some(c) => {
                     c.lock()
                         .await
-                        .try_write_and_flush(&protocol::transfer_encode(
-                            Frame::Data(id, data).to_buf(),
+                        .try_write_and_flush(&protocol::transfer_encode_frame(
+                            Frame::Data(id, data),
                         ))
                         .await;
                 }
@@ -375,8 +378,8 @@ pub async fn handle_init_message(
                     .clone()
                     .lock()
                     .await
-                    .write_and_flush(&protocol::transfer_encode(
-                        Frame::CtrlAuthReply(true).to_buf(),
+                    .write_and_flush(&protocol::transfer_encode_frame(
+                        Frame::CtrlAuthReply(true),
                     ))
                     .await?;
             } else {
@@ -384,8 +387,8 @@ pub async fn handle_init_message(
                     .clone()
                     .lock()
                     .await
-                    .write_and_flush(&protocol::transfer_encode(
-                        Frame::CtrlAuthReply(false).to_buf(),
+                    .write_and_flush(&protocol::transfer_encode_frame(
+                        Frame::CtrlAuthReply(false),
                     ))
                     .await?;
                 // time::sleep(Duration::from_secs(2)).await;
@@ -405,8 +408,8 @@ pub async fn handle_init_message(
                     .clone()
                     .lock()
                     .await
-                    .write_and_flush(&protocol::transfer_encode(
-                        Frame::CtrlDataConnAuthReply(true).to_buf(),
+                    .write_and_flush(&protocol::transfer_encode_frame(
+                        Frame::CtrlDataConnAuthReply(true),
                     ))
                     .await?;
             } else {
@@ -414,8 +417,8 @@ pub async fn handle_init_message(
                     .clone()
                     .lock()
                     .await
-                    .write_and_flush(&protocol::transfer_encode(
-                        Frame::CtrlDataConnAuthReply(false).to_buf(),
+                    .write_and_flush(&protocol::transfer_encode_frame(
+                        Frame::CtrlDataConnAuthReply(false),
                     ))
                     .await?;
                 // time::sleep(Duration::from_secs(2)).await;
@@ -496,8 +499,8 @@ pub async fn handle_init_message(
             mutex_guard.put("rx".to_string(), Arc::new(Mutex::new(rx)));
             mutex_guard.put("tx".to_string(), tx);
             mutex_guard
-                .write_and_flush(&protocol::transfer_encode(
-                    Frame::KikId(kik.kik_info.id.unwrap()).to_buf(),
+                .write_and_flush(&protocol::transfer_encode_frame(
+                    Frame::KikId(kik.kik_info.id.unwrap()),
                 ))
                 .await?;
         }
@@ -518,7 +521,7 @@ pub async fn handle_init_message(
                     channel
                         .lock()
                         .await
-                        .write_and_flush(&protocol::transfer_encode(Frame::KikId(id).to_buf()))
+                        .write_and_flush(&protocol::transfer_encode_frame(Frame::KikId(id)))
                         .await?;
                 }
             };

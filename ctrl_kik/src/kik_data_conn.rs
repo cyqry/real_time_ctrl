@@ -1,6 +1,6 @@
 use crate::context::Context;
 use crate::{cmd_util, read_handle};
-use anyhow::Error;
+use anyhow::{anyhow, Error};
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
@@ -112,7 +112,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
     //这次为第一次rx接收数据,用于阻塞校验
     match rx.recv().await {
         None => {
-            panic!("服务器未响应")
+            return Err(anyhow!("发送端关闭，连接结束"));
         }
         Some(res) => {
             //获得服务器响应的kik_id
@@ -128,7 +128,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
                     context.insert_data_conn(channel_arc.clone()).await;
                 }
                 _ => {
-                    panic!("服务端奇怪的响应，系统错误");
+                    panic!("不可能出现！系统错误");
                 }
             };
         }
@@ -158,8 +158,8 @@ async fn handle_active(context: &Context, channel: Arc<Mutex<Channel>>) -> anyho
         .clone()
         .lock()
         .await
-        .write_and_flush(&protocol::transfer_encode(
-            Frame::KikDataConnReq(id).to_buf(),
+        .write_and_flush(&protocol::transfer_encode_frame(
+            Frame::KikDataConnReq(id),
         ))
         .await
 }
@@ -177,12 +177,12 @@ async fn handle_read(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    auth_tx: &mut Sender<Box<dyn Any + Send + Sync>>,
 ) -> anyhow::Result<()> {
     let channel_type = channel.clone().lock().await.channel_type.clone();
     match channel_type {
-        ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg, tx).await,
-        ChannelType::Unknown => read_handle::handle_init_message(context, channel, msg, tx).await,
+        ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
+        ChannelType::Unknown => read_handle::handle_init_message(context, channel, msg, auth_tx).await,
         _ => {
             //todo 日志收集而不是 panic!
             panic!("不支持的")
