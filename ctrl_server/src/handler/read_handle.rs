@@ -153,7 +153,6 @@ pub async fn handle_ctrl(
                                                    Frame::Cmd(ReqCmd::new(cmd_id.clone(), cmd_options.clone(), cmd.clone())),
                                                 ))
                                                 .await;
-                                            println!("发送了{:?}", ReqCmd::new(cmd_id.clone(), cmd_options.clone(), cmd));
 
                                             let rx_arc = kik_conn
                                                 .lock()

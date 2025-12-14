@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI16, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use log::debug;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time;
@@ -162,6 +163,7 @@ impl Agent {
     }
 
     pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<Resp> {
+        debug!("发送命令，{:?}", cmd);
         let mut re = anyhow::Error::msg("unreachable!");
         //由于编译器无法确定这个for是否至少有一次循环，所以需要re变量初始化
         for _ in 0..3 {

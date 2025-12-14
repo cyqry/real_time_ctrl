@@ -14,7 +14,7 @@ type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>
 /// 异步执行器
 #[derive(Debug)]
 pub struct AsyncExecutor {
-    task_tx: UnboundedSender<Option<Task>>,
+    task_tx: Option<UnboundedSender<Option<Task>>>,
     worker_handle: Option<JoinHandle<()>>,
 }
 
@@ -29,7 +29,7 @@ impl AsyncExecutor {
         let worker_handle = tokio::spawn(Self::worker_loop(task_rx));
 
         Self {
-            task_tx,
+            task_tx: Some(task_tx),
             worker_handle: Some(worker_handle),
         }
     }
@@ -51,7 +51,7 @@ impl AsyncExecutor {
     {
         let task: Task = Box::new(move || Box::pin(f()));
 
-        self.task_tx
+        self.task_tx.as_ref().ok_or(anyhow!("执行器已关闭"))?
             .send(Some(task))
             .map_err(|e| anyhow!("Failed to submit task: {}", e))
     }
@@ -78,30 +78,35 @@ impl AsyncExecutor {
         Ok(result_rx)
     }
 
-    /// 优雅关闭执行器
-    pub async fn shutdown(mut self) -> Result<(), String> {
+    /// 任务执行结束信号
+    pub async fn finish(&mut self) -> Result<(), String> {
         // 发送关闭信号
-        self.task_tx.send(None).unwrap_or(());
+        self.task_tx.take().ok_or("执行器已关闭".to_string())?.send(None).unwrap_or(());
+        Ok(())
+    }
+
+    pub async fn wait(&mut self) -> Result<(), String> {
         // 等待工作协程完成
         if let Some(handle) = self.worker_handle.take() {
             handle
                 .await
                 .map_err(|e| format!("Worker panicked: {}", e))?;
         }
-
         Ok(())
     }
 
     /// 检查执行器是否已关闭
     pub fn is_closed(&self) -> bool {
-        self.task_tx.is_closed()
+        self.task_tx.as_ref().map(|t| t.is_closed()).unwrap_or(false)
     }
 }
 
 impl Drop for AsyncExecutor {
     fn drop(&mut self) {
         // 如果用户没有显式调用shutdown，则尝试关闭
-        self.task_tx.send(None).unwrap_or(());
+        if let Some(t) = self.task_tx.take() {
+            t.send(None).unwrap_or(());
+        }
         // 注意：在Drop中不能等待异步操作完成
     }
 }
@@ -184,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_execution() {
-        let executor = AsyncExecutor::new();
+        let mut executor = AsyncExecutor::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
         for i in 0..10 {
@@ -198,19 +203,19 @@ mod tests {
                 })
                 .unwrap();
         }
-
+        executor.finish().await.unwrap();
         // 给任务一些时间执行
         sleep(Duration::from_millis(100)).await;
-
+        executor.wait().await.unwrap();
         // 0+1+2+...+9 = 45
         assert_eq!(counter.load(Ordering::SeqCst), 45);
 
-        executor.shutdown().await.unwrap();
+
     }
 
     #[tokio::test]
     async fn test_shutdown_with_pending_tasks() {
-        let executor = AsyncExecutor::new();
+        let mut executor = AsyncExecutor::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
         for i in 0..5 {
@@ -226,10 +231,10 @@ mod tests {
                 })
                 .unwrap();
         }
-
+        executor.finish().await.unwrap();
         // 立即关闭，但应该等待所有任务完成
         sleep(Duration::from_millis(10)).await;
-        executor.shutdown().await.unwrap();
+        executor.wait().await.unwrap();
 
         // 所有任务都应该完成
         assert_eq!(counter.load(Ordering::SeqCst), 10); // 0+1+2+3+4 = 10
@@ -237,15 +242,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_result_return() {
-        let executor = AsyncExecutor::new();
+        let mut executor = AsyncExecutor::new();
 
         let result = executor
             .submit_with_result(|| async { 42 })
             .unwrap().await.unwrap();
-
+        executor.finish().await.unwrap();
+        executor.wait().await.unwrap();
         assert_eq!(result, 42);
 
-        executor.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -277,14 +282,17 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-
-        // 给任务一些时间执行
-        sleep(Duration::from_millis(100)).await;
-
-        Arc::try_unwrap(executor)
-            .unwrap()
-            .shutdown()
+        let mut async_executor = Arc::try_unwrap(executor)
+            .unwrap();
+        async_executor.finish()
             .await
             .unwrap();
+        // 给任务一些时间执行
+        sleep(Duration::from_millis(100)).await;
+        async_executor
+            .wait()
+            .await
+            .unwrap();
+
     }
 }

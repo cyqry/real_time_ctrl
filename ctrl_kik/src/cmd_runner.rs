@@ -1,7 +1,9 @@
+use std::error::Error;
 use crate::cmd_runner::fs::rename;
 use crate::context::Context;
 use crate::{cmd_util, screen};
-use anyhow::anyhow;
+use anyhow::{anyhow};
+// use   anyhow::Context as AnyContext;
 use log::debug;
 use common::command::{Command, CtrlCommand};
 use common::message::resp::Resp;
@@ -11,6 +13,7 @@ use common::protocol::BufSerializable;
 use common::{file_util};
 use tokio::fs;
 use uuid::Uuid;
+
 
 pub async fn run(context: &Context, cmd: Command) -> Resp {
     debug!("Running command: {:?}", cmd);
@@ -121,7 +124,7 @@ async fn set_big_file(
 ) -> anyhow::Result<()> {
     let mut sum = 0;
 
-    let file = file_util::create_file(save_path.as_str()).await?;
+    let file = file_util::create_file(save_path.as_str()).await.map_err(|e| anyhow!("获取文件句柄失败,err:{}",e))?;
 
     let original_path = fs::canonicalize(save_path.as_str()).await?;
 
@@ -154,8 +157,13 @@ async fn set_big_file(
         }
     }
     drop(file);
-    fs::remove_file(save_path.as_str()).await?;
-    rename(temp_file_path.as_str(), save_path.as_str()).await?;
+    fs::remove_file(save_path.as_str()).await.or_else(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        Err(e)
+    }).map_err(|e| anyhow!("删除文件失败,err:{}",e))?;
+    rename(temp_file_path.as_str(), save_path.as_str()).await.map_err(|e| anyhow!("移动文件失败,err:{}",e))?;
     Ok(())
 }
 
