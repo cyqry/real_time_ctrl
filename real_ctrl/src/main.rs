@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use common::generated::encrypted_strings;
-use common::generated::encrypted_strings::HOST;
+use common::generated::encrypted_strings::{ PASSWORD, USER_NAME};
+use common::host::get_host;
+use crate::input_command::InputCommand;
 
 mod context;
 mod ctrl_conn;
@@ -20,19 +22,21 @@ mod dispatch;
 mod local_executor;
 mod server_executor;
 mod input_command;
+mod pipe;
+mod local_server;
 
 #[tokio::main]
 async fn main() {
-    env::set_var("RUST_LOG", "DEBUG");
+    env::set_var("RUST_LOG", "INFO");
     env_logger::init();
 
     let agent = Arc::new(RwLock::new(
         Agent::create(&Config {
             id: Id {
-                username: "root".to_string(),
-                password: "1104399".to_string(),
+                username: USER_NAME(),
+                password: PASSWORD(),
             },
-            server_host: HOST(),
+            server_host: get_host(),
             server_port: "9002".to_string(),
             read_timeout: Duration::from_secs(45),
             write_timeout: Duration::from_secs(45),
@@ -44,15 +48,19 @@ async fn main() {
     let context = Context::new(agent);
 
     context.data_init().await.unwrap();
-
+    println!("连接成功");
     loop {
         let mut s = String::new();
         let n = std::io::stdin().read_line(&mut s).unwrap();
         if s.trim().is_empty() {
             continue;
         }
-        debug!("\ninput:{}", s.trim());
-        match dispatch::distribution(&context, &s).await {
+        let i_cmd = s.trim().parse::<InputCommand>();
+        if let Err(e) = i_cmd {
+            println!("{}", e);
+            continue;
+        }
+        match dispatch::distribution(&context, i_cmd.unwrap()).await {
             Ok(s) => {
                 println!("{}", s);
             }

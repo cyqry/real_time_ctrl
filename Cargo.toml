@@ -1,17 +1,29 @@
+#ctrl_kik时放开
+#cargo-features = ["trim-paths"]
+
 [workspace]
-members = ["real_ctrl", "ctrl_kik", "ctrl_server", "win_common", "common", "start"]
+members = ["real_ctrl", "ctrl_kik", "ctrl_server", "win_common", "common", "start", "ctrl_common"]
 resolver = "2"
 
-
+#ctrl_server,real_ctrl 时放开
 [profile.release]
 strip = false
 lto = true
 opt-level = "z"
 
+#ctrl_kik时放开
+#[profile.release]
+#debug = 0
+#lto = true
+#strip = "symbols" # 比 `strip = true` 更彻底
+#codegen-units = 1
+#opt-level = "z"
+#panic = "abort"
+#trim-paths = "all"
+
 
 #[profile.ctrl_kik-release]
 #inherits = "release"
-#cargo-features = ["trim-paths"]
 #debug = 0
 #lto = true
 #strip = "symbols" # 比 `strip = true` 更彻底

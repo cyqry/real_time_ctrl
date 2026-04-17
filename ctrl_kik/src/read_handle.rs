@@ -5,10 +5,8 @@ use common::channel::{Channel, ChannelType};
 use common::command::{Command, SysCommand};
 use common::config::Config;
 use common::kik::Kik;
-use common::message::frame::Frame;
-use common::message::frame::Frame::{Cmd, Resp};
-use common::message::resp;
-use common::message::resp::Resp::{DataId, Info};
+use common::message::kik_frame::{ KikFrame};
+use common::message::kik_resp;
 use common::protocol;
 use common::protocol::{BufSerializable, CmdOptions};
 use log::debug;
@@ -22,6 +20,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time;
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
+use common::message::init_frame::InitFrame;
+use common::message::kik_resp::kik_error;
 
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的帧类型")
@@ -32,10 +32,10 @@ pub async fn handle_kik(
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut
 ) -> anyhow::Result<()> {
-    let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
+    let frame = KikFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
         //控制过程应由单独线程处理，不阻塞连接主线程,与ping pong分开
-        Frame::Cmd(req_cmd) => {
+        KikFrame::Cmd(req_cmd) => {
             channel
                 .lock()
                 .await
@@ -44,8 +44,8 @@ pub async fn handle_kik(
                 .send(req_cmd.split())
                 .expect("处理线程关闭");
         }
-        Frame::Ping => {}
-        Frame::Pong => {}
+        KikFrame::Ping => {}
+        KikFrame::Pong => {}
         _ => {
             return Err(default_error());
         }
@@ -60,11 +60,11 @@ pub async fn handle_kik_cmd(
     cmd_options: CmdOptions,
     cmd: Command,
 ) {
-    debug!("开run,cmd_id:{}", cmd_id);
+    debug!("Running command: {:?}", cmd);
     let resp = {
         let runner = cmd_runner::run(&context, cmd);
         if cmd_options.timeout() {
-            timeout(Duration::from_secs(60 * 5), runner).await.unwrap_or_else(|_| Info("Kik执行任务超时".to_string()))
+            timeout(Duration::from_secs(60 * 5), runner).await.unwrap_or_else(|_| kik_error("Kik执行任务超时".to_string()))
         } else {
             runner.await
         }
@@ -75,7 +75,7 @@ pub async fn handle_kik_cmd(
         .lock()
         .await
         .write_and_flush(&protocol::transfer_encode_frame(
-            Frame::RespExtra(resp, cmd_id),
+            KikFrame::RespExtra(resp, cmd_id),
         ))
         .await;
     //当发送失败
@@ -90,13 +90,16 @@ pub async fn handle_kik_data(
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut
 ) -> anyhow::Result<()> {
-    let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
+
+    let frame = KikFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
-        Frame::Data(id, data) => {
+        KikFrame::Data(id, data) => {
+            // debug!("kik收到长度{}的数据",data.len());
             context.send_data((id, data)).await.unwrap_or(());
+            // debug!("向接收通道发送数据失败,err:{}",e);
         }
-        Frame::Ping => {}
-        Frame::Pong => {}
+        KikFrame::Ping => {}
+        KikFrame::Pong => {}
         _ => {
             return Err(default_error());
         }
@@ -110,9 +113,11 @@ pub async fn handle_init_message(
     msg: BytesMut,
     tx: &mut Sender<Box<dyn Any + Send + Sync>>,
 ) -> anyhow::Result<()> {
-    let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
+
+    //由于服务端延迟发ping 所以还未初始化完成的kik连接 一般不会收到服务器的 KikFrame::Ping
+    let frame = InitFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
-        Frame::KikId(id) => {
+        InitFrame::KikId(id) => {
             match tx.send(Box::new(id)).await {
                 Ok(_) => {}
                 Err(e) => {
@@ -120,8 +125,6 @@ pub async fn handle_init_message(
                 }
             };
         }
-        Frame::Ping => {}
-        Frame::Pong => {}
         f => {
             return Err(default_error());
         }

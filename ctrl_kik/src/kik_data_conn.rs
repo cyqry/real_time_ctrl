@@ -7,8 +7,6 @@ use common::config::Config;
 use common::kik::Kik;
 use common::kik_info::KikInfo;
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
-use common::message::frame::Frame;
-use common::message::resp::Resp;
 use common::protocol;
 use common::protocol::BufSerializable;
 use log::debug;
@@ -25,6 +23,8 @@ use tokio::{join, time};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use uuid::Uuid;
+use common::message::init_frame;
+use common::message::init_frame::InitFrame;
 
 pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
     let socket =
@@ -103,10 +103,8 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
             let chan = channel.clone();
             handle_error(chan, e.unwrap()).await;
         }
-
-        let chan = channel.clone();
-        let context = context.clone();
-        tokio::spawn(async move { handle_inactive(&context, chan).await });
+        
+        handle_inactive(&context, channel).await;
     });
 
     //这次为第一次rx接收数据,用于阻塞校验
@@ -140,9 +138,13 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         time::sleep(Duration::from_secs(5)).await;
         let arc = channel.clone();
+        if arc.lock().await.is_closed() {
+            return;
+        }
+        
         let mut guard = arc.lock().await;
         if guard.channel_type != ChannelType::Unknown {
-            match guard.write_and_flush(&protocol::pong()).await {
+            match guard.write_and_flush(&protocol::kik_pong()).await {
                 Ok(_) => {}
                 Err(_) => {
                     break;
@@ -159,7 +161,7 @@ async fn handle_active(context: &Context, channel: Arc<Mutex<Channel>>) -> anyho
         .lock()
         .await
         .write_and_flush(&protocol::transfer_encode_frame(
-            Frame::KikDataConnReq(id),
+            InitFrame::KikDataConnReq(id),
         ))
         .await
 }

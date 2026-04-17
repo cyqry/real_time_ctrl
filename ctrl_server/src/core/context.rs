@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ops::Index;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use log::error;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 
 #[derive(Clone)]
@@ -25,6 +26,7 @@ pub struct Context {
     //当前正在控制的kik
     //之所以要在Kik内部加一个arc，是因为会被kik_map变量共享引用，Kik的conn和vec都只能在堆中存在一份，kik_info是可克隆的，conn和vec锁分开是因为他们没有关系
     kik_op: Arc<RwLock<Option<Kik>>>,
+    
     //所有在线的被控端map<String,Kik>
     pub kik_map: Arc<RwLock<HashMap<String, Kik>>>,
 
@@ -77,12 +79,13 @@ impl Context {
             Some(_) => false,
         }
     }
+    
     pub async fn delete_now_cmd_id(&self) {
         *(self.now_cmd_id.clone().write().await) = None;
     }
 
     pub async fn exist_ctrl(&self) -> bool {
-        self.ctrl_op.clone().read().await.is_some()
+        self.ctrl_op.read().await.is_some()
     }
 
     pub async fn delete_ctrl_conn(&self) -> Option<Arc<Mutex<Channel>>> {
@@ -183,9 +186,14 @@ impl Context {
         if option.is_some() {
             option.unwrap().delete_kik_conn().await;
         }
-        //判断map和 op是否为0和None，是的话自动删除map中的Kik,说明其彻底下线
+      
     }
-
+    
+    pub async fn delete_kik_if_not_online(&self, kik_id: &str)->Option<Kik> {
+        //todo 判断map和 op是否为0和None，是的话自动删除map中的Kik,说明其彻底下线
+        return None;
+    }
+    
     pub async fn delete_kik_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
         //先从 kik_op中找
         {
@@ -214,10 +222,43 @@ impl Context {
         *(self.kik_op.clone().write().await) = Some(kik);
     }
 
+    
+    //当前正在控制的kik，一定是初始化完成的kik连接即initialized一定为true
     pub async fn get_kik(&self) -> Option<Kik> {
-        self.kik_op.clone().read().await.clone()
+        let guard = self.kik_op.read().await;
+        match *guard {
+            None => {}
+            Some(ref k) => {
+                if !k.initialized() {
+                    error!("取当前正在控制kik时，未初始化完成")
+                }
+            }
+        }
+        guard.clone()
     }
 
+    pub async fn get_can_ctrl_kik(&self) -> Vec<(String, Kik)> {
+        let mut res = vec![];
+        for (id, kik) in self.kik_map.read().await.iter() {
+            if kik.initialized() && kik.exist_kik_conn().await {
+                res.push((id.to_owned(), kik.clone()))
+            }
+        }
+        res
+    }
+
+    pub async fn get_initialized_kik_by_id(&self, id: &str) -> Option<Kik> {
+        let read = self.kik_map.read().await;
+        let kik = read.get(id);
+
+        if kik.is_some() {
+            if kik.unwrap().initialized() {
+                return Some(kik.unwrap().clone());
+            }
+        }
+        None
+    }
+    
     pub async fn kiks_emtpy(&self) -> bool {
         self.kik_map.clone().read().await.is_empty()
     }

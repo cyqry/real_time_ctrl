@@ -17,6 +17,8 @@ use tokio::{io, time};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
+use common::protocol::kik_ping;
+use ctrl_common::ctrl_protocol::ctrl_ping;
 
 pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     let listener =
@@ -44,7 +46,7 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, loca
 
     let chan = channel.clone();
     tokio::spawn(async move {
-        hearbeat(chan).await;
+        heartbeat(chan).await;
     });
 
     let e = loop {
@@ -57,7 +59,7 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, loca
             Ok(res) => match res {
                 Some(Ok(msg)) => {
                     let channel = channel.clone();
-                    match handle_read(&config, &context, channel, msg).await {
+                    match handle_read(config.clone(), context.clone(), channel, msg).await {
                         Ok(_) => {}
                         Err(e) => {
                             break Some(e);
@@ -122,10 +124,17 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
             // context.set_kik_state();
             // 因为Kik连接断开了，所以万一在被控制，需要清理
             let _ = context.delete_kik_conn_if_id(id.as_str()).await;
+            if let Some(kik) =  context.delete_kik_if_not_online(id.as_str()).await {
+                info!("【{}】下线，ip:{}",kik.kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
+            }
         }
         ChannelType::KikData => {
+            let id = channel.lock().await.get::<String>("kik_id").unwrap().to_string();
             //清理
-            context.delete_kik_data_conn(channel).await;
+            context.delete_kik_data_conn(channel.clone()).await;
+            if let Some(kik) =  context.delete_kik_if_not_online(id.as_str()).await {
+                info!("【{}】下线，ip:{}",kik.kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
+            }
         }
         ChannelType::Unknown => {
             //清理？？？？
@@ -133,16 +142,35 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
     };
 }
 
-async fn hearbeat(channel: Arc<Mutex<Channel>>) {
+async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
-        time::sleep(Duration::from_secs(10)).await;
-        // 服务器可以放开此限制
-        // if channel.clone().lock().await.channel_type!=ChannelType::Unknown {
+        //延迟发ping
+        time::sleep(Duration::from_secs(5)).await;
+        if channel.lock().await.is_closed() {
+            return;
+        }
+        let channel_type = channel.clone().lock().await.channel_type.clone();
+        let ping = match channel_type {
+            ChannelType::Ctrl | ChannelType::CtrlData => {
+                Some(ctrl_ping())
+            }
+            ChannelType::Kik | ChannelType::KikData => {
+                Some(kik_ping())
+            }
+            ChannelType::Unknown => {
+                None
+            }
+        };
+        if ping.is_none() {
+            continue;
+        }
+
+        //服务端要保证得到状态之后延迟一点发，因为要等对方接收确认
+        time::sleep(Duration::from_secs(5)).await;
         match channel
-            .clone()
             .lock()
             .await
-            .write_and_flush(&protocol::ping())
+            .write_and_flush(&*ping.unwrap())
             .await
         {
             Ok(_) => {}
@@ -155,9 +183,13 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
 
 async fn handle_active(arc: Arc<Mutex<Channel>>) {}
 
+
+
+
+//由于初始化验证消息和业务消息是分开的，所以初始化过程中不能ping pong和发业务消息，所以服务端要么 确认 客户端接收到服务端确认 才能 ping pong， 要么 向客户端发送服务端确认之后 延迟发ping pong；这里采用后者方案
 async fn handle_read(
-    config: &Config,
-    context: &Context,
+    config: Config,
+    context: Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
@@ -168,7 +200,7 @@ async fn handle_read(
         ChannelType::Kik => read_handle::handle_kik(context, channel, msg).await,
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => {
-            //未识别的连接连ping pong 都不让发
+            //未识别的连接连ping pong 都不让发； unknow到其他消息状态的转换最好是同步的，不然有问题
             read_handle::handle_init_message(config, context, channel, msg).await
         }
     };

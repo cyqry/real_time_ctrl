@@ -10,6 +10,8 @@
     "PORT": "9002",
     "START_ERROR_1": "start在隐藏路径执行失败",
     "START_ERROR_2": "start保存至隐藏路径失败",
-    "START_ERROR_3": "start获取后台执行文件失败"
+    "START_ERROR_3": "start获取后台执行文件失败",
+    "USER_NAME": "root",
+    "PASSWORD": "1104399"
   }
 }

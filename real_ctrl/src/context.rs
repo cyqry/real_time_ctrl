@@ -1,22 +1,20 @@
 use crate::ctrl_conn::ctrl_conn;
 use crate::ctrl_data_conn::ctrl_data_conn;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use common::channel::Channel;
-use common::command::Command;
 use common::config::Config;
-use common::message::frame::Frame;
-use common::message::resp::Resp;
 use common::protocol;
-use common::protocol::{BufSerializable, ReqCmd};
+use common::protocol::ReqCmd;
+use ctrl_common::ctrl_frame::Frame;
+use ctrl_common::ctrl_protocol::ctrl_cmd_req;
+use ctrl_common::ctrl_resp::CmdResp;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI16, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use log::debug;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -34,7 +32,7 @@ pub struct Context {
 //
 pub struct Agent {
     pub config: Config,
-    recv: mpsc::Receiver<Resp>,
+    recv: mpsc::Receiver<CmdResp>,
     conn: Arc<Mutex<Channel>>,
 }
 
@@ -49,7 +47,7 @@ impl Context {
         }
     }
     pub async fn insert_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
-        let id = data_conn.clone().lock().await.get_id().to_string();
+        let id = data_conn.lock().await.get_id().to_string();
         self.data_conns.write().await.insert(id, data_conn);
     }
     pub async fn delete_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
@@ -71,19 +69,17 @@ impl Context {
     }
 
     pub async fn send_data_with_id(&self, data_id: String, v: &[u8]) -> anyhow::Result<()> {
-
         match self.find_ctrl_data().await {
             None => Err(anyhow::Error::msg("应用数据传输通道未初始化!")),
             Some(data_conn) => {
                 let mut bytes_mut = BytesMut::with_capacity(v.len());
                 bytes_mut.put_slice(v);
 
-                let mut guard = data_conn
-                    .lock()
-                    .await;
-                guard .write_and_flush(&protocol::transfer_encode_frame(
-                        Frame::Data(data_id, bytes_mut),
-                    ))
+                let mut guard = data_conn.lock().await;
+                guard
+                    .write_and_flush(&protocol::transfer_encode_frame(Frame::Data(
+                        data_id, bytes_mut,
+                    )))
                     .await?;
                 Ok(())
             }
@@ -123,7 +119,7 @@ impl Context {
         Some(c)
     }
     pub async fn data_init(&self) -> anyhow::Result<()> {
-        let config = self.agent.clone().read().await.config.clone();
+        let config = self.agent.read().await.config.clone();
         ctrl_data_conn(self.clone(), &config).await
     }
 }
@@ -143,9 +139,9 @@ impl Agent {
             Err(_) => {}
         }
     }
-    pub async fn re_conn(&mut self, count: u32) -> anyhow::Result<()> {
+    pub async fn re_conn(&mut self, retry_count: u32) -> anyhow::Result<()> {
         let mut re = anyhow::Error::msg("unreachable!");
-        for _ in 0..count {
+        for _ in 0..retry_count {
             match ctrl_conn(&self.config).await {
                 Ok((conn, tx)) => {
                     self.conn = conn;
@@ -162,8 +158,7 @@ impl Agent {
         Err(re)
     }
 
-    pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<Resp> {
-        debug!("发送命令，{:?}", cmd);
+    pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
         let mut re = anyhow::Error::msg("unreachable!");
         //由于编译器无法确定这个for是否至少有一次循环，所以需要re变量初始化
         for _ in 0..3 {
@@ -173,7 +168,7 @@ impl Agent {
                 .clone()
                 .lock()
                 .await
-                .write_and_flush(&protocol::cmd(cmd.clone()))
+                .write_and_flush(&ctrl_cmd_req(cmd.clone()))
                 .await
             {
                 Ok(_) => {}
@@ -183,6 +178,7 @@ impl Agent {
                     continue;
                 }
             };
+
             //read
             match self.recv.recv().await {
                 None => {

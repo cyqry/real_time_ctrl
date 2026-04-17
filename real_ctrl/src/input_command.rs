@@ -3,8 +3,11 @@ use common::command::LocalCommand::LocalExit;
 use common::command::SysCommand::*;
 use common::command::{Command, CtrlCommand, LocalCommand, SysCommand};
 use std::str::FromStr;
+use bytes::BytesMut;
+use serde::{Deserialize, Serialize};
+use common::protocol::BufSerializable;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputCommand {
     Sys(SysCommand),
     Local(LocalCommand),
@@ -12,7 +15,7 @@ pub enum InputCommand {
     Exec(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputCtrlCommand {
     GetFile(String, String),
     GetBigFile(String, String),
@@ -21,6 +24,30 @@ pub enum InputCtrlCommand {
     Ls(String),
     Screen(String),
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RemoteResp {
+    Success(String),
+    SuccessData(Vec<u8>),
+    Error(u32, String),
+}
+
+impl BufSerializable for RemoteResp {
+    fn to_buf(&self) -> BytesMut {
+        let vec = postcard::to_allocvec(self).expect("failed to serialize RemoteResp");
+        BytesMut::from(vec.as_slice())
+    }
+
+    fn from_buf(bys: BytesMut) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let resp = postcard::from_bytes::<RemoteResp>(bys.to_vec().as_slice()).expect("failed to serialize RemoteResp");
+        Some(resp)
+    }
+}
+
+
 
 #[cfg(target_os = "windows")]
 static DEFAULT_SCREEN_PATH: &str = "D:\\MyTest\\1.png";
@@ -112,6 +139,17 @@ fn unknown<T>(s: &str) -> anyhow::Result<T> {
     Err(anyhow!(format!("Unknown command: {}", s)))
 }
 
+pub fn serialize_command(cmd: &InputCommand) -> anyhow::Result<Vec<u8>> {
+    let bytes = postcard::to_allocvec(cmd)?;
+    Ok(bytes)
+}
+
+/// 从字节切片反序列化 InputCommand
+pub fn deserialize_command(bytes: &[u8]) -> anyhow::Result<InputCommand> {
+    let cmd = postcard::from_bytes(bytes)?;
+    Ok(cmd)
+}
+
 #[test]
 fn test() {
     println!("{}", (0 as *mut String).is_null()); //true
@@ -127,4 +165,13 @@ fn test() {
         }
         _ => {}
     }
+}
+
+#[test]
+fn de_test(){
+    let command = InputCommand::Ctrl(InputCtrlCommand::Ls("sss".to_string()));
+    let vec = serialize_command(&command).unwrap();
+    println!("{}", vec.len());
+    let input_command = deserialize_command(vec.as_slice()).unwrap();
+    println!("{:?}", input_command);
 }

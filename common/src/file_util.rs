@@ -459,3 +459,7 @@ async fn test() {
 
     println!("Elapsed time: {} ms", timer.elapsed(TimeUnit::Milliseconds));
 }
+
+pub async fn get_file_size<P: AsRef<Path>>(path: P) -> Result<u64, std::io::Error> {
+    fs::metadata(path.as_ref()).await.map(|meta| meta.len())
+}

@@ -3,10 +3,12 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::{Config, Id};
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
-use common::message::frame::Frame;
-use common::message::resp::Resp;
+use common::message::init_frame::InitFrame;
 use common::protocol;
 use common::protocol::BufSerializable;
+use ctrl_common::ctrl_frame::Frame;
+use ctrl_common::ctrl_resp::Resp::Server;
+use ctrl_common::ctrl_resp::{CmdResp, Resp, ServerResp, ServerSuccessResp};
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,26 +20,25 @@ use tokio::time;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
+use ctrl_common::ctrl_protocol::ctrl_pong;
 
-pub async fn ctrl_conn(config: &Config) -> anyhow::Result<(Arc<Mutex<Channel>>, Receiver<Resp>)> {
+pub async fn ctrl_conn(
+    config: &Config,
+) -> anyhow::Result<(Arc<Mutex<Channel>>, Receiver<CmdResp>)> {
     let socket =
         TcpStream::connect(format!("{}:{}", config.server_host, config.server_port)).await?;
     let (reader, writer) = socket.into_split();
     let framed_read = FramedRead::new(BufReader::new(reader), LengthFieldBasedFrameDecoder::new());
     let mut framed_arc = Arc::new(Mutex::new(framed_read));
 
-    let channel_arc = Arc::new(Mutex::new(Channel::new(
-        writer,
-        None,
-        ChannelType::Unknown,
-    )));
+    let channel_arc = Arc::new(Mutex::new(Channel::new(writer, None, ChannelType::Unknown)));
 
     //active逻辑
     let channel = channel_arc.clone();
     handle_active(&config.id, channel.clone()).await?;
 
     //tx在连接处理线程结束后被关闭
-    let (mut tx, mut rx) = mpsc::channel::<Resp>(5);
+    let (mut tx, mut rx) = mpsc::channel::<CmdResp>(5);
     tokio::spawn(async move {
         //心跳逻辑
         let chan = channel.clone();
@@ -102,19 +103,19 @@ pub async fn ctrl_conn(config: &Config) -> anyhow::Result<(Arc<Mutex<Channel>>, 
             panic!("服务器未响应")
         }
         Some(res) => {
-            match res {
-                Resp::Info(auth) => {
+            match res.get_resp() {
+                Server(ServerResp::Success(ServerSuccessResp::Info(auth))) => {
                     //使用这个类型这个值来标识这是服务端校验成功的回复
                     if auth == "##authtrue" {
                         //更改类型为Ctrl，即校验成功了
-                        channel_arc.clone().lock().await.channel_type = ChannelType::Ctrl;
-                        println!("校验成功");
+                        channel_arc.lock().await.channel_type = ChannelType::Ctrl;
+                        debug!("校验成功");
                     } else {
-                        panic!("服务端奇怪的响应，系统错误");
+                        panic!("系统错误");
                     }
                 }
                 _ => {
-                    panic!("服务端奇怪的响应，系统错误");
+                    panic!("系统错误");
                 }
             };
         }
@@ -131,7 +132,7 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
         let arc = channel.clone();
         let mut guard = arc.lock().await;
         if guard.channel_type != ChannelType::Unknown {
-            match guard.write_and_flush(&protocol::pong()).await {
+            match guard.write_and_flush(&ctrl_pong()).await {
                 Ok(_) => {}
                 Err(_) => {
                     break;
@@ -143,12 +144,11 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
 
 async fn handle_active(id: &Id, channel: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
     channel
-        .clone()
         .lock()
         .await
-        .write_and_flush(&protocol::transfer_encode_frame(
-            Frame::CtrlAuthReq(id.encrypt()),
-        ))
+        .write_and_flush(&protocol::transfer_encode_frame(InitFrame::CtrlAuthReq(
+            id.encrypt(),
+        )))
         .await?;
     Ok(())
 }
@@ -165,30 +165,48 @@ async fn handle_inactive(channel: Arc<Mutex<Channel>>) {
 async fn handle_read(
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    tx: &mut Sender<Resp>,
+    tx: &mut Sender<CmdResp>,
 ) -> Option<()> {
-    let frame = Frame::from_buf(msg)?;
-
-    match frame {
-        Frame::CtrlAuthReply(b) => {
-            if !b {
-                debug!("控制连接校验失败");
-                println!("账号或密码错误");
-                std::process::exit(0);
-            } else {
-                //发一次使得这个的rx第一次read，即接下来可以read数据
-                tx.send(Resp::Info("##authtrue".to_string())).await.unwrap(); //设计不允许此时unwrap
+    let channel_type = channel.lock().await.channel_type.clone();
+    if channel_type == ChannelType::Unknown {
+        let frame = InitFrame::from_buf(msg)?;
+        match frame {
+            InitFrame::CtrlAuthReply(b) => {
+                if !b {
+                    debug!("控制连接校验失败");
+                    println!("账号或密码错误");
+                    std::process::exit(0);
+                } else {
+                    //发一次使得这个的rx第一次read，即接下来可以read数据; 业务消息和验证成功消息这里用同一个tx，第一次读为通知验证成功
+                    tx.send(CmdResp::new(
+                        "##cmdId".to_string(),
+                        Server(ServerResp::Success(ServerSuccessResp::Info(
+                            "##authtrue".to_string(),
+                        ))),
+                    ))
+                    .await
+                    .unwrap(); //设计不允许此时unwrap
+                }
+            }
+            _ => {
+                panic!("控制端不支持的帧")
             }
         }
-        Frame::Resp(resp) => {
-            tx.send(resp).await.ok()?;
-        }
-        Frame::Ping => {}
-        Frame::Pong => {}
-        f => {
-            debug!("控制连接收到错误的帧,{:?}", f);
-            panic!("控制端不支持的帧")
-        }
-    };
+    } else {
+        let frame = Frame::from_buf(msg)?;
+
+        match frame {
+            Frame::Resp(resp) => {
+                tx.send(resp).await.ok()?;
+            }
+            Frame::Ping => {}
+            Frame::Pong => {}
+            f => {
+                debug!("控制连接收到错误的帧,{:?}", f);
+                panic!("控制端不支持的帧")
+            }
+        };
+    }
+
     Some(())
 }

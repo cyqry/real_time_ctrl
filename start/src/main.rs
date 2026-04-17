@@ -4,19 +4,16 @@ mod req_util;
 
 use std::error::Error;
 use std::ffi::OsStr;
-use std::iter::once;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Stdio};
-use std::ptr::null_mut;
 use std::time::Duration;
 use anyhow::anyhow;
 use tokio::{fs, time};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
 use common::generated::encrypted_strings::*;
+use common::host::get_host;
 use crate::req_util::{get_file_bytes, info_call};
 
 
@@ -31,7 +28,7 @@ async fn main() {
     }
     println!("你好😃😃😃...");
 
-    let host_str = HOST();
+    let host_str = get_host();
     let (host, port) = (host_str.as_str(), 9003);
 
 

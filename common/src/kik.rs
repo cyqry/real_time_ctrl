@@ -2,7 +2,7 @@ use crate::channel::Channel;
 use crate::kik_info::KikInfo;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock};
@@ -18,6 +18,9 @@ pub struct Kik {
     //data conn 的getid是 random id,  attr 一个 kik id;这里的key为 data conn的get_id
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
     next_data_conn: Arc<AtomicU16>,
+    
+    //是否已上线(只在初始化时修改一次)
+    initialized: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -39,6 +42,7 @@ impl Kik {
             next_data_conn: Arc::new(AtomicU16::new(0)),
             conn_op: Arc::new(RwLock::new(Some(conn))),
             data_conns: Arc::new(Mutex::new(HashMap::new())),
+            initialized: Arc::new(AtomicBool::new(false)),
         }
     }
     pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {
@@ -55,6 +59,14 @@ impl Kik {
         }
     }
 
+    pub fn set_kik_initialized(&self, initialized: bool) {
+        self.initialized.store(initialized, Ordering::SeqCst);
+    }
+    
+    pub fn initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
+    }
+    
     pub async fn exist_kik_conn(&self) -> bool {
         self.conn_op.clone().read().await.is_some()
     }

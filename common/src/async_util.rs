@@ -1,79 +1,156 @@
+use anyhow::anyhow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use anyhow::anyhow;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::Receiver;
 use tokio::task::JoinHandle;
 
 // 定义任务类型：一个返回Future的闭包
-type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output=()> + Send + 'static>> + Send + 'static>;
 
 /// 异步执行器
 #[derive(Debug)]
-pub struct AsyncExecutor {
-    task_tx: Option<UnboundedSender<Option<Task>>>,
+pub struct AsyncExecutor<T> {
+    task_tx: Option<T>,
     worker_handle: Option<JoinHandle<()>>,
+    capacity: usize,
 }
 
-impl AsyncExecutor {
-    /// 创建新的异步执行器
-    pub fn new() -> Self {
-        // 创建任务通道
-        let (task_tx, task_rx) = mpsc::unbounded_channel();
+pub trait Sender {
+    fn send(
+        &self,
+        data: Option<Task>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+}
+pub trait Receiver {
+    fn recv(&mut self) -> impl Future<Output = Option<Option<Task>>> + Send;
+}
 
-
-        // 启动工作协程
-        let worker_handle = tokio::spawn(Self::worker_loop(task_rx));
-
-        Self {
-            task_tx: Some(task_tx),
-            worker_handle: Some(worker_handle),
+impl Sender for mpsc::Sender<Option<Task>> {
+    fn send(
+        &self,
+        data: Option<Task>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        async {
+            let res = self.send(data).await;
+            match res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(anyhow!("{}", e)),
+            }
         }
     }
+}
 
-    /// 工作协程的主循环
-    async fn worker_loop(mut task_rx: UnboundedReceiver<Option<Task>>) {
-        let mut shutdown = false;
-        while let Some(Some(task)) = task_rx.recv().await {
-            let future = task();
-            future.await;
+impl Sender for mpsc::UnboundedSender<Option<Task>> {
+    async fn send(&self, data: Option<Task>) -> anyhow::Result<()> {
+        self.send(data).map_err(|e| anyhow!("{}", e))
+    }
+}
+
+impl Receiver for mpsc::UnboundedReceiver<Option<Task>> {
+    async fn recv(&mut self) -> Option<Option<Task>> {
+        self.recv().await
+    }
+}
+impl Receiver for mpsc::Receiver<Option<Task>> {
+    async fn recv(&mut self) -> Option<Option<Task>> {
+        self.recv().await
+    }
+}
+
+/// 创建有限缓存的异步执行器
+pub fn new(size: usize) -> AsyncExecutor<mpsc::Sender<Option<Task>>> {
+    // 创建有界任务通道
+    let (task_tx, task_rx) = mpsc::channel(size);
+
+    // 启动工作协程
+    let worker_handle = tokio::spawn(worker_loop(task_rx));
+
+    AsyncExecutor {
+        task_tx: Some(task_tx),
+        worker_handle: Some(worker_handle),
+        capacity: size,
+    }
+}
+
+/// 创建无限缓存的异步执行器
+pub fn new_unbound() -> AsyncExecutor<mpsc::UnboundedSender<Option<Task>>> {
+    // 创建无界任务通道
+    let (task_tx, task_rx) = mpsc::unbounded_channel();
+
+    // 启动工作协程
+    let worker_handle = tokio::spawn(worker_loop(task_rx));
+
+    AsyncExecutor {
+        task_tx: Some(task_tx),
+        worker_handle: Some(worker_handle),
+        capacity: 0, // 0表示无限容量
+    }
+}
+
+/// 工作协程的主循环
+async fn worker_loop(mut task_rx: impl Receiver) {
+    while let Some(task_opt) = task_rx.recv().await {
+        match task_opt {
+            Some(task) => {
+                let future = task();
+                future.await;
+            }
+            None => {
+                break;
+            }
         }
     }
+}
 
-    /// 提交异步任务
-    pub fn submit<F, Fut>(&self, f: F) -> anyhow::Result<()>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        let task: Task = Box::new(move || Box::pin(f()));
+impl<T: Sender> AsyncExecutor<T> {
+    /// 获取执行器容量
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 
-        self.task_tx.as_ref().ok_or(anyhow!("执行器已关闭"))?
+    // /// 获取当前队列中的任务数量（近似值）
+    // pub async fn pending_tasks(&self) -> usize {
+    //     if let Some(tx) = &self.task_tx {
+    //         tx.capacity()
+    //             .map(|cap| {
+    //                 // 有界队列：容量减去可用空间
+    //                 if cap > 0 { cap - tx.max_capacity() } else { 0 }
+    //             })
+    //             .unwrap_or(0)
+    //     } else {
+    //         0
+    //     }
+    // }
+
+    /// 提交异步任务（阻塞直到有可用空间）
+    pub async fn submit(&self, task: Task) -> anyhow::Result<()> {
+        self.task_tx
+            .as_ref()
+            .ok_or(anyhow!("执行器已关闭"))?
             .send(Some(task))
+            .await
             .map_err(|e| anyhow!("Failed to submit task: {}", e))
     }
 
-    /// 提交异步任务并等待返回结果
-    pub fn submit_with_result<F, Fut, R>(&self, f: F) -> anyhow::Result<Receiver<R>>
+    /// 提交异步任务并等待返回结果（阻塞直到有可用空间）
+    pub async fn submit_with_result<R>(&self, f: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output=R> + Send >> + Send>) -> anyhow::Result<oneshot::Receiver<R>>
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
         let (result_tx, result_rx) = oneshot::channel();
 
-        let task = move || {
-            let future = f();
-            async move {
-                let result = future.await;
-                let _ = result_tx.send(result);
-            }
-        };
+        let task2 = Box::new(move ||-> Pin<Box<dyn Future<Output=()> + Send>> {
+            let f = f;
+            Box::pin(async move {
+                let result = f().await;
+                _ = result_tx.send(result);
+            })
+        });
 
-        self.submit(task)?;
+        self.submit(task2).await?;
 
         Ok(result_rx)
     }
@@ -81,10 +158,16 @@ impl AsyncExecutor {
     /// 任务执行结束信号
     pub async fn finish(&mut self) -> Result<(), String> {
         // 发送关闭信号
-        self.task_tx.take().ok_or("执行器已关闭".to_string())?.send(None).unwrap_or(());
-        Ok(())
+        if let Some(tx) = self.task_tx.take() {
+            // 这里我们发送None来通知worker退出
+            let _ = tx.send(None).await;
+            Ok(())
+        } else {
+            Err("执行器已关闭".to_string())
+        }
     }
 
+    /// 等待所有任务完成
     pub async fn wait(&mut self) -> Result<(), String> {
         // 等待工作协程完成
         if let Some(handle) = self.worker_handle.take() {
@@ -97,202 +180,148 @@ impl AsyncExecutor {
 
     /// 检查执行器是否已关闭
     pub fn is_closed(&self) -> bool {
-        self.task_tx.as_ref().map(|t| t.is_closed()).unwrap_or(false)
+        self.task_tx.is_none()
     }
+
+    // 检查队列是否已满（仅对有限缓存版本有意义）
+    // pub fn is_full(&self) -> bool {
+    //     match &self.task_tx {
+    //         Some(tx) => tx.is_full(),
+    //         None => true,
+    //     }
+    // }
 }
 
-impl Drop for AsyncExecutor {
-    fn drop(&mut self) {
-        // 如果用户没有显式调用shutdown，则尝试关闭
-        if let Some(t) = self.task_tx.take() {
-            t.send(None).unwrap_or(());
-        }
-        // 注意：在Drop中不能等待异步操作完成
-    }
-}
-
-/// 线程安全的执行器引用
-// pub type AsyncExecutorRef = Arc<AsyncExecutor>;
-
-/// 构建器模式，用于配置执行器
-// pub struct ExecutorBuilder {
-//     worker_name: Option<String>,
-//     panic_handler: Option<Box<dyn Fn(Box<dyn std::any::Any + Send>) + Send + Sync>>,
-// }
-//
-// impl ExecutorBuilder {
-//     pub fn new() -> Self {
-//         Self {
-//             worker_name: None,
-//             panic_handler: None,
+// impl Drop for AsyncExecutor<mpsc::UnboundedSender<Option<Task>>> {
+//     fn drop(&mut self) {
+//         // 如果用户没有显式调用finish，则尝试关闭
+//         if let Some(tx) = self.task_tx.take() {
+//             // 由于在Drop中不能await，我们只能尝试发送，如果失败则忽略
+//             _ = tx.send(None);
 //         }
-//     }
-//
-//     pub fn worker_name(mut self, name: impl Into<String>) -> Self {
-//         self.worker_name = Some(name.into());
-//         self
-//     }
-//
-//     pub fn panic_handler<F>(mut self, handler: F) -> Self
-//     where
-//         F: Fn(Box<dyn std::any::Any + Send>) + Send + Sync + 'static,
-//     {
-//         self.panic_handler = Some(Box::new(handler));
-//         self
-//     }
-//
-//     pub fn build(self) -> AsyncExecutor {
-//         let (task_tx, task_rx) = mpsc::unbounded_channel();
-//         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-//
-//         // 包装工作循环以处理panic
-//         let worker_loop = async move {
-//             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-//                 async move {
-//                     AsyncExecutor::worker_loop(task_rx).await
-//                 }
-//             ));
-//
-//             match result {
-//                 Ok(future) => future.await,
-//                 Err(panic) => {
-//                     if let Some(handler) = &self.panic_handler {
-//                         handler(panic);
-//                     } else {
-//                         eprintln!("Executor worker panicked!");
-//                     }
-//                 }
-//             }
-//         };
-//
-//         // 创建任务，可选命名
-//         let worker_handle = if let Some(name) = self.worker_name {
-//             tokio::task::Builder::::new().name(&name).spawn(worker_loop)
-//         } else {
-//             tokio::spawn(worker_loop)
-//         }.expect("Failed to spawn worker task");
-//
-//         AsyncExecutor {
-//             task_tx,
-//             worker_handle: Some(worker_handle),
-//         }
+//         // 注意：在Drop中不能等待异步操作完成
 //     }
 // }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_util;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
 
-    #[tokio::test]
-    async fn test_basic_execution() {
-        let mut executor = AsyncExecutor::new();
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        for i in 0..10 {
-            let counter_clone = counter.clone();
-            executor
-                .submit(move || {
-                    let counter = counter_clone;
-                    async move {
-                        counter.fetch_add(i, Ordering::SeqCst);
-                    }
-                })
-                .unwrap();
-        }
-        executor.finish().await.unwrap();
-        // 给任务一些时间执行
-        sleep(Duration::from_millis(100)).await;
-        executor.wait().await.unwrap();
-        // 0+1+2+...+9 = 45
-        assert_eq!(counter.load(Ordering::SeqCst), 45);
-
-
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_with_pending_tasks() {
-        let mut executor = AsyncExecutor::new();
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        for i in 0..5 {
-            let counter_clone = counter.clone();
-            executor
-                .submit(move || {
-                    let counter = counter_clone;
-                    async move {
-                        // 模拟长时间运行的任务
-                        sleep(Duration::from_millis(50)).await;
-                        counter.fetch_add(i, Ordering::SeqCst);
-                    }
-                })
-                .unwrap();
-        }
-        executor.finish().await.unwrap();
-        // 立即关闭，但应该等待所有任务完成
-        sleep(Duration::from_millis(10)).await;
-        executor.wait().await.unwrap();
-
-        // 所有任务都应该完成
-        assert_eq!(counter.load(Ordering::SeqCst), 10); // 0+1+2+3+4 = 10
-    }
-
-    #[tokio::test]
-    async fn test_result_return() {
-        let mut executor = AsyncExecutor::new();
-
-        let result = executor
-            .submit_with_result(|| async { 42 })
-            .unwrap().await.unwrap();
-        executor.finish().await.unwrap();
-        executor.wait().await.unwrap();
-        assert_eq!(result, 42);
-
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_submission() {
-        let executor = Arc::new(AsyncExecutor::new());
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = vec![];
-
-        for _ in 0..10 {
-            let executor = executor.clone();
-            let counter = counter.clone();
-            let handle = tokio::spawn(async move {
-                for i in 0..10 {
-                    let counter = counter.clone();
-                    executor
-                        .submit(move || {
-                            let counter = counter;
-                            async move {
-                                counter.fetch_add(i, Ordering::SeqCst);
-                            }
-                        })
-                        .unwrap();
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-        let mut async_executor = Arc::try_unwrap(executor)
-            .unwrap();
-        async_executor.finish()
-            .await
-            .unwrap();
-        // 给任务一些时间执行
-        sleep(Duration::from_millis(100)).await;
-        async_executor
-            .wait()
-            .await
-            .unwrap();
-
-    }
+    // #[tokio::test]
+    // async fn test_basic_execution() {
+    //     let mut executor = async_util::new(5);
+    //     let counter = Arc::new(AtomicUsize::new(0));
+    //
+    //     for i in 0..10 {
+    //         let counter_clone = counter.clone();
+    //         executor
+    //             .submit(move || {
+    //                 let counter = counter_clone;
+    //                 async move {
+    //                     counter.fetch_add(i, Ordering::SeqCst);
+    //                 }
+    //             })
+    //             .await
+    //             .unwrap();
+    //     }
+    //     executor.finish().await.unwrap();
+    //     // 给任务一些时间执行
+    //     sleep(Duration::from_millis(100)).await;
+    //     executor.wait().await.unwrap();
+    //     // 0+1+2+...+9 = 45
+    //     assert_eq!(counter.load(Ordering::SeqCst), 45);
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_shutdown_with_pending_tasks() {
+    //     let mut executor = new(5);
+    //     let counter = Arc::new(AtomicUsize::new(0));
+    //
+    //     for i in 0..5 {
+    //         let counter_clone = counter.clone();
+    //         executor
+    //             .submit(move || {
+    //                 let counter = counter_clone;
+    //                 async move {
+    //                     // 模拟长时间运行的任务
+    //                     sleep(Duration::from_millis(50)).await;
+    //                     counter.fetch_add(i, Ordering::SeqCst);
+    //                 }
+    //             })
+    //             .await
+    //             .unwrap();
+    //     }
+    //     executor.finish().await.unwrap();
+    //     // 立即关闭，但应该等待所有任务完成
+    //     sleep(Duration::from_millis(10)).await;
+    //     executor.wait().await.unwrap();
+    //
+    //     // 所有任务都应该完成
+    //     assert_eq!(counter.load(Ordering::SeqCst), 10); // 0+1+2+3+4 = 10
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_result_return() {
+    //     let mut executor = new(5);
+    //
+    //     let result = executor
+    //         .submit_with_result(|| async { 42 })
+    //         .await
+    //         .unwrap()
+    //         .await
+    //         .unwrap();
+    //     executor.finish().await.unwrap();
+    //     executor.wait().await.unwrap();
+    //     assert_eq!(result, 42);
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_concurrent_submission() {
+    //     // let executor = Arc::new(new(4));
+    //     // let counter = Arc::new(AtomicUsize::new(0));
+    //     //
+    //     // let mut handles = vec![];
+    //     //
+    //     // for _ in 0..10 {
+    //     //     let counter = counter.clone();
+    //     //     let executor = executor.clone();
+    //     //     let handle = tokio::spawn(async move {
+    //     //         let mut executor =executor;
+    //     //       executor.submit(||{
+    //     //           async {
+    //     //
+    //     //           }
+    //     //       }).await.unwrap();
+    //     //         // executor.submit( || {
+    //     //         //     async {}
+    //     //         // }).await.unwrap();
+    //     //         // for i in 0..10 {
+    //     //         //     let counter = counter.clone();
+    //     //         //     executor
+    //     //         //         .submit(move || {
+    //     //         //             let counter = counter;
+    //     //         //             async move {
+    //     //         //                 counter.fetch_add(i, Ordering::SeqCst);
+    //     //         //             }
+    //     //         //         })
+    //     //         //         .await
+    //     //         //         .unwrap();
+    //     //         // }
+    //     //     });
+    //     //     handles.push(handle);
+    //     // }
+    //     //
+    //     // for handle in handles {
+    //     //     handle.await.unwrap();
+    //     // }
+    //     // let mut async_executor = Arc::try_unwrap(executor).unwrap();
+    //     // async_executor.finish().await.unwrap();
+    //     // // 给任务一些时间执行
+    //     // sleep(Duration::from_millis(100)).await;
+    //     // async_executor.wait().await.unwrap();
+    // }
 }

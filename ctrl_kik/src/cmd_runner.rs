@@ -1,68 +1,69 @@
-use std::error::Error;
 use crate::cmd_runner::fs::rename;
 use crate::context::Context;
 use crate::{cmd_util, screen};
-use anyhow::{anyhow};
+use anyhow::anyhow;
+use std::error::Error;
+use std::fmt::Alignment::{Left, Right};
 // use   anyhow::Context as AnyContext;
-use log::debug;
 use common::command::{Command, CtrlCommand};
-use common::message::resp::Resp;
-use common::protocol::dok::Dok;
-use common::protocol::dok::Dok::FilePart;
+use common::file_util;
+use common::message::dok::Dok;
+use common::message::dok::Dok::FilePart;
 use common::protocol::BufSerializable;
-use common::{file_util};
+use log::debug;
 use tokio::fs;
+use tokio_util::either::Either;
 use uuid::Uuid;
+use common::message::kik_resp::{kik_error, kik_success_data_id, kik_success_info, KikResp};
 
-
-pub async fn run(context: &Context, cmd: Command) -> Resp {
-    debug!("Running command: {:?}", cmd);
+pub async fn run(context: &Context, cmd: Command) -> KikResp {
     match cmd {
         Command::Ctrl(c) => {
-            let mut info;
-            match c {
+            let resp = match c {
                 CtrlCommand::GetFile(file_path, _) => match file_util::read_file(file_path).await {
                     Ok(v) => match context.find_and_send_data(&v).await {
                         Ok(data_id) => {
-                            return Resp::DataId(data_id);
+                            return kik_success_data_id(data_id);
                         }
                         Err(e) => {
-                            info = format!("Kik发送数据失败,err:{:?}", e);
+                            kik_error(format!("Kik发送数据失败,err:{:?}", e))
                         }
                     },
                     Err(e) => {
-                        info = format!("Kik读取文件失败:{}", e);
+                        kik_error( format!("Kik读取文件失败:{}", e))
                     }
                 },
                 CtrlCommand::GetBigFile(file_path, _) => {
-                    info = "暂不支持".to_string();
-                    //return  Resp::dataid(dataids.join(",")+)
+                    match do_get_big_file(context, file_path).await {
+                        Either::Left(info) => kik_success_info(info),
+                        Either::Right(data_id) => return kik_success_data_id(data_id),
+                    }
                 }
                 CtrlCommand::SetBigFile(data_id, total, hash, save_path) => {
-                    info = match set_big_file(&context, data_id, total, hash, save_path.clone()).await {
+                    match set_big_file(&context, data_id, total, hash, save_path.clone()).await {
                         Ok(_) => {
-                            format!("保存大文件至Kik:{}成功", save_path)
+                            kik_success_info(format!("保存大文件至Kik:{}成功", save_path))
                         }
                         Err(e) => {
-                            format!("保存大文件至Kik:{}失败,err:{}", save_path, e)
+                            kik_success_info(format!("保存大文件至Kik:{}失败,err:{}", save_path, e))
                         }
-                    };
+                    }
                 }
                 CtrlCommand::SetFile(data_id, save_path) => {
                     //recv data
                     match context.read_data(data_id).await {
                         Ok(data) => {
                             //save_path
-                            info = match file_util::save_file(save_path.as_str(), &data).await {
+                            match file_util::save_file(save_path.as_str(), &data).await {
                                 Ok(_) => {
-                                    format!("保存文件至Kik:{}成功", save_path)
+                                    kik_success_info( format!("保存文件至Kik:{}成功", save_path))
                                 }
                                 Err(e) => {
-                                    format!("保存文件至Kik:{}失败,err:{}", save_path, e)
+                                    kik_error(format!("保存文件至Kik:{}失败,err:{}", save_path, e))
                                 }
-                            };
+                            }
                         }
-                        Err(e) => info = format!("{}", e),
+                        Err(e) => kik_error(format!("{}", e)),
                     }
                 }
                 CtrlCommand::Ls(s) => {
@@ -79,39 +80,59 @@ pub async fn run(context: &Context, cmd: Command) -> Resp {
                     })
                     .await
                     {
-                        Ok(v) => {
-                            info = format_file_meta(&v);
-                        }
-                        Err(e) => {
-                            info = e.to_string();
-                        }
+                        Ok(v) =>  kik_success_info(format_file_meta(&v)),
+                        Err(e) => kik_error(e.to_string()),
                     }
                 }
                 CtrlCommand::Screen(_) => match screen::cut_screen().await {
                     Ok(v) => match context.find_and_send_data(&v).await {
                         Ok(data_id) => {
-                            return Resp::DataId(data_id);
+                            return kik_success_data_id(data_id);
                         }
                         Err(e) => {
-                            info = format!("Kik发送数据失败,err:{:?}", e);
+                            kik_error(format!("Kik发送数据失败,err:{:?}", e))
                         }
                     },
                     Err(e) => {
-                        info = format!("Kik截屏失败,err:{:?}", e);
+                        kik_error(format!("Kik截屏失败,err:{:?}", e))
                     }
                 },
-            }
-            Resp::Info(info)
+            };
+            resp
         }
         Command::Exec(s) => {
             // let v: Vec<String> = s.trim().split_whitespace().map(|x| x.to_string()).collect();
-            Resp::Info(
-                cmd_util::cmd_exec_line(s.as_str(), false, true)
-                    .await
-                    .unwrap_or_else(|e| format!("cmd exec err:{}", e)),
-            )
+
+            match cmd_util::cmd_exec_line(s.as_str(), false, true)
+                .await {
+                Ok(res) => {
+                    kik_success_info(res)
+                }
+                Err(e) => {
+                    kik_error(format!("cmd exec err:{}", e))
+                }
+            }
+
         }
-        _ => Resp::Info("暂不支持该类型消息".to_string()),
+        _ => kik_error("暂不支持该类型消息".to_string()),
+    }
+}
+
+async fn do_get_big_file(context: &Context, file_path: String) -> Either<String, String> {
+    let file_size = file_util::get_file_size(file_path.as_str()).await;
+    if let Err(e) = file_size {
+        return Either::Left(format!("获取文件失败,err:{}", e));
+    }
+    if file_size.unwrap() > 1024 * 1024 * 1024 {
+        Either::Left("暂不支持1G以上的文件".to_string())
+    } else {
+        match file_util::read_file(file_path).await {
+            Ok(v) => match context.find_and_send_data(&v).await {
+                Ok(data_id) => Either::Right(data_id),
+                Err(e) => Either::Left(format!("Kik发送数据失败,err:{:?}", e)),
+            },
+            Err(e) => Either::Left(format!("Kik读取文件失败:{}", e)),
+        }
     }
 }
 
@@ -124,17 +145,25 @@ async fn set_big_file(
 ) -> anyhow::Result<()> {
     let mut sum = 0;
 
-    let file = file_util::create_file(save_path.as_str()).await.map_err(|e| anyhow!("获取文件句柄失败,err:{}",e))?;
+    let file = file_util::create_file(save_path.as_str())
+        .await
+        .map_err(|e| anyhow!("获取文件句柄失败,err:{}", e))?;
 
     let original_path = fs::canonicalize(save_path.as_str()).await?;
 
-    let file_name = original_path.file_name().ok_or(anyhow!("获取文件名失败"))?.to_string_lossy();
+    let file_name = original_path
+        .file_name()
+        .ok_or(anyhow!("获取文件名失败"))?
+        .to_string_lossy();
     // 在临时目录创建临时文件路径
-    let temp_file_path = std::env::temp_dir().join(&format!(
-        "{}-{}.temp",
-        file_name,
-        Uuid::new_v4().to_string()
-    )).to_string_lossy().to_string();
+    let temp_file_path = std::env::temp_dir()
+        .join(&format!(
+            "{}-{}.temp",
+            file_name,
+            Uuid::new_v4().to_string()
+        ))
+        .to_string_lossy()
+        .to_string();
 
     loop {
         let data = context.read_data(data_id.clone()).await?;
@@ -157,13 +186,24 @@ async fn set_big_file(
         }
     }
     drop(file);
-    fs::remove_file(save_path.as_str()).await.or_else(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            return Ok(());
+    fs::remove_file(save_path.as_str())
+        .await
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            Err(e)
+        })
+        .map_err(|e| anyhow!("删除文件失败,err:{}", e))?;
+    match rename(temp_file_path.as_str(), save_path.as_str()).await {
+        Ok(_) => {}
+        Err(_) => {
+            fs::copy(&temp_file_path, &save_path)
+                .await
+                .map_err(|e| anyhow!("移动文件失败,err:{}", e))?;
         }
-        Err(e)
-    }).map_err(|e| anyhow!("删除文件失败,err:{}",e))?;
-    rename(temp_file_path.as_str(), save_path.as_str()).await.map_err(|e| anyhow!("移动文件失败,err:{}",e))?;
+    }
+    fs::remove_file(temp_file_path.as_str()).await.unwrap_or(());
     Ok(())
 }
 

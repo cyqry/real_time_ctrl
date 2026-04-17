@@ -3,6 +3,7 @@ use common::config::{Config, Id};
 use std::{env, panic, thread};
 use std::time::Duration;
 use log::{debug, error, info, warn};
+use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
 use core::server;
 
 mod core;
@@ -34,8 +35,8 @@ async fn main() {
         Context::init(),
         Config {
             id: Id {
-                username: "root".to_string(),
-                password: "1104399".to_string(),
+                username: USER_NAME(),
+                password: PASSWORD(),
             },
             server_host: "0.0.0.0".to_string(),
             server_port: "9002".to_string(),

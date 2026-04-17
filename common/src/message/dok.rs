@@ -2,6 +2,7 @@
 use crate::protocol::BufSerializable;
 use bytes::{BytesMut, BufMut, Buf};
 
+//数据交换格式结构体
 pub enum Dok {
     FilePart(u64, u64, Vec<u8>),
     Err(ErrCode),

@@ -1,11 +1,9 @@
 use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetBigFile, SetFile};
-use crate::command::LocalCommand::LocalExit;
 use crate::command::SysCommand::{List, Now, Use};
 use crate::protocol::{BufSerializable, CmdOptions, ReqCmd};
-use anyhow::anyhow;
 use bytes::{Buf, BufMut, BytesMut};
-use std::str::FromStr;
-use crate::message::frame::Frame;
+use serde::{Deserialize, Serialize};
+
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -15,7 +13,7 @@ pub enum Command {
     Exec(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LocalCommand {
     LocalExit,
 }
@@ -32,7 +30,7 @@ pub enum CtrlCommand {
 }
 
 //todo Down kik
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SysCommand {
     List,
     Use(String),
@@ -218,15 +216,14 @@ impl BufSerializable for Command {
 
 #[test]
 fn test() {
-    println!("{:?}", Frame::from_buf(
-        Frame::Cmd(ReqCmd::new("sfdid".to_string(), CmdOptions::default().with_timeout(false), Command::Ctrl(CtrlCommand::SetBigFile(
+    use crate::message::kik_frame::KikFrame;
+    println!("{:?}", ReqCmd::from_buf(
+        ReqCmd::new("sfdid".to_string(), CmdOptions::default().with_timeout(false), Command::Ctrl(CtrlCommand::SetBigFile(
             "werwrwerw".to_string(),
             232,
             vec![12, 3, 4, 5, 3, 6, 66, 12],
             "".to_string(),
-        ))))
-
-            .to_buf(),
+        ))).to_buf()
     )
         .unwrap());
 }

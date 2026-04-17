@@ -2,7 +2,6 @@ use anyhow::{anyhow, Error};
 use bytes::{BufMut, BytesMut};
 use common::channel::Channel;
 use common::kik::Kik;
-use common::message::frame::Frame;
 use common::protocol;
 use common::protocol::BufSerializable;
 use std::collections::HashMap;
@@ -16,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 use common::command::Command;
+use common::message::kik_frame::KikFrame;
 use crate::read_handle;
 
 #[derive(Clone)]
@@ -57,15 +57,19 @@ impl Context {
     pub async fn send_data(&self, op: (String, BytesMut)) -> anyhow::Result<()> {
 
         //只在 确为当前在等数据 或者 当前无在等数据时，可以写入此数据
+        // let (can_send, now_wait_id) = unsafe {
+        //     let wait = self.data_x.wait_data.lock().await;
+        //     (wait.eq(&0) || *((*wait) as *mut String).as_ref().unwrap() == op.0, ((*wait) as *mut String).as_ref().unwrap().clone())
+        // };
         let can_send = unsafe {
             let wait = self.data_x.wait_data.lock().await;
-            wait.eq(&0) || *((*wait) as *mut String).as_ref().unwrap() == op.0
+            (wait.eq(&0) || *((*wait) as *mut String).as_ref().unwrap() == op.0)
         };
         if can_send {
             Ok(self.data_x.tx.send(op).expect("不可能没有读者!"))
         } else {
             //直接丢弃
-           Err(anyhow!("正在读"))
+            Err(anyhow!("得到数据不一致"))
         }
     }
 
@@ -180,7 +184,7 @@ impl Context {
                     .lock()
                     .await
                     .write_and_flush(&protocol::transfer_encode_frame(
-                        Frame::Data(data_id.clone(), bytes_mut),
+                        KikFrame::Data(data_id.clone(), bytes_mut),
                     ))
                     .await?;
                 Ok(data_id)

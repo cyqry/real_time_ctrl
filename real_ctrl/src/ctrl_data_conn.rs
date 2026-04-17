@@ -4,8 +4,6 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::{Config, Id};
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
-use common::message::frame::Frame;
-use common::message::resp::Resp;
 use common::protocol;
 use common::protocol::BufSerializable;
 use log::debug;
@@ -20,6 +18,13 @@ use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use uuid::Uuid;
+use common::message::init_frame::InitFrame;
+use common::message::kik_frame::KikFrame;
+use ctrl_common::ctrl_frame::Frame;
+use ctrl_common::ctrl_protocol::ctrl_pong;
+use ctrl_common::ctrl_resp::{CmdResp, ServerResp, ServerSuccessResp};
+use ctrl_common::ctrl_resp::Resp::Server;
+use ctrl_common::ctrl_resp::ServerResp::Success;
 
 pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result<()> {
     let socket =
@@ -39,7 +44,7 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
     handle_active(&config.id, channel.clone()).await?;
 
     //tx在连接处理线程结束后被关闭
-    let (mut tx, mut rx) = mpsc::channel::<Resp>(5);
+    let (mut tx, mut rx) = mpsc::channel::<CmdResp>(5);
     let context_clone = context.clone();
     tokio::spawn(async move {
         let context = context_clone;
@@ -47,7 +52,7 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
         //心跳逻辑
         let chan = channel.clone();
         tokio::spawn(async move {
-            hearbeat(chan).await;
+            heartbeat(chan).await;
         });
 
         let e = loop {
@@ -110,14 +115,14 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
             panic!("服务器未响应")
         }
         Some(res) => {
-            match res {
-                Resp::Info(auth) => {
+            match res.get_resp() {
+                Server(ServerResp::Success(ServerSuccessResp::Info(auth))) => {
                     //使用这个类型这个值来标识这是服务端校验成功的回复
                     if auth == "##authtrue" {
                         //更改类型为Ctrl，即校验成功了
                         channel_arc.clone().lock().await.channel_type = ChannelType::CtrlData;
                         context.insert_ctrl_data_conn(channel_arc).await;
-                        println!("数据连接校验成功");
+                        debug!("数据连接校验成功");
                     } else {
                         panic!("服务端奇怪的响应，系统错误");
                     }
@@ -132,7 +137,7 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
 }
 
 async fn handle_inactive(context: &Context, channel: Arc<Mutex<Channel>>) {
-    channel.clone().lock().await.try_write_half_close().await;
+    channel.lock().await.try_write_half_close().await;
     let channel_type = channel.clone().lock().await.channel_type.clone();
     //其实不用判断，
     if channel_type == ChannelType::CtrlData {
@@ -148,40 +153,54 @@ async fn handle_read(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    tx: &mut Sender<Resp>,
+    tx: &mut Sender<CmdResp>,
 ) -> anyhow::Result<()> {
-    let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
-    match frame {
-        Frame::CtrlDataConnAuthReply(b) => {
-            if !b {
-                debug!("数据控制连接校验失败");
-                println!("账号或密码错误");
-                std::process::exit(0);
-            } else {
-                //发一次使得这个的rx第一次read，即接下来可以read数据
-                tx.send(Resp::Info("##authtrue".to_string())).await?; //注意设计不允许此时错误返回
+    if channel.lock().await.channel_type == ChannelType::Unknown {
+        let init_frame = InitFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
+        match init_frame {
+            InitFrame::CtrlDataConnAuthReply(b) => {
+                if !b {
+                    debug!("数据控制连接校验失败");
+                    println!("账号或密码错误");
+                    std::process::exit(0);
+                } else {
+                    //发一次使得这个的rx第一次read，即接下来可以read数据
+                    tx.send(CmdResp::new("##cmd_id".to_owned(), Server(Success(ServerSuccessResp::Info("##authtrue".to_string()))))).await?; //注意设计不允许此时错误返回
+                }
+            }
+            f => {
+                debug!("数据控制连接收到错误的帧,{:?}", f);
+                panic!("控制端不支持的帧")
             }
         }
-        Frame::Data(id, data) => {
-            context.get_data_tx().send((id, data)).await?;
-        }
-        Frame::Ping => {}
-        Frame::Pong => {}
-        f => {
-            debug!("数据控制连接收到错误的帧,{:?}", f);
-            panic!("控制端不支持的帧")
-        }
-    };
+    } else {
+        let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
+        match frame {
+            Frame::Data(id, data) => {
+                context.get_data_tx().send((id, data)).await?;
+            }
+            Frame::Ping => {}
+            Frame::Pong => {}
+            f => {
+                debug!("数据控制连接收到错误的帧,{:?}", f);
+                panic!("控制端不支持的帧")
+            }
+        };
+    }
+
     Ok(())
 }
 
-async fn hearbeat(channel: Arc<Mutex<Channel>>) {
+async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         time::sleep(Duration::from_secs(5)).await;
+        if channel.lock().await.is_closed() { 
+            return;
+        }
         let arc = channel.clone();
         let mut guard = arc.lock().await;
         if guard.channel_type != ChannelType::Unknown {
-            match guard.write_and_flush(&protocol::pong()).await {
+            match guard.write_and_flush(&ctrl_pong()).await {
                 Ok(_) => {}
                 Err(_) => {
                     break;
@@ -193,11 +212,10 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
 
 async fn handle_active(id: &Id, channel: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
     channel
-        .clone()
         .lock()
         .await
         .write_and_flush(&protocol::transfer_encode_frame(
-            Frame::CtrlDataConnReq(id.encrypt()),
+            InitFrame::CtrlDataConnReq(id.encrypt()),
         ))
         .await?;
     Ok(())

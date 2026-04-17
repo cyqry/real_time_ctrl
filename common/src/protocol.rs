@@ -1,8 +1,5 @@
-pub mod dok;
-
 use crate::command::{Command, CtrlCommand};
-use crate::message::frame::Frame;
-use crate::message::resp::Resp;
+use crate::message::kik_frame::KikFrame;
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +20,10 @@ pub struct ReqCmd {
     id: String,
     cmd_options: CmdOptions,
     cmd: Command,
+}
+
+pub enum ErrCode {
+    EXCEPTION = 1,
 }
 
 impl Default for CmdOptions {
@@ -111,10 +112,6 @@ impl BufSerializable for ReqCmd {
     }
 }
 
-pub fn transfer_encode_frame(frame: Frame) -> BytesMut {
-    let bytes_mut = frame.to_buf();
-    transfer_encode(bytes_mut)
-}
 
 //对应 ltc解码器 data长度 data内容的格式
 pub fn transfer_encode(bts: BytesMut) -> BytesMut {
@@ -138,24 +135,19 @@ pub fn transfer_b_encode(bts: &[u8], start: u32, end: u32) -> BytesMut {
     bytes_mut
 }
 
-pub fn frame_decode(bys: BytesMut) -> Option<Frame> {
-    Frame::from_buf(bys)
+
+pub fn transfer_encode_frame(frame: impl BufSerializable) -> BytesMut {
+    let bytes_mut = frame.to_buf();
+    transfer_encode(bytes_mut)
 }
 
-pub fn resp(resp: Resp) -> BytesMut {
-    transfer_encode_frame(Frame::Resp(resp))
+pub fn kik_ping() -> BytesMut {
+    transfer_encode_frame(KikFrame::Ping)
 }
 
-pub fn cmd(cmd: ReqCmd) -> BytesMut {
-    transfer_encode_frame(Frame::Cmd(cmd))
-}
 
-pub fn ping() -> BytesMut {
-    transfer_encode_frame(Frame::Ping)
-}
-
-pub fn pong() -> BytesMut {
-    transfer_encode_frame(Frame::Pong)
+pub fn kik_pong() -> BytesMut {
+    transfer_encode_frame(KikFrame::Pong)
 }
 
 #[test]

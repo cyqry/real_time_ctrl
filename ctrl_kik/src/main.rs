@@ -1,5 +1,6 @@
-#![windows_subsystem = "windows"] //此宏不打开窗口，同时print也失效
+// #![windows_subsystem = "windows"] //此宏不打开窗口，同时print也失效
 
+use std::env;
 use crate::context::Context;
 use common::config::{Config, Id};
 use log::debug;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::{join, time};
 use common::generated::encrypted_strings::*;
+use common::host::get_host;
 
 mod cmd_runner;
 mod cmd_util;
@@ -35,7 +37,7 @@ async fn test() {
 
 #[tokio::main]
 async fn main() {
-    // env::set_var("RUST_LOG", "DEBUG");
+    env::set_var("RUST_LOG", "DEBUG");
     env_logger::init();
     //此lock在程序结束时会被操作系统回收，所以无需担心是否释放
     let f = single(LOCK_FILE_PATH()).await; // 须要给一个变量名不能用let _ = xxx，(注意: let _ = xxx 当下与  _ = xxx 行为一致，会在这一行结束就释放变量) ，免得rust这里直接回收了
@@ -45,7 +47,7 @@ async fn main() {
             username: "".to_string(),
             password: "".to_string(),
         },
-        server_host: HOST(),
+        server_host: get_host(),
         server_port: PORT(),
         read_timeout: Duration::from_secs(45),
         write_timeout: Duration::from_secs(45),
@@ -70,10 +72,9 @@ async fn main() {
                             }
                         }
                     });
-                    join!(h);
+                  let _ =  join!(h);
                 }
                 Err(e) => {
-                    debug!("{}", e);
                     time::sleep(Duration::from_secs(2)).await;
                     //todo
                 }

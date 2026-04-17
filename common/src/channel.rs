@@ -1,5 +1,4 @@
 use crate::ltc_codec::LengthFieldBasedFrameDecoder;
-use crate::message::frame::Frame;
 use anyhow::Error;
 use bytes::BytesMut;
 use std::any::Any;
@@ -10,6 +9,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
@@ -32,6 +32,7 @@ pub struct Channel {
     writer: BufWriter<OwnedWriteHalf>,
     addr: (io::Result<SocketAddr>, io::Result<SocketAddr>),
     attr: HashMap<String, Box<dyn Any + Send + Sync>>,
+    closed: AtomicBool,
     create_time: Instant,
 }
 
@@ -45,6 +46,7 @@ impl Channel {
             writer: BufWriter::new(writer),
             attr: HashMap::new(),
             create_time: time::Instant::now(),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -105,6 +107,7 @@ impl Channel {
     }
 
     pub async fn write_half_close(&mut self) -> std::io::Result<()> {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
         self.writer.shutdown().await
     }
     pub async fn try_write_half_close(&mut self) {
@@ -112,6 +115,7 @@ impl Channel {
             Ok(_) => {}
             Err(_) => {}
         };
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     pub async fn write_and_flush(&mut self, bys: &[u8]) -> anyhow::Result<()> {
         
@@ -130,5 +134,9 @@ impl Channel {
             Ok(_) => {}
             Err(_) => {}
         }
+    }
+    
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
