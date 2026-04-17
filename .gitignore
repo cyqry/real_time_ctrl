@@ -2,3 +2,4 @@
 /logs
 *.lock
 .idea
+rust-toolchain.toml
