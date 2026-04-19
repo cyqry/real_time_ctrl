@@ -5,7 +5,9 @@ use common::command::{Command, CtrlCommand, LocalCommand, SysCommand};
 use std::str::FromStr;
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
+use common::message::kik_cmd_resp_info;
 use common::protocol::BufSerializable;
+use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputCommand {
@@ -27,9 +29,18 @@ pub enum InputCtrlCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RemoteResp {
-    Success(String),
+    Success(RemoteSuccessResp),
     SuccessData(Vec<u8>),
     Error(u32, String),
+}
+
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RemoteSuccessResp {
+    Info(String),
+    Ls(Vec<kik_cmd_resp_info::Ls>),
+    SysList(Vec<KikInfoVo>),
+    Now(SysNow),
 }
 
 impl BufSerializable for RemoteResp {

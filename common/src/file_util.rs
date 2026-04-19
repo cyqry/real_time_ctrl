@@ -453,7 +453,7 @@ async fn test() {
         "{:?}",
         match save_file_with_unique_name(path.as_path(), &[0, 1]).await {
             Ok(p) => Ok(format!("保存Kik的截屏至:{:?}", path)),
-            Err(e) => Err(anyhow!(format!("保存Kik的截屏至:{:?}失败,err:{}", path, e))),
+            Err(e) => Err(anyhow!(format!("保存Kik的截屏至:{:?}失败,error:{}", path, e))),
         }
     );
 

@@ -113,6 +113,8 @@ impl BufSerializable for ReqCmd {
 }
 
 
+
+
 //对应 ltc解码器 data长度 data内容的格式
 pub fn transfer_encode(bts: BytesMut) -> BytesMut {
     if bts.len() > u32::MAX as usize {
@@ -124,16 +126,17 @@ pub fn transfer_encode(bts: BytesMut) -> BytesMut {
     bytes_mut
 }
 
-pub fn transfer_b_encode(bts: &[u8], start: u32, end: u32) -> BytesMut {
+pub fn transfer_b_encode(bts: &[u8], start: usize, end: usize) -> BytesMut {
     let len = end - start;
-    if len > u32::MAX {
+    if len > u32::MAX as usize {
         panic!("要传输的数据太大")
     }
-    let mut bytes_mut = BytesMut::with_capacity((len + 4) as usize);
-    bytes_mut.put_slice(&len.to_be_bytes());
-    bytes_mut.put_slice(&bts[start as usize..end as usize]);
+    let mut bytes_mut = BytesMut::with_capacity((len + 4));
+    bytes_mut.put_slice(&(len as u32).to_be_bytes());
+    bytes_mut.put_slice(&bts[start..end]);
     bytes_mut
 }
+
 
 
 pub fn transfer_encode_frame(frame: impl BufSerializable) -> BytesMut {

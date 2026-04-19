@@ -10,11 +10,14 @@ mod core;
 mod handler;
 mod logger;
 
+//编译期获取环境变量，写死在程序
+const LOG_LEVEL: &str = env!("LOG_LEVEL");
+
 #[tokio::main]
 async fn main() {
 
-    // 设置全局 INFO 级别，但模块 `core` 设置为 DEBUG 级别。
-    unsafe { std::env::set_var("RUST_LOG", "info"); }
+    // 设置全局 INFO 级别
+    unsafe { std::env::set_var("RUST_LOG", LOG_LEVEL); }
     // env_logger::init(); //该库 为 log 库 实现环境变量设置日志级别, 这里应该不需要
     let config = logger::LogConfig {
         dir: std::path::PathBuf::from("./logs"),
@@ -30,7 +33,6 @@ async fn main() {
     //     error!("panic_info:{:?}", panic_info);
     //
     // }));
-
     match server::run(
         Context::init(),
         Config {

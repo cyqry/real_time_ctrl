@@ -99,17 +99,18 @@ async fn handle_stream(context: Context, config: Config, stream: TcpStream, loca
 async fn handle_error(chan: Arc<Mutex<Channel>>, error: Error) {
     let remote_addr = chan.lock().await.get_peer_addr().as_ref().map(|addr| addr.to_string()).unwrap_or("未知远程地址".to_string());
     if error.is::<io::Error>() {
-        println!("io错误，远程地址:{}，err:{}", remote_addr, error);
+        println!("io错误，远程地址:{}，error:{}", remote_addr, error);
     } else if error.is::<time::error::Elapsed>() {
         println!("读取超时，远程地址:{}", remote_addr);
     } else {
-        error!("处理连接错误，远程地址:{}，err:{}",remote_addr , error);
+        error!("处理连接错误，远程地址:{}，error:{}",remote_addr , error);
     }
 }
 
 async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
-    channel.clone().lock().await.try_write_half_close().await;
-    let channel_type = channel.clone().lock().await.channel_type.clone();
+    //统一close
+    channel.lock().await.try_write_half_close().await;
+    let channel_type = channel.lock().await.channel_type.clone();
     match channel_type {
         ChannelType::Ctrl => {
             context.delete_ctrl_conn().await;
@@ -120,20 +121,20 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
         }
         ChannelType::Kik => {
             // kik连接的id直接是kikid
-            let id = channel.clone().lock().await.get_id().to_string();
+            let id = channel.lock().await.get_id().to_string();
             // context.set_kik_state();
             // 因为Kik连接断开了，所以万一在被控制，需要清理
             let _ = context.delete_kik_conn_if_id(id.as_str()).await;
             if let Some(kik) =  context.delete_kik_if_not_online(id.as_str()).await {
-                info!("【{}】下线，ip:{}",kik.kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
+                info!("【{}】下线，ip:{}",kik.kik_client_info.kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
             }
         }
         ChannelType::KikData => {
-            let id = channel.lock().await.get::<String>("kik_id").unwrap().to_string();
+            let kik_id = channel.lock().await.get::<String>("kik_id").unwrap().to_string();
             //清理
             context.delete_kik_data_conn(channel.clone()).await;
-            if let Some(kik) =  context.delete_kik_if_not_online(id.as_str()).await {
-                info!("【{}】下线，ip:{}",kik.kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
+            if let Some(kik) =  context.delete_kik_if_not_online(kik_id.as_str()).await {
+                info!("【{}】下线，ip:{}",kik.kik_client_info.kik_info.name,channel.lock().await.get_peer_addr().as_ref().map(| addr| addr.to_string()).unwrap_or("未知ip".to_string()));
             }
         }
         ChannelType::Unknown => {

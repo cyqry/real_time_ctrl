@@ -14,6 +14,7 @@ use log::debug;
 use tokio::fs;
 use tokio_util::either::Either;
 use uuid::Uuid;
+use common::message::kik_cmd_resp_info;
 use common::message::kik_resp::{kik_error, kik_success_data_id, kik_success_info, KikResp};
 
 pub async fn run(context: &Context, cmd: Command) -> KikResp {
@@ -26,7 +27,7 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                             return kik_success_data_id(data_id);
                         }
                         Err(e) => {
-                            kik_error(format!("Kik发送数据失败,err:{:?}", e))
+                            kik_error(format!("Kik发送数据失败,error:{:?}", e))
                         }
                     },
                     Err(e) => {
@@ -45,7 +46,7 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                             kik_success_info(format!("保存大文件至Kik:{}成功", save_path))
                         }
                         Err(e) => {
-                            kik_success_info(format!("保存大文件至Kik:{}失败,err:{}", save_path, e))
+                            kik_success_info(format!("保存大文件至Kik:{}失败,error:{}", save_path, e))
                         }
                     }
                 }
@@ -59,7 +60,7 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                                     kik_success_info( format!("保存文件至Kik:{}成功", save_path))
                                 }
                                 Err(e) => {
-                                    kik_error(format!("保存文件至Kik:{}失败,err:{}", save_path, e))
+                                    kik_error(format!("保存文件至Kik:{}失败,error:{}", save_path, e))
                                 }
                             }
                         }
@@ -78,9 +79,22 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                         }
                         _ => file_util::ls(s.as_str(), false),
                     })
-                    .await
+                        .await.and_then(|v| {
+                        Ok(
+                            serde_json::to_string(&v
+                                .into_iter()
+                                .map(|(filename, is_file, size, created_date, modified_date)| {
+                                    kik_cmd_resp_info::Ls {
+                                        size,
+                                        filename,
+                                        is_file,
+                                        created_date,
+                                        modified_date,
+                                    }
+                                }).collect::<Vec<kik_cmd_resp_info::Ls>>())?)
+                    })
                     {
-                        Ok(v) =>  kik_success_info(format_file_meta(&v)),
+                        Ok(json) => kik_success_info(json),
                         Err(e) => kik_error(e.to_string()),
                     }
                 }
@@ -90,11 +104,11 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                             return kik_success_data_id(data_id);
                         }
                         Err(e) => {
-                            kik_error(format!("Kik发送数据失败,err:{:?}", e))
+                            kik_error(format!("Kik发送数据失败,error:{:?}", e))
                         }
                     },
                     Err(e) => {
-                        kik_error(format!("Kik截屏失败,err:{:?}", e))
+                        kik_error(format!("Kik截屏失败,error:{:?}", e))
                     }
                 },
             };
@@ -109,7 +123,7 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                     kik_success_info(res)
                 }
                 Err(e) => {
-                    kik_error(format!("cmd exec err:{}", e))
+                    kik_error(format!("cmd exec error:{}", e))
                 }
             }
 
@@ -121,7 +135,7 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
 async fn do_get_big_file(context: &Context, file_path: String) -> Either<String, String> {
     let file_size = file_util::get_file_size(file_path.as_str()).await;
     if let Err(e) = file_size {
-        return Either::Left(format!("获取文件失败,err:{}", e));
+        return Either::Left(format!("获取文件失败,error:{}", e));
     }
     if file_size.unwrap() > 1024 * 1024 * 1024 {
         Either::Left("暂不支持1G以上的文件".to_string())
@@ -129,7 +143,7 @@ async fn do_get_big_file(context: &Context, file_path: String) -> Either<String,
         match file_util::read_file(file_path).await {
             Ok(v) => match context.find_and_send_data(&v).await {
                 Ok(data_id) => Either::Right(data_id),
-                Err(e) => Either::Left(format!("Kik发送数据失败,err:{:?}", e)),
+                Err(e) => Either::Left(format!("Kik发送数据失败,error:{:?}", e)),
             },
             Err(e) => Either::Left(format!("Kik读取文件失败:{}", e)),
         }
@@ -147,7 +161,7 @@ async fn set_big_file(
 
     let file = file_util::create_file(save_path.as_str())
         .await
-        .map_err(|e| anyhow!("获取文件句柄失败,err:{}", e))?;
+        .map_err(|e| anyhow!("获取文件句柄失败,error:{}", e))?;
 
     let original_path = fs::canonicalize(save_path.as_str()).await?;
 
@@ -194,134 +208,15 @@ async fn set_big_file(
             }
             Err(e)
         })
-        .map_err(|e| anyhow!("删除文件失败,err:{}", e))?;
+        .map_err(|e| anyhow!("删除文件失败,error:{}", e))?;
     match rename(temp_file_path.as_str(), save_path.as_str()).await {
         Ok(_) => {}
         Err(_) => {
             fs::copy(&temp_file_path, &save_path)
                 .await
-                .map_err(|e| anyhow!("移动文件失败,err:{}", e))?;
+                .map_err(|e| anyhow!("移动文件失败,error:{}", e))?;
         }
     }
     fs::remove_file(temp_file_path.as_str()).await.unwrap_or(());
     Ok(())
-}
-
-fn format_file_meta(
-    data: &Vec<(
-        Option<String>,
-        bool,
-        Option<u64>,
-        Option<String>,
-        Option<String>,
-    )>,
-) -> String {
-    let mut res = String::new();
-    let file_name_header = "Filename";
-    let is_file_header = "IsFile";
-    let size_header = "Size(KB)";
-    let create_date_header = "Created Date";
-    let modified_date_header = "Modified Date";
-    // 用于存储每列的最大宽度
-    let mut max_filename_len = file_name_header.len();
-    let mut max_is_file_len = is_file_header.len();
-    let mut max_size_len = size_header.len();
-    let mut max_created_date_len = create_date_header.len();
-    let mut max_modified_date_len = modified_date_header.len();
-
-    let is_file_str = |is_file: bool| -> &str {
-        if is_file {
-            "File"
-        } else {
-            "Directory"
-        }
-    };
-    // 首先，找出每列的最大宽度
-    for (filename, is_file, size, created_date, modified_date) in data {
-        if let Some(name) = filename {
-            max_filename_len = max_filename_len.max(name.len());
-        }
-        let is_file_str = is_file_str(*is_file);
-        max_is_file_len = max_is_file_len.max(is_file_str.len());
-
-        let size_str = format!(
-            "{}",
-            match size.map(|size| { size / 1024 }) {
-                None => {
-                    "__".to_string()
-                }
-                Some(size) => {
-                    size.to_string()
-                }
-            }
-        ); // 转换到KB
-        max_size_len = max_size_len.max(size_str.len());
-
-        if let Some(date) = created_date {
-            max_created_date_len = max_created_date_len.max(date.len());
-        }
-
-        if let Some(date) = modified_date {
-            max_modified_date_len = max_modified_date_len.max(date.len());
-        }
-    }
-
-    // 打印表头
-    res += &format!(
-        "{:<width$} | {:<width2$} | {:<width3$} | {:<width4$} | {:<width5$}\n",
-        file_name_header,
-        is_file_header,
-        size_header,
-        create_date_header,
-        modified_date_header,
-        width = max_filename_len,
-        width2 = max_is_file_len,
-        width3 = max_size_len,
-        width4 = max_created_date_len,
-        width5 = max_modified_date_len,
-    );
-
-    // 打印分隔线
-    res += &format!(
-        "{}-+-{}-+-{}-+-{}-+-{}\n",
-        "-".repeat(max_filename_len),
-        "-".repeat(max_is_file_len),
-        "-".repeat(max_size_len),
-        "-".repeat(max_created_date_len),
-        "-".repeat(max_modified_date_len),
-    );
-
-    // 打印数据
-    let blank = "".to_string();
-    for (filename, is_file, size, created_date, modified_date) in data {
-        let filename_str = filename.as_ref().unwrap_or(&blank);
-        let size_str = format!(
-            "{}",
-            match size.map(|size| { size / 1024 }) {
-                None => {
-                    "__".to_string()
-                }
-                Some(size) => {
-                    size.to_string()
-                }
-            }
-        ); // 转换到KB
-        let created_date_str = created_date.as_ref().unwrap_or(&blank);
-        let modified_date_str = modified_date.as_ref().unwrap_or(&blank);
-
-        res += &format!(
-            "{:<width$} | {:<width2$} | {:<width3$} | {:<width4$} | {:<width5$}\n",
-            filename_str,
-            is_file_str(*is_file),
-            size_str,
-            created_date_str,
-            modified_date_str,
-            width = max_filename_len,
-            width2 = max_is_file_len,
-            width3 = max_size_len,
-            width4 = max_created_date_len,
-            width5 = max_modified_date_len,
-        );
-    }
-    res
 }

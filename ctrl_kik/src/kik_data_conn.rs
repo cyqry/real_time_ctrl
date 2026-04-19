@@ -4,7 +4,6 @@ use anyhow::{anyhow, Error};
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
-use common::kik::Kik;
 use common::kik_info::KikInfo;
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
 use common::protocol;
@@ -172,7 +171,7 @@ async fn handle_inactive(context: &Context, c: Arc<Mutex<Channel>>) {
 }
 
 async fn handle_error(p0: Arc<Mutex<Channel>>, e: Error) {
-    println!("handle_error:{}", e);
+    debug!("handle_error:{}", e);
 }
 
 async fn handle_read(
@@ -186,8 +185,7 @@ async fn handle_read(
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => read_handle::handle_init_message(context, channel, msg, auth_tx).await,
         _ => {
-            //todo 日志收集而不是 panic!
-            panic!("不支持的")
+            unreachable!("不会这样")
         }
     }
 }

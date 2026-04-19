@@ -1,7 +1,8 @@
+use std::io::Write;
 use crate::context::{Agent, Context};
 use common::command::Command;
 use common::config::{Config, Id};
-use log::{debug, error, info};
+use log::{debug, error, info, LevelFilter};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::env;
@@ -12,6 +13,7 @@ use common::generated::encrypted_strings;
 use common::generated::encrypted_strings::{ PASSWORD, USER_NAME};
 use common::host::get_host;
 use crate::input_command::InputCommand;
+use chrono::Local;
 
 mod context;
 mod ctrl_conn;
@@ -24,11 +26,26 @@ mod server_executor;
 mod input_command;
 mod pipe;
 mod local_server;
+mod local_client;
+
+const LOG_LEVEL: &str = env!("LOG_LEVEL");
 
 #[tokio::main]
 async fn main() {
-    env::set_var("RUST_LOG", "INFO");
-    env_logger::init();
+    env::set_var("RUST_LOG", LOG_LEVEL);
+    env_logger::Builder::new()
+        // 关键：定义自定义格式
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] - {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), // 添加毫秒
+                record.level(),
+                record.args()
+            )
+        })
+        .parse_default_env()
+        .init();
 
     let agent = Arc::new(RwLock::new(
         Agent::create(&Config {

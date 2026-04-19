@@ -1,5 +1,5 @@
 use common::channel::Channel;
-use common::kik::Kik;
+use ctrl_common::kik::Kik;
 use std::collections::HashMap;
 use std::ops::Index;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -155,14 +155,9 @@ impl Context {
     }
 
     pub async fn offline_kik(&self, kik_id: &str) {
-        if let Some(kik) = self.get_kik().await {
-            if kik.kik_info.id.clone().unwrap() == kik_id {
-                *(self.kik_op.clone().write().await) = None;
-            }
-        }
-        let kik = self.kik_map.clone().write().await.remove(kik_id);
-        if kik.is_some() {
-            kik.unwrap().clear().await;
+        let delete_kik = self.just_delete_kik(kik_id).await;
+        if let Some(kik) = delete_kik {
+            kik.clear().await;
         }
     }
 
@@ -173,7 +168,7 @@ impl Context {
             let arc = self.kik_op.clone();
             let guard = arc.write().await;
             if guard.is_some() {
-                if guard.clone().unwrap().kik_info.id.unwrap() == id {
+                if guard.clone().unwrap().kik_client_info.kik_info.id.unwrap() == id {
                     guard.clone().unwrap().delete_kik_conn().await;
                     return;
                 }
@@ -188,10 +183,53 @@ impl Context {
         }
       
     }
-    
-    pub async fn delete_kik_if_not_online(&self, kik_id: &str)->Option<Kik> {
-        //todo 判断map和 op是否为0和None，是的话自动删除map中的Kik,说明其彻底下线
-        return None;
+
+    pub async fn delete_kik_if_not_online(&self, kik_id: &str) -> Option<Kik> {
+        //判断数据连接和kik还有没有，都没有就说明其彻底下线
+        let find_kik = self.find_kik(kik_id).await;
+        if find_kik.is_none() {
+            return None;
+        }
+        let kik = find_kik.unwrap();
+        if !kik.exist_data_channel().await && !kik.exist_kik_conn().await {
+            kik.clear().await;
+        }
+        self.just_delete_kik(kik_id).await
+    }
+
+    async fn find_kik(&self, kik_id: &str) -> Option<Kik> {
+        //先从 self.kik_op找
+        let mut guard = self.kik_op.write().await;
+        if let Some(ref kik) = *guard {
+            if kik.kik_client_info.kik_info.id.clone().unwrap() == kik_id {
+                return guard.take();
+            }
+        }
+        //map中的
+        self.kik_map.read().await.get(kik_id).cloned()
+    }
+
+   async  fn just_delete_kik(&self, kik_id: &str) -> Option<Kik> {
+        //先从 self.kik_op找
+        let kik_op = {
+            let mut guard = self.kik_op.write().await;
+            if let Some(ref kik) = *guard {
+                if kik.kik_client_info.kik_info.id.clone().unwrap() == kik_id {
+                    guard.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        //删除map中的
+        let map_kik = self.kik_map.write().await.remove(kik_id);
+        if kik_op.is_some() {
+            kik_op
+        } else {
+            map_kik
+        }
     }
     
     pub async fn delete_kik_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {

@@ -177,6 +177,7 @@ async fn handle_read(
         let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
         match frame {
             Frame::Data(id, data) => {
+                debug!("得到长度为{}的数据",data.len());
                 context.get_data_tx().send((id, data)).await?;
             }
             Frame::Ping => {}

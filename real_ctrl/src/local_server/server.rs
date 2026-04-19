@@ -1,55 +1,49 @@
+use anyhow::{anyhow, Result};
 use std::io;
 use std::io::{Read, Write};
-use anyhow::{anyhow, Result};
-
-use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToFsName, ToNsName};
-use interprocess::local_socket::traits::ListenerExt;
-use interprocess::os::windows::local_socket::NamedPipe;
+use anyhow::__private::kind::TraitKind;
 use crate::context::Context;
 use crate::local_server::handle_client::handle_client;
-
-// 定义管道名称（Windows 格式）
-const PIPE_NAME: &str = r"\\.\pipe\my_service_pipe";
-
+use interprocess::os::windows::named_pipe::{pipe_mode, tokio::*, PipeListenerOptions};
+use log::{error, info};
+use crate::pipe::pipe_common::PIPE_NAME;
 
 pub async fn server(context: &Context) -> Result<()> {
-    // 创建命名管道服务器
-    let name =PIPE_NAME.to_fs_name::<NamedPipe>()?;
 
-    let listener = match ListenerOptions::new().name(name).create_sync() {
+    //  创建命名管道服务器 (异步版)
+    let listener = match PipeListenerOptions::new()
+        .path(std::path::Path::new(PIPE_NAME))
+        .create_tokio_duplex::<pipe_mode::Bytes>()  // 关键：使用异步创建方法
+    {
+        // 处理 "地址已占用" 的错误
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            // When a program that uses a file-type socket name terminates
-            // its socket server without deleting the file, a "corpse socket"
-            // remains, which can neither be connected to nor reused by a new
-            // listener. Normally, Interprocess takes care of this on affected
-            // platforms by deleting the socket file when the listener is
-            // dropped. (This is vulnerable to all sorts of races and thus can
-            // be disabled.)
-            //
-            // In a real program, instead of leaving it up to the user
-            // to perform cleanup, one would use the .try_overwrite(true)
-            // listener option to try to replace the socket.
-            eprintln!(
-                "Error: could not start server because the socket file is \
-                occupied. Please check if {PIPE_NAME} is in use by another \
-                process and try again."
+            error!(
+                "Error: could not start server because the socket file is occupied. \
+                Please check if {PIPE_NAME} is in use by another process and try again."
             );
             return Err(anyhow!(e));
         }
         x => x?,
     };
-    println!("服务端 A 已启动，监听管道: {}", PIPE_NAME);
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // 每个连接单独处理（简单场景可以顺序处理，也可 spawn 线程）
-                if let Err(e) = handle_client(context, stream).await {
-                    eprintln!("处理请求失败: {}", e);
-                }
+    info!("服务端 A 已启动，监听管道: \\\\.\\pipe\\{}", PIPE_NAME);
+
+    // 2. 异步地循环处理连接
+    loop {
+        // 异步等待连接
+        let stream = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("连接接受失败: {}", e);
+                continue;
             }
-            Err(e) => eprintln!("连接接受失败: {}", e),
-        }
+        };
+
+        let context = context.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(context, stream).await {
+                error!("处理请求失败: {}", e);
+            };
+        });
     }
-    Ok(())
 }

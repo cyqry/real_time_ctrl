@@ -1,33 +1,41 @@
+use std::io;
 use crate::context::Context;
-use crate::dispatch;
-use crate::input_command::{deserialize_command, InputCommand};
-use anyhow::Context as AnyhowContext;
-use interprocess::local_socket::prelude::LocalSocketStream;
+use crate::input_command::{deserialize_command, InputCommand, RemoteResp};
+use anyhow::{anyhow, Context as AnyhowContext};
 use std::io::Read;
-
+use std::io::Write;
+use bytes::{BufMut, BytesMut};
+use interprocess::os::windows::named_pipe::pipe_mode::Bytes;
+use interprocess::os::windows::named_pipe::tokio::PipeStream;
+use log::debug;
+use serde::{Deserialize, Serialize};
+use serde::de::Unexpected::Option;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use common::protocol::{transfer_b_encode, transfer_encode};
+use crate::dispatch;
+use crate::pipe::pipe_common::ServerResponse;
 
 // 处理单个连接
-pub async fn handle_client(context: &Context, mut stream: LocalSocketStream) -> anyhow::Result<()> {
-    // 1. 读取消息长度（4字节，小端序）
+pub async fn handle_client(context: Context, mut stream: PipeStream<Bytes, Bytes>) -> anyhow::Result<()> {
     loop {
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf)?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
+        //async trait 封装了OK(0)为 eof error
+        if let Err(e) = stream.read_exact(&mut len_buf).await { return if e.kind() == io::ErrorKind::UnexpectedEof { Ok(()) } else { Err(anyhow!(e)) }; }
 
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        debug!("msg_len: {}", msg_len);
         let mut data = vec![0u8; msg_len];
-        stream.read_exact(&mut data)?;
+        if let Err(e) = stream.read_exact(&mut data).await { return if e.kind() == io::ErrorKind::UnexpectedEof { Ok(()) } else { Err(anyhow!(e)) }; }
+        debug!("data: {:?}", data);
 
         let input_cmd: InputCommand = deserialize_command(data.as_ref()).context("请求错误")?;
 
-        // let mut bytes_mut = BytesMut::with_capacity(data.len());
-        // bytes_mut.put_slice(&data);
-        // // 3. 反序列化
-        // let input_cmd = RemoteResp::from_buf(bytes_mut).ok_or(anyhow!("响应错误"))?;
-        postcard::to_allocvec(&Some(1))?;
-        postcard::to_allocvec(&Some(1))?;
-        let res = dispatch::distribution_other(context, input_cmd).await;
-        // let bytes_mut = transfer_encode();
-        // stream.write_all(&bytes_mut)?;
+        debug!("input_cmd: {:?}", input_cmd);
+        let res = dispatch::distribution_other(&context, input_cmd).await;
+        let response = res.and_then(|resp| Ok(ServerResponse::Success(resp))).unwrap_or_else(|e| ServerResponse::Error(format!("{}", e)));
+        let bys = postcard::to_allocvec(&response)?;
+        let bytes_mut = transfer_b_encode(&bys, 0, bys.len());
+        if let Err(e) = stream.write_all(&bytes_mut).await { return if e.kind() == io::ErrorKind::UnexpectedEof { Ok(()) } else { Err(anyhow!(e)) }; };
     } 
   
     //

@@ -3,6 +3,7 @@ use bytes::Buf;
 use common::file_util;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ImageBuffer, ImageEncoder, ImageOutputFormat, Rgb, RgbImage, Rgba};
+use log::debug;
 use winapi::ctypes::c_int;
 use winapi::shared::windef::{HBITMAP, HDC};
 use winapi::um::wingdi::{
@@ -68,7 +69,6 @@ fn pixels_2_png(
     screen_width: c_int,
     screen_height: c_int,
 ) -> anyhow::Result<Vec<u8>> {
-    println!("{}", pixels.len());
     // 转换像素数据为图像缓冲区
     let img: RgbImage = ImageBuffer::from_fn(screen_width as u32, screen_height as u32, |x, y| {
         let base = ((screen_height as u32 - 1 - y) * screen_width as u32 + x) * 3;

@@ -1,24 +1,26 @@
+use bytes::BytesMut;
+use serde::{Deserialize, Serialize};
+use common::protocol::BufSerializable;
+use crate::input_command::RemoteResp;
 
+// 定义管道名称（Windows 格式）
+pub const PIPE_NAME: &str = r"\\.\pipe\real_ctrl_service_pipe";
 
-// src/common.rs
-#[derive(Debug)]
-pub struct Request {
-    pub method: String,
-    pub args: Vec<u8>,   // 序列化后的参数，例如 (i32, i32) 的二进制表示
+#[derive(Serialize, Deserialize, Debug)]
+pub enum  ServerResponse{
+    Success(RemoteResp),
+    Error(String)
 }
 
-#[derive(Debug)]
-pub struct Response {
-    pub result: Vec<u8>,
-    pub error: Option<String>,
-}
+impl BufSerializable for ServerResponse {
+    fn to_buf(&self) -> BytesMut {
+        todo!()
+    }
 
-// // 辅助函数：将参数对序列化为 Vec<u8>
-// pub fn serialize_args<A: Serialize<S>>(args: &A) -> Vec<u8> {
-//     serde_json::to_vec(args).unwrap()
-// }
-//
-// // 辅助函数：从 Vec<u8> 反序列化参数
-// pub fn deserialize_args<A: for<'de> Deserialize<'de>>(bytes: &[u8]) -> anyhow::Result<A> {
-//     Ok(serde_json::from_slice(bytes)?)
-// }
+    fn from_buf(bys: BytesMut) -> Option<Self>
+    where
+        Self: Sized
+    {
+        todo!()
+    }
+}

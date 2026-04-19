@@ -1,6 +1,4 @@
-use crate::ltc_codec::LengthFieldBasedFrameDecoder;
-use anyhow::Error;
-use bytes::BytesMut;
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -10,6 +8,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
@@ -33,7 +32,7 @@ pub struct Channel {
     addr: (io::Result<SocketAddr>, io::Result<SocketAddr>),
     attr: HashMap<String, Box<dyn Any + Send + Sync>>,
     closed: AtomicBool,
-    create_time: Instant,
+    create_time: SystemTime,
 }
 
 impl Channel {
@@ -45,7 +44,7 @@ impl Channel {
             addr: (writer.local_addr(),writer.peer_addr()),
             writer: BufWriter::new(writer),
             attr: HashMap::new(),
-            create_time: time::Instant::now(),
+            create_time: SystemTime::now(),
             closed: AtomicBool::new(false),
         }
     }

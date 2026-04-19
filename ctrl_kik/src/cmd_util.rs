@@ -88,7 +88,7 @@ pub async fn cmd_exec_line(
 
 fn try_decode(bys: &[u8], gbk: bool) -> String {
     if gbk {
-        //                  enc:实际使用编码格式,err:是否存在因格式错误而被替换的序列
+        //                  enc:实际使用编码格式,error:是否存在因格式错误而被替换的序列
         let (res, enc, err) = GBK.decode(bys);
         if err {
             format!("GBK解码失败！utf-8: {}", String::from_utf8_lossy(bys))

@@ -16,7 +16,7 @@ pub async fn get_file_bytes((host, port): (&str, u16), name: &str) -> anyhow::Re
             req
         }
         Err(e) => {
-            return Err(anyhow!("构建{}文件下载的请求时错误,err:{}", name, e));
+            return Err(anyhow!("构建{}文件下载的请求时错误,error:{}", name, e));
         }
     };
 
@@ -43,7 +43,7 @@ pub async fn get_file_bytes((host, port): (&str, u16), name: &str) -> anyhow::Re
             e
         }
     };
-    Err(anyhow!("请求{}文件下载时错误,err:{}", name, e))
+    Err(anyhow!("请求{}文件下载时错误,error:{}", name, e))
 }
 
 

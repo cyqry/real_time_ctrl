@@ -1,17 +1,19 @@
-use crate::channel::Channel;
-use crate::kik_info::KikInfo;
+use common::channel::Channel;
+use common::kik_info::KikInfo;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock};
+use crate::entity::KikClientInfo;
 
 //Kik可看做指向一个(conn，data_conns)的指针
 #[derive(Clone)]
 pub struct Kik {
     //Kik中的kik_info的id一定是Some的
-    pub kik_info: KikInfo,
+    pub kik_client_info: KikClientInfo,
     // conn的id直接是 kik_id
     //todo 优化为原子锁
     conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
@@ -33,11 +35,15 @@ pub struct KikLifeTime {
 }
 
 impl Kik {
-    pub fn new(id: &str, name: &str, conn: Arc<Mutex<Channel>>) -> Self {
+    pub fn new(id: &str, name: &str, ip: String, recent_online_time: SystemTime, conn: Arc<Mutex<Channel>>) -> Self {
         Kik {
-            kik_info: KikInfo {
-                id: Some(id.to_string()),
-                name: name.to_string(),
+            kik_client_info:KikClientInfo{
+                kik_info: KikInfo {
+                    id: Some(id.to_string()),
+                    name: name.to_string(),
+                },
+                ip: Arc::new(RwLock::new(ip)),
+                recent_online_time: Arc::new(RwLock::new(recent_online_time)),
             },
             next_data_conn: Arc::new(AtomicU16::new(0)),
             conn_op: Arc::new(RwLock::new(Some(conn))),
@@ -91,12 +97,11 @@ impl Kik {
 
     pub async fn delete_data_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
         let id = conn.lock().await.get_id().to_string();
-        self.data_conns.clone().lock().await.remove(id.as_str())
+        self.data_conns.lock().await.remove(id.as_str())
     }
 
     pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) {
         self.data_conns
-            .clone()
             .lock()
             .await
             .insert(conn.clone().lock().await.get_id().to_string(), conn);
@@ -115,7 +120,7 @@ impl Kik {
             guard.clear();
         }
         //kik_conn 关闭
-        match self.conn_op.clone().write().await.clone() {
+        match self.conn_op.write().await.clone() {
             None => {}
             Some(conn) => {
                 conn.lock().await.try_write_half_close().await;

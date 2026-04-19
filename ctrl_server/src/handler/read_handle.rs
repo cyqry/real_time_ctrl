@@ -3,7 +3,7 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::command::{Command, CtrlCommand, SysCommand};
 use common::config::Config;
-use common::kik::Kik;
+use ctrl_common::kik::Kik;
 use common::kik_info::KikInfo;
 use common::message::init_frame::InitFrame;
 use common::message::kik_frame::KikFrame;
@@ -20,12 +20,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
+use futures::stream;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
-use tokio_fusion::{Task, ThreadPool, ThreadPoolConfig};
+use tokio_stream::StreamExt;
 use uuid::Uuid;
+use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
 
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的帧类型")
@@ -41,7 +43,7 @@ pub async fn handle_ctrl(
     match frame.clone() {
         Frame::Cmd(req) => {
             let (cmd_id, cmd_options, cmd) = req.split();
-            debug!("handel ctrl cmd:{:?}",cmd);
+            debug!("handel ctrl cmd:{:?}", cmd);
             //保证方法结束时 set none cmd_id了,这里判断一下目前流程来说其实一般没用，除非ctrl连接重连并快速发命令
             if !context.set_now_cmd_id_if_none(cmd_id.clone()).await {
                 channel
@@ -67,12 +69,17 @@ pub async fn handle_ctrl(
                                 let resp = if can_ctrl_kiks.is_empty() {
                                     ctrl_server_resp_error(cmd_id, "没有可控制的Kik".to_owned())
                                 } else {
-                                    let mut info = String::new();
-                                    for (id, kik) in can_ctrl_kiks.iter() {
-                                        info +=
-                                            format!("{}--->{}\n", id, kik.kik_info.name).as_str();
-                                    }
-                                    ctrl_server_resp_success(cmd_id, info)
+                                    let list:Vec<KikInfoVo> =  stream::iter(can_ctrl_kiks.into_iter()).then(|(id, k)| {
+                                        async move{
+                                            KikInfoVo {
+                                                id,
+                                                name: k.kik_client_info.kik_info.name,
+                                                ip: k.kik_client_info.ip.read().await.to_string(),
+                                                recent_online_time: k.kik_client_info.recent_online_time.read().await.clone(),
+                                            }
+                                        }
+                                    }).collect().await;
+                                    ctrl_server_resp_success(cmd_id, serde_json::to_string(&list).unwrap())
                                 };
                                 channel.clone().lock().await.write_and_flush(&resp).await?;
                             }
@@ -84,10 +91,12 @@ pub async fn handle_ctrl(
                                         context.set_kik(choose_kik.clone()).await;
                                         ctrl_server_resp_success(
                                             cmd_id,
-                                            format!(
-                                                "您正在控制 {}-----{}",
-                                                choose_kik.kik_info.name, id
-                                            ),
+                                            serde_json::to_string(&KikInfoVo {
+                                                id,
+                                                name: choose_kik.kik_client_info.kik_info.name,
+                                                ip: choose_kik.kik_client_info.ip.read().await.clone(),
+                                                recent_online_time: choose_kik.kik_client_info.recent_online_time.read().await.clone(),
+                                            })?,
                                         )
                                     } else {
                                         ctrl_server_resp_error(
@@ -102,23 +111,24 @@ pub async fn handle_ctrl(
                             }
                             SysCommand::Now => {
                                 let info = match context.get_kik().await {
-                                    None => "没有正在控制的Kik".to_string(),
+                                    None => SysNow::None,//"没有正在控制的Kik"
                                     Some(kik) => {
                                         if kik.exist_kik_conn().await {
-                                            format!(
-                                                "当前正在控制 {}-----{}",
-                                                kik.kik_info.name,
-                                                kik.kik_info.id.unwrap()
-                                            )
+                                            SysNow::Kik(KikInfoVo {
+                                                id: kik.kik_client_info.kik_info.id.unwrap(),
+                                                name: kik.kik_client_info.kik_info.name,
+                                                ip: kik.kik_client_info.ip.read().await.clone(),
+                                                recent_online_time: kik.kik_client_info.recent_online_time.read().await.clone(),
+                                            })
                                         } else {
-                                            "被控制的kik已下线".to_string()
+                                            SysNow::NotOnline //"被控制的kik已下线".to_string()
                                         }
                                     }
                                 };
                                 channel
                                     .lock()
                                     .await
-                                    .write_and_flush(&ctrl_server_resp_success(cmd_id, info))
+                                    .write_and_flush(&ctrl_server_resp_success(cmd_id, serde_json::to_string(&info)?))
                                     .await?;
                             }
                         },
@@ -243,7 +253,7 @@ pub async fn handle_ctrl(
                                                 //说明三次都读的过期或异常数据，有问题，放弃这个kik
                                                 //日志报告
                                                 context
-                                                    .offline_kik(kik.kik_info.id.unwrap().as_str())
+                                                    .offline_kik(kik.kik_client_info.kik_info.id.unwrap().as_str())
                                                     .await;
                                                 channel
                                                     .clone()
@@ -277,6 +287,7 @@ pub async fn handle_ctrl(
     Ok(())
 }
 
+
 pub async fn handle_ctrl_data(
     context: Context,
     _: Arc<Mutex<Channel>>,
@@ -290,38 +301,41 @@ pub async fn handle_ctrl_data(
             // async_executor.submit(Box::new(move || {
             //     Box::pin(async {})
             // })).await;
-
-            //todo 优化为全局单线程池
-            //todo 学习该项目源码完善async_executor
-            let thread_pool = ThreadPool::new(ThreadPoolConfig {
-                worker_threads: 1,
-                queue_capacity: 1,
-            });
+            
+            //todo 学习该项目源码完善async_executor（这个项目有bug，这里使用时偶尔会出现异步任务没有开始执行的问题）
+            // let thread_pool = ThreadPool::new(ThreadPoolConfig {
+            //     worker_threads: 1,
+            //     queue_capacity: 1,
+            // });
 
             //目前这种方式可能会比较消耗服务器内存
-            let len = data.len();
-            debug!("开始发送长度为{}的数据", len);
-            let task = Task::new(
-                async move {
-                    //ctrl data过来，如果kik不在线，就不管
-                    if let Some(kik) = context.get_kik().await {
-                        //如果未找到kik的data_conn，也不管
-                        if let Some(data_c) = kik.find_data_conn().await {
-                            data_c
-                                .lock()
-                                .await
-                                .try_write_and_flush(&protocol::transfer_encode_frame(
-                                    KikFrame::Data(id, data)
-                                ))
-                                .await;
-                        }
+            // let len = data.len();
+            // debug!("开始发送长度为{}的数据", len);
+            
+
+            //因为kik不在意data顺序，这里可以异步地发给多个连接
+            //如果kik不在线，就不管
+            tokio::spawn(async move {
+                if let Some(kik) = context.get_kik().await {
+                    //如果未找到kik的data_conn，也不管
+                    if let Some(data_c) = kik.find_data_conn().await {
+                        data_c
+                            .lock()
+                            .await
+                            .try_write_and_flush(&protocol::transfer_encode_frame(KikFrame::Data(
+                                id, data,
+                            )))
+                            .await;
+                    } else {
+                        info!("当前kik没有数据连接")
                     }
-                    Ok(())
-                },
-                1,
-            );
-            _ = thread_pool.submit(task).await?;
-            debug!("长度为{}的数据发送完毕", len);
+                } else {
+                    info!("数据发送失败当前没有在线kik")
+                }
+            });
+          
+
+            // debug!("长度为{}的数据发送完毕", len);
             // let result = handle.await_result().await;
         }
         Frame::Ping => {}
@@ -486,7 +500,7 @@ async fn kik_data_req(
     id: String,
 ) -> anyhow::Result<()> {
     channel.lock().await.put("kik_id".to_string(), id.clone());
-    
+
     //未初始化完成的kik也可以添加kik_data_conn
     match context.kik_map.clone().read().await.get(&id) {
         None => {
@@ -521,9 +535,13 @@ async fn kik_req(
             }
             //先响应确认和分配内存，但是上线延迟
             let kik = new_kik_login_line(context, channel, &kik_info, id).await;
-            channel.lock().await.write_and_flush(&protocol::transfer_encode_frame(InitFrame::KikId(
-                kik.kik_info.id.clone().unwrap(),
-            ))).await?;
+            channel
+                .lock()
+                .await
+                .write_and_flush(&protocol::transfer_encode_frame(InitFrame::KikId(
+                    kik.kik_client_info.kik_info.id.clone().unwrap(),
+                )))
+                .await?;
             kik
         }
         //重连
@@ -538,9 +556,13 @@ async fn kik_req(
             //先响应确认和分配内存，但是上线延迟
             let kik = kik_reconnect_line(context, channel, &kik_info, &id).await;
 
-            channel.lock().await.write_and_flush(&protocol::transfer_encode_frame(InitFrame::KikId(
-                id.clone(),
-            ))).await?;
+            channel
+                .lock()
+                .await
+                .write_and_flush(&protocol::transfer_encode_frame(InitFrame::KikId(
+                    id.clone(),
+                )))
+                .await?;
 
             kik
         }
@@ -576,28 +598,27 @@ async fn kik_reconnect_line(
     kik_info: &KikInfo,
     id: &String,
 ) -> Kik {
- 
-    info!(
-        "【{}】重连，ip:{}",
-        kik_info.name,
-        channel
-            .lock()
-            .await
-            .get_peer_addr()
-            .as_ref()
-            .map(|addr| addr.to_string())
-            .unwrap_or("未知ip".to_string())
-    );
+    let ip = channel
+        .lock()
+        .await
+        .get_peer_addr()
+        .as_ref()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or("未知ip".to_string());
+    info!("【{}】重连，ip:{}",kik_info.name,ip);
     let arc = context.kik_map.clone();
     let mut kik_map = arc.write().await;
     match kik_map.get(id) {
         None => {
             // 重连发现以前的kik从map中删除，那么插入
-            let kik = Kik::new(id.as_str(), kik_info.name.as_str(), channel.clone());
+            let kik = Kik::new(id.as_str(), kik_info.name.as_str(), ip, SystemTime::now(), channel.clone());
             kik_map.insert(id.clone(), kik.clone());
             kik
         }
         Some(kik) => {
+            //更新kik_info
+            *kik.kik_client_info.ip.write().await = ip;
+            *kik.kik_client_info.recent_online_time.write().await = SystemTime::now();
             //有旧的连接就删了
             match kik.set_kik_conn(channel.clone()).await {
                 None => {}
@@ -610,7 +631,6 @@ async fn kik_reconnect_line(
     }
 }
 
-
 //kik上线，代表控制端可以向其发送业务消息
 async fn new_kik_login_line(
     context: &Context,
@@ -618,24 +638,21 @@ async fn new_kik_login_line(
     kik_info: &KikInfo,
     id: String,
 ) -> Kik {
+    let ip = channel
+        .lock()
+        .await
+        .get_peer_addr()
+        .as_ref()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or("未知ip".to_string());
     //将自动生成的id返回做为Kik id
-    let kik = Kik::new(id.as_str(), kik_info.name.as_str(), channel.clone());
+    let kik = Kik::new(id.as_str(), kik_info.name.as_str(), ip.clone(), SystemTime::now(), channel.clone());
     context
         .kik_map
         .write()
         .await
         .insert(id.clone(), kik.clone());
-    info!(
-        "【{}】上线，ip:{}",
-        kik_info.name,
-        channel
-            .lock()
-            .await
-            .get_peer_addr()
-            .as_ref()
-            .map(|addr| addr.to_string())
-            .unwrap_or("未知ip".to_string())
-    );
+    info!("【{}】上线，ip:{}",kik_info.name,ip);
     push_event().await;
     kik
 }

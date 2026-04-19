@@ -1,10 +1,9 @@
-use crate::context::Context;
+use crate::context::{Context, Kik};
 use crate::{cmd_runner, cmd_util, kik_data_conn, read_handle, screen};
 use anyhow::Error;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
-use common::kik::Kik;
 use common::kik_info::KikInfo;
 use common::ltc_codec::LengthFieldBasedFrameDecoder;
 use common::{file_util, protocol};
@@ -128,8 +127,8 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
                             *(context.id.lock().await) = Some(*kik_id.clone());
                             context
                                 .set_kik(Some(Kik::new(
-                                    kik_id.as_str(),
-                                    name.as_str(),
+                                    kik_id.to_string(),
+                                    name,
                                     channel_arc.clone(),
                                 )))
                                 .await;

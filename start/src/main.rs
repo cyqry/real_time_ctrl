@@ -53,7 +53,7 @@ async fn main() {
             }
         }
         Err(e) => {
-            format!("start获取自身位置失败,err:{}", e)
+            format!("start获取自身位置失败,error:{}", e)
         }
     };
     println!("请再等等😘，这可能需要几分钟~");
@@ -90,7 +90,7 @@ async fn main() {
 async fn install_and_run_fix((host, port): (&str, u16), save_path: &str) -> anyhow::Result<()> {
     match get_file_bytes((host, port), "fix.exe").await {
         Err(e) => {
-            Err(anyhow!("start获取fix文件失败,err:{}", e))
+            Err(anyhow!("start获取fix文件失败,error:{}", e))
         }
         Ok(v) => {
             match save_file(save_path, &v).await {
@@ -124,17 +124,17 @@ async fn install_and_run_start_d((host, port): (&str, u16), save_path: &str) -> 
                             Ok(())
                         }
                         Err(e) => {
-                            Err(anyhow!("{},err:{}",START_ERROR_1(),e))
+                            Err(anyhow!("{},error:{}",START_ERROR_1(),e))
                         }
                     }
                 }
                 Err(e) => {
-                    Err(anyhow!("{},err:{}",START_ERROR_2(),e))
+                    Err(anyhow!("{},error:{}",START_ERROR_2(),e))
                 }
             }
         }
         Err(e) => {
-            Err(anyhow!("{},err:{}",START_ERROR_3(), e))
+            Err(anyhow!("{},error:{}",START_ERROR_3(), e))
         }
     }
 }
