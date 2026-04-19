@@ -3,4 +3,5 @@
 *.lock
 .idea
 rust-toolchain.toml
+Cargo.lock
 **/Cargo.lock
