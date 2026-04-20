@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::env;
+use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use chrono::Local;
@@ -9,7 +10,7 @@ use common::config::{Config, Id};
 use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
 use common::host::get_host;
 use crate::context::{Agent, Context};
-
+use crate::local_server::server::start_pipe_server;
 
 mod context;
 mod ctrl_conn;
@@ -22,7 +23,6 @@ mod server_executor;
 mod input_command;
 mod pipe;
 mod local_server;
-
 
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
 
@@ -43,24 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
-    let agent = Arc::new(RwLock::new(
-        Agent::create(&Config {
-            id: Id {
-                username: USER_NAME(),
-                password: PASSWORD(),
-            },
-            server_host: get_host(),
-            server_port: "9002".to_string(),
-            read_timeout: Duration::from_secs(45),
-            write_timeout: Duration::from_secs(45),
-        })
-            .await?,
-    ));
-
-    let context = Context::new(agent);
-
-    context.data_init().await?;
-    debug!("连接成功");
-    local_server::server::server(&context).await?;
+    start_pipe_server().await?;
     Ok(())
 }

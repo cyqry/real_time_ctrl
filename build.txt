@@ -1,0 +1,1 @@
+cargo.exe build --bin real_ctrl_invoker_http_service --profile release --manifest-path D:\Code\Rust\my\real_time_ctrl\real_ctrl\Cargo.toml

@@ -1,5 +1,4 @@
 use std::io;
-use crate::context::Context;
 use crate::input_command::{deserialize_command, InputCommand, RemoteResp};
 use anyhow::{anyhow, Context as AnyhowContext};
 use std::io::Read;
@@ -12,10 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde::de::Unexpected::Option;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use common::protocol::{transfer_b_encode, transfer_encode};
+use crate::context::Context;
 use crate::dispatch;
 use crate::pipe::pipe_common::ServerResponse;
 
 // 处理单个连接
+//todo 控制不能并发调用
 pub async fn handle_client(context: Context, mut stream: PipeStream<Bytes, Bytes>) -> anyhow::Result<()> {
     loop {
         let mut len_buf = [0u8; 4];

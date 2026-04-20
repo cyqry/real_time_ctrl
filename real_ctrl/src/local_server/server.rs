@@ -1,12 +1,44 @@
+use std::error::Error;
 use anyhow::{anyhow, Result};
 use std::io;
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::time::Duration;
 use anyhow::__private::kind::TraitKind;
-use crate::context::Context;
+use crate::context::{Agent, Context};
 use crate::local_server::handle_client::handle_client;
 use interprocess::os::windows::named_pipe::{pipe_mode, tokio::*, PipeListenerOptions};
-use log::{error, info};
+use log::{debug, error, info};
+use tokio::sync::RwLock;
+use common::config::{Config, Id};
+use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
+use common::host::get_host;
+use crate::local_server;
 use crate::pipe::pipe_common::PIPE_NAME;
+
+
+pub async fn start_pipe_server() -> anyhow::Result<()> {
+    let agent = Arc::new(RwLock::new(
+        Agent::create(&Config {
+            id: Id {
+                username: USER_NAME(),
+                password: PASSWORD(),
+            },
+            server_host: get_host(),
+            server_port: "9002".to_string(),
+            read_timeout: Duration::from_secs(45),
+            write_timeout: Duration::from_secs(45),
+        })
+            .await?,
+    ));
+
+    let context = Context::new(agent);
+
+    context.data_init().await?;
+    debug!("连接成功");
+    local_server::server::server(&context).await?;
+    Ok(())
+}
 
 pub async fn server(context: &Context) -> Result<()> {
 
