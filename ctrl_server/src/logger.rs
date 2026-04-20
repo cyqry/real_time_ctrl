@@ -92,9 +92,13 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
         .with_writer(error_appender)
         .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
 
+    // 创建 EnvFilter 来读取 RUST_LOG 环境变量
+    let env_filter = EnvFilter::from_default_env();
+
     //  初始化订阅者，同时注册两个日志层
     // SubscriberExt::with() 允许我们附加多个层
     tracing_subscriber::registry()
+        .with(env_filter) // 添加环境过滤器
         .with(default_layer) // 注册非 ERROR 日志层
         .with(error_layer) // 注册 ERROR 日志层
         .init();
