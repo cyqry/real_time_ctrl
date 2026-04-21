@@ -5,3 +5,4 @@
 rust-toolchain.toml
 Cargo.lock
 **/Cargo.lock
+**/encrypted_strings.rs

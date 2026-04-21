@@ -154,9 +154,10 @@ impl Context {
         };
     }
 
+    //手动下线kik, 通过手动关闭连接自动触发下线
     pub async fn offline_kik(&self, kik_id: &str) {
-        let delete_kik = self.just_delete_kik(kik_id).await;
-        if let Some(kik) = delete_kik {
+        let offline_kik = self.find_kik(kik_id).await;
+        if let Some(kik) = offline_kik {
             kik.clear().await;
         }
     }
@@ -192,9 +193,12 @@ impl Context {
         }
         let kik = find_kik.unwrap();
         if !kik.exist_data_channel().await && !kik.exist_kik_conn().await {
-            kik.clear().await;
+            //从整个context中删除这个kik
+            self.just_delete_kik(kik_id).await
+        } else {
+            None
         }
-        self.just_delete_kik(kik_id).await
+     
     }
 
     async fn find_kik(&self, kik_id: &str) -> Option<Kik> {

@@ -107,7 +107,7 @@ impl Kik {
             .insert(conn.clone().lock().await.get_id().to_string(), conn);
     }
     pub async fn exist_data_channel(&self) -> bool {
-        self.data_conns.clone().lock().await.is_empty()
+        !self.data_conns.clone().lock().await.is_empty()
     }
     pub async fn clear(&self) {
         {
