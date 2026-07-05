@@ -2,7 +2,7 @@
 #cargo-features = ["trim-paths"]
 
 [workspace]
-members = ["real_ctrl", "ctrl_kik", "ctrl_server", "win_common", "common", "start", "ctrl_common"]
+members = ["real_ctrl", "ctrl_kik", "ctrl_server", "win_common", "common", "start", "ctrl_common", "screen_stream"]
 resolver = "2"
 
 #ctrl_server,real_ctrl 时放开

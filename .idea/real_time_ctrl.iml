@@ -11,6 +11,8 @@
       <sourceFolder url="file://$MODULE_DIR$/start/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/real_ctrl_local_server/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/ctrl_common/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/screen_stream/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/screen_stream/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/real_ctrl/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>

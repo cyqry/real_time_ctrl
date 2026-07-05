@@ -1,0 +1,12 @@
+[package]
+name = "screen_stream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.11.0"
+openh264 = "0.9.3"
+thiserror = "2.0.18"
+tokio = { version = "1.26.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+windows-capture = "2.0.0"
