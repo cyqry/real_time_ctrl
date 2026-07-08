@@ -1,32 +1,34 @@
-use std::io::Write;
 use crate::context::{Agent, Context};
+use crate::input_command::InputCommand;
+use chrono::Local;
 use common::command::Command;
-use common::config::{Config, Id};
+use common::config::{Config, Id, SecurityConfig};
+use common::generated::encrypted_strings;
+use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
+use common::host::get_host_from_env_or_default;
 use log::{debug, error, info, LevelFilter};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::env;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use common::generated::encrypted_strings;
-use common::generated::encrypted_strings::{ PASSWORD, USER_NAME};
-use common::host::get_host;
-use crate::input_command::InputCommand;
-use chrono::Local;
 
+mod api_contract;
+mod api_service;
 mod context;
 mod ctrl_conn;
 mod ctrl_data_conn;
 mod ctrl_executor;
 mod direct_executor;
 mod dispatch;
-mod local_executor;
-mod server_executor;
 mod input_command;
-mod pipe;
-mod local_server;
 mod local_client;
+mod local_executor;
+mod local_server;
+mod pipe;
+mod server_executor;
 
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
 
@@ -47,19 +49,26 @@ async fn main() {
         .parse_default_env()
         .init();
 
+    let server_port = env::var("REAL_CTRL_SERVER_PORT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "9002".to_string());
+
     let agent = Arc::new(RwLock::new(
         Agent::create(&Config {
             id: Id {
                 username: USER_NAME(),
                 password: PASSWORD(),
             },
-            server_host: get_host(),
-            server_port: "9002".to_string(),
+            server_host: get_host_from_env_or_default("REAL_CTRL_SERVER_HOST"),
+            server_port,
             read_timeout: Duration::from_secs(45),
             write_timeout: Duration::from_secs(45),
+            security: SecurityConfig::real_ctrl_from_env(),
         })
-            .await
-            .unwrap(),
+        .await
+        .unwrap(),
     ));
 
     let context = Context::new(agent);

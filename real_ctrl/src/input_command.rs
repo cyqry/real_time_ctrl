@@ -1,13 +1,13 @@
 use anyhow::anyhow;
+use bytes::BytesMut;
 use common::command::LocalCommand::LocalExit;
 use common::command::SysCommand::*;
 use common::command::{Command, CtrlCommand, LocalCommand, SysCommand};
-use std::str::FromStr;
-use bytes::BytesMut;
-use serde::{Deserialize, Serialize};
 use common::message::kik_cmd_resp_info;
 use common::protocol::BufSerializable;
 use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputCommand {
@@ -34,7 +34,6 @@ pub enum RemoteResp {
     Error(u32, String),
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RemoteSuccessResp {
     Info(String),
@@ -53,12 +52,11 @@ impl BufSerializable for RemoteResp {
     where
         Self: Sized,
     {
-        let resp = postcard::from_bytes::<RemoteResp>(bys.to_vec().as_slice()).expect("failed to serialize RemoteResp");
+        let resp = postcard::from_bytes::<RemoteResp>(bys.to_vec().as_slice())
+            .expect("failed to serialize RemoteResp");
         Some(resp)
     }
 }
-
-
 
 #[cfg(target_os = "windows")]
 static DEFAULT_SCREEN_PATH: &str = "D:\\MyTest\\1.png";
@@ -179,7 +177,7 @@ fn test() {
 }
 
 #[test]
-fn de_test(){
+fn de_test() {
     let command = InputCommand::Ctrl(InputCtrlCommand::Ls("sss".to_string()));
     let vec = serialize_command(&command).unwrap();
     println!("{}", vec.len());

@@ -8,6 +8,8 @@ pub mod kik_info;
 pub mod ltc_codec;
 pub mod message;
 pub mod protocol;
+pub mod secure_transport;
+pub mod session_auth;
 pub mod time_util;
 
 pub mod generated;

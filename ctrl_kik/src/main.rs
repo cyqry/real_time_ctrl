@@ -1,17 +1,17 @@
 #![windows_subsystem = "windows"] //此宏不打开窗口，同时print也失效
 
-use std::io::Write;
-use std::env;
 use crate::context::Context;
-use common::config::{Config, Id};
-use log::debug;
-use std::path::Path;
-use std::time::Duration;
 use chrono::Local;
-use tokio::fs::{File, OpenOptions};
-use tokio::{join, time};
+use common::config::{Config, Id, SecurityConfig};
 use common::generated::encrypted_strings::*;
 use common::host::get_host;
+use log::debug;
+use std::env;
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
+use tokio::fs::{File, OpenOptions};
+use tokio::{join, time};
 
 mod cmd_runner;
 mod cmd_util;
@@ -24,17 +24,24 @@ mod screen;
 #[tokio::test]
 async fn test() {
     use common::file_util;
-    use common::time_util::{self, TimeUnit, Timer};
-    use std::time::Duration;
-    use time_util::*;
-    // let start = Instant::now();
-    // //8602103819
-    // println!("{}", get_dir_size(r"D:\Myjava").await.unwrap());
-    // println!("{:?}", start.elapsed());
-    // println!("{:?}", ls("E:", false).await);
-    let mut timer = Timer::new();
-    println!("{}", file_util::get_dir_size(r"E:\D\").await.unwrap());
-    println!("Elapsed time: {} ms", timer.elapsed(TimeUnit::Milliseconds));
+    let test_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("ctrl_kik_get_dir_size_test");
+
+    // 测试数据必须留在仓库 target 目录内，避免依赖开发机私有盘符。
+    let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    tokio::fs::create_dir_all(test_dir.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(test_dir.join("a.bin"), [1_u8, 2, 3])
+        .await
+        .unwrap();
+    tokio::fs::write(test_dir.join("nested").join("b.bin"), [4_u8, 5])
+        .await
+        .unwrap();
+
+    assert_eq!(file_util::get_dir_size(&test_dir).await.unwrap(), 5);
 }
 
 #[tokio::main]
@@ -66,6 +73,7 @@ async fn main() {
         server_port: PORT(),
         read_timeout: Duration::from_secs(45),
         write_timeout: Duration::from_secs(45),
+        security: SecurityConfig::plain(),
     };
 
     loop {
@@ -87,7 +95,7 @@ async fn main() {
                             }
                         }
                     });
-                  let _ =  join!(h);
+                    let _ = join!(h);
                 }
                 Err(e) => {
                     time::sleep(Duration::from_secs(2)).await;

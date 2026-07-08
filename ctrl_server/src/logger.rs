@@ -73,7 +73,7 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
         .event_format(log_format.clone())
         .with_writer(default_appender)
         // 过滤器: 结合 EnvFilter 的规则，并使用 filter_fn 明确排除 ERROR 及以上级别
-        .with_filter(   tracing_subscriber::filter::filter_fn ( move |metadata| {
+        .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
             // 排除 ERROR 及以上的事件，避免与 error_layer 重复
             metadata.level().as_log() > Level::Error
         }));

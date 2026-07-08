@@ -1,20 +1,14 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpStream;
-use tokio::time;
-use tokio::time::Instant;
-use tokio_util::codec::Framed;
+
+use crate::secure_transport::BoxedAsyncWrite;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChannelType {
@@ -28,7 +22,7 @@ pub enum ChannelType {
 pub struct Channel {
     pub channel_type: ChannelType,
     id: String,
-    writer: BufWriter<OwnedWriteHalf>,
+    writer: BufWriter<BoxedAsyncWrite>,
     addr: (io::Result<SocketAddr>, io::Result<SocketAddr>),
     attr: HashMap<String, Box<dyn Any + Send + Sync>>,
     closed: AtomicBool,
@@ -36,17 +30,32 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn new(writer: OwnedWriteHalf, id: Option<String>, channel_type: ChannelType) -> Self {
-        
+    pub fn new(
+        writer: BoxedAsyncWrite,
+        id: Option<String>,
+        channel_type: ChannelType,
+        local_addr: io::Result<SocketAddr>,
+        peer_addr: io::Result<SocketAddr>,
+    ) -> Self {
         Channel {
             id: id.unwrap_or("undefined_id".to_string()),
             channel_type,
-            addr: (writer.local_addr(),writer.peer_addr()),
+            addr: (local_addr, peer_addr),
             writer: BufWriter::new(writer),
             attr: HashMap::new(),
             create_time: SystemTime::now(),
             closed: AtomicBool::new(false),
         }
+    }
+
+    pub fn from_tcp_writer(
+        writer: OwnedWriteHalf,
+        id: Option<String>,
+        channel_type: ChannelType,
+    ) -> Self {
+        let local_addr = writer.local_addr();
+        let peer_addr = writer.peer_addr();
+        Self::new(Box::pin(writer), id, channel_type, local_addr, peer_addr)
     }
 
     pub fn get_local_addr(&self) -> &std::io::Result<SocketAddr> {
@@ -67,7 +76,7 @@ impl Channel {
     }
 
     pub fn get_stream_info(&self) -> String {
-        format!("{:?}", self.writer)
+        format!("local={:?}, peer={:?}", self.addr.0, self.addr.1)
     }
 
     pub fn put<T: 'static + Any + Send + Sync>(&mut self, key: String, value: T) {

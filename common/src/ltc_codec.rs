@@ -1,14 +1,54 @@
 use bytes::{Buf, BytesMut};
-use log::debug;
+use std::io::{Error, ErrorKind};
 use tokio_util::codec::Decoder;
+
+/// 控制通道建议上限。当前先暴露常量，后续按连接类型逐步启用。
+pub const CONTROL_MAX_FRAME_LENGTH: usize = 1024 * 1024;
+/// 数据通道为了兼容历史的大文件一次性传输，默认仍保留较大上限。
+pub const DATA_MAX_FRAME_LENGTH: usize = 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+/// 兼容旧行为的默认上限。后续应把控制通道切到 CONTROL_MAX_FRAME_LENGTH。
+pub const DEFAULT_MAX_FRAME_LENGTH: usize = DATA_MAX_FRAME_LENGTH;
 
 pub struct LengthFieldBasedFrameDecoder {
     pub current_len: Option<usize>,
+    max_frame_len: usize,
 }
 
 impl LengthFieldBasedFrameDecoder {
     pub fn new() -> Self {
-        LengthFieldBasedFrameDecoder { current_len: None }
+        Self::new_with_max_frame_len(DEFAULT_MAX_FRAME_LENGTH)
+    }
+
+    pub fn new_with_max_frame_len(max_frame_len: usize) -> Self {
+        LengthFieldBasedFrameDecoder {
+            current_len: None,
+            max_frame_len,
+        }
+    }
+
+    pub fn max_frame_len(&self) -> usize {
+        self.max_frame_len
+    }
+
+    pub fn set_max_frame_len(&mut self, max_frame_len: usize) {
+        // 已经读到长度字段的半帧不能在中途改上限，避免同一帧按两套规则解释。
+        if self.current_len.is_none() {
+            self.max_frame_len = max_frame_len;
+        }
+    }
+
+    fn validate_frame_len(&self, len: usize) -> Result<(), Error> {
+        if len > self.max_frame_len {
+            Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "frame length {} exceeds max frame length {}",
+                    len, self.max_frame_len
+                ),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -17,33 +57,113 @@ impl Decoder for LengthFieldBasedFrameDecoder {
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // debug!("src len: {}", src.len());
         if self.current_len.is_none() {
-            // debug!("无current_len");
             if src.len() < 4 {
-                // 这里的 4 代表长度字段占用的字节数
+                // 前 4 个字节是大端 body 长度，长度字段不完整时继续等待。
                 return Ok(None);
             }
-            //get_uint会改变src中剩余字节，即将前四个字节读掉，以大端的方式读取
-            let len = src.get_uint(4) as usize; // 这里我们从字节流中读取长度字段
+
+            let len = src.get_u32() as usize;
+            self.validate_frame_len(len)?;
             self.current_len = Some(len);
 
             if src.len() < len {
                 return Ok(None);
             }
-            // 这里相当于将前len个字节读掉
+
+            // 只切出当前完整 body，后续粘包数据留给下一轮 decode。
             let res = src.split_to(len);
             self.current_len = None;
             Ok(Some(res))
         } else {
-            // debug!("有current_len,为{}",self.current_len.unwrap());
             let current_len = self.current_len.unwrap();
+            self.validate_frame_len(current_len)?;
             if src.len() < current_len {
                 return Ok(None);
             }
+
             self.current_len = None;
-            // debug!("删除current_len");
             Ok(Some(src.split_to(current_len)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BufMut;
+
+    #[test]
+    fn waits_for_complete_header() {
+        let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(8);
+        let mut src = BytesMut::from(&[0, 0, 0][..]);
+
+        let decoded = decoder.decode(&mut src).unwrap();
+
+        assert!(decoded.is_none());
+        assert_eq!(src.len(), 3);
+    }
+
+    #[test]
+    fn waits_for_complete_body_after_reading_length() {
+        let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(8);
+        let mut src = BytesMut::new();
+        src.put_u32(4);
+        src.extend_from_slice(&[1, 2]);
+
+        let decoded = decoder.decode(&mut src).unwrap();
+
+        assert!(decoded.is_none());
+        assert_eq!(decoder.current_len, Some(4));
+        assert_eq!(src.as_ref(), &[1, 2]);
+    }
+
+    #[test]
+    fn decodes_one_complete_frame_and_keeps_trailing_bytes() {
+        let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(8);
+        let mut src = BytesMut::new();
+        src.put_u32(3);
+        src.extend_from_slice(&[1, 2, 3, 9, 9]);
+
+        let decoded = decoder.decode(&mut src).unwrap().unwrap();
+
+        assert_eq!(decoded.as_ref(), &[1, 2, 3]);
+        assert_eq!(src.as_ref(), &[9, 9]);
+        assert_eq!(decoder.current_len, None);
+    }
+
+    #[test]
+    fn rejects_frame_that_exceeds_configured_limit() {
+        let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(3);
+        let mut src = BytesMut::new();
+        src.put_u32(4);
+        src.extend_from_slice(&[1, 2, 3, 4]);
+
+        let err = decoder.decode(&mut src).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(decoder.current_len, None);
+    }
+
+    #[test]
+    fn updates_max_frame_len_between_frames() {
+        let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(8);
+
+        decoder.set_max_frame_len(4);
+
+        assert_eq!(decoder.max_frame_len(), 4);
+    }
+
+    #[test]
+    fn does_not_update_max_frame_len_in_the_middle_of_a_frame() {
+        let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(8);
+        let mut src = BytesMut::new();
+        src.put_u32(6);
+        src.extend_from_slice(&[1, 2]);
+
+        assert!(decoder.decode(&mut src).unwrap().is_none());
+        decoder.set_max_frame_len(4);
+
+        assert_eq!(decoder.max_frame_len(), 8);
     }
 }

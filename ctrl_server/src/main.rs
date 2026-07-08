@@ -1,10 +1,10 @@
-use core::context::Context;
-use common::config::{Config, Id};
-use std::{env, panic, thread};
-use std::time::Duration;
-use log::{debug, error, info, warn};
+use common::config::{Config, Id, SecurityConfig};
 use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
+use core::context::Context;
 use core::server;
+use log::{debug, error, info, warn};
+use std::time::Duration;
+use std::{env, panic, thread};
 
 mod core;
 mod handler;
@@ -15,9 +15,21 @@ const LOG_LEVEL: &str = env!("LOG_LEVEL");
 
 #[tokio::main]
 async fn main() {
+    let bind_host = env::var("CTRL_SERVER_BIND_HOST")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let server_port = env::var("CTRL_SERVER_PORT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "9002".to_string());
 
     // 设置全局 INFO 级别
-    unsafe { std::env::set_var("RUST_LOG", LOG_LEVEL); }
+    unsafe {
+        std::env::set_var("RUST_LOG", LOG_LEVEL);
+    }
     // env_logger::init(); //该库 为 log 库 实现环境变量设置日志级别, 这里应该不需要
     let config = logger::LogConfig {
         dir: std::path::PathBuf::from("./logs"),
@@ -40,13 +52,15 @@ async fn main() {
                 username: USER_NAME(),
                 password: PASSWORD(),
             },
-            server_host: "0.0.0.0".to_string(),
-            server_port: "9002".to_string(),
+            server_host: bind_host,
+            server_port,
             read_timeout: Duration::from_secs(45),
             write_timeout: Duration::from_secs(45),
+            security: SecurityConfig::ctrl_server_from_env(),
         },
     )
-        .await {
+    .await
+    {
         Ok(_) => {}
         Err(e) => {
             error!("服务停止!{}", e);

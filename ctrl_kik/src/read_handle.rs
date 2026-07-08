@@ -91,7 +91,7 @@ pub async fn handle_kik_data(
     let frame = KikFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
         KikFrame::Data(id, data) => {
-            debug!("得到长度为{}的数据",data.len());
+            debug!("得到长度为{}的数据", data.len());
             context.send_data((id, data)).await.unwrap_or_else(|e| {
                 debug!("向接收通道发送数据失败,error:{}", e);
             });

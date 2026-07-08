@@ -1,7 +1,7 @@
-use common::message::kik_cmd_resp_info;
 use crate::context::Context;
 use crate::input_command::{InputCommand, RemoteResp, RemoteSuccessResp};
 use crate::{ctrl_executor, direct_executor, local_executor, server_executor};
+use common::message::kik_cmd_resp_info;
 use common::message::kik_cmd_resp_info::Ls;
 use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
 
@@ -38,25 +38,14 @@ pub async fn distribution(context: &Context, command: InputCommand) -> anyhow::R
 fn format_now(sys_now: SysNow) -> String {
     match sys_now {
         SysNow::Kik(kik) => {
-            format!(
-                "当前正在控制 {}-----{}",
-                kik.name,
-                kik.id
-            )
+            format!("当前正在控制 {}-----{}", kik.name, kik.id)
         }
-        SysNow::None => {
-            "没有被控制的Kik".to_owned()
-        }
-        SysNow::NotOnline => {
-            "当前被控Kik不在线".to_owned()
-        }
+        SysNow::None => "没有被控制的Kik".to_owned(),
+        SysNow::NotOnline => "当前被控Kik不在线".to_owned(),
     }
-
 }
 
-fn format_ls(
-    data: &Vec<kik_cmd_resp_info::Ls>,
-) -> String {
+fn format_ls(data: &Vec<kik_cmd_resp_info::Ls>) -> String {
     let mut res = String::new();
     let file_name_header = "Filename";
     let is_file_header = "IsFile";
@@ -78,7 +67,14 @@ fn format_ls(
         }
     };
     // 首先，找出每列的最大宽度
-    for kik_cmd_resp_info::Ls { filename, is_file, size, created_date, modified_date } in data {
+    for kik_cmd_resp_info::Ls {
+        filename,
+        is_file,
+        size,
+        created_date,
+        modified_date,
+    } in data
+    {
         if let Some(name) = filename {
             max_filename_len = max_filename_len.max(name.len());
         }
@@ -134,7 +130,14 @@ fn format_ls(
 
     // 打印数据
     let blank = "".to_string();
-    for kik_cmd_resp_info::Ls { filename, is_file, size, created_date, modified_date } in data {
+    for kik_cmd_resp_info::Ls {
+        filename,
+        is_file,
+        size,
+        created_date,
+        modified_date,
+    } in data
+    {
         let filename_str = filename.as_ref().unwrap_or(&blank);
         let size_str = format!(
             "{}",
@@ -167,7 +170,6 @@ fn format_ls(
     res
 }
 
-
 pub async fn distribution_other(
     context: &Context,
     command: InputCommand,
@@ -194,9 +196,7 @@ fn format_use(kik: KikInfoVo) -> String {
     format!("您正在控制 {}-----{}", kik.name, kik.id)
 }
 
-fn format_file_meta(
-    data: &Vec<kik_cmd_resp_info::Ls>,
-) -> String {
+fn format_file_meta(data: &Vec<kik_cmd_resp_info::Ls>) -> String {
     let mut res = String::new();
     let file_name_header = "Filename";
     let is_file_header = "IsFile";
@@ -218,7 +218,14 @@ fn format_file_meta(
         }
     };
     // 首先，找出每列的最大宽度
-    for kik_cmd_resp_info::Ls { filename, is_file, size, created_date, modified_date } in data {
+    for kik_cmd_resp_info::Ls {
+        filename,
+        is_file,
+        size,
+        created_date,
+        modified_date,
+    } in data
+    {
         if let Some(name) = filename {
             max_filename_len = max_filename_len.max(name.len());
         }
@@ -274,7 +281,14 @@ fn format_file_meta(
 
     // 打印数据
     let blank = "".to_string();
-    for kik_cmd_resp_info::Ls { filename, is_file, size, created_date, modified_date } in data {
+    for kik_cmd_resp_info::Ls {
+        filename,
+        is_file,
+        size,
+        created_date,
+        modified_date,
+    } in data
+    {
         let filename_str = filename.as_ref().unwrap_or(&blank);
         let size_str = format!(
             "{}",

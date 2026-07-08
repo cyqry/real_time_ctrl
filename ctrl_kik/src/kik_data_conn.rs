@@ -5,7 +5,9 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
 use common::kik_info::KikInfo;
-use common::ltc_codec::LengthFieldBasedFrameDecoder;
+use common::ltc_codec::{LengthFieldBasedFrameDecoder, DATA_MAX_FRAME_LENGTH};
+use common::message::init_frame;
+use common::message::init_frame::InitFrame;
 use common::protocol;
 use common::protocol::BufSerializable;
 use log::debug;
@@ -22,17 +24,19 @@ use tokio::{join, time};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use uuid::Uuid;
-use common::message::init_frame;
-use common::message::init_frame::InitFrame;
 
 pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
     let socket =
         TcpStream::connect(format!("{}:{}", config.server_host, config.server_port)).await?;
     let (reader, writer) = socket.into_split();
-    let framed_read = FramedRead::new(BufReader::new(reader), LengthFieldBasedFrameDecoder::new());
+    // Kik 数据通道承载截图和文件内容，先保留兼容旧路径的大帧上限。
+    let framed_read = FramedRead::new(
+        BufReader::new(reader),
+        LengthFieldBasedFrameDecoder::new_with_max_frame_len(DATA_MAX_FRAME_LENGTH),
+    );
     let mut framed_arc = Arc::new(Mutex::new(framed_read));
 
-    let channel_arc = Arc::new(Mutex::new(Channel::new(
+    let channel_arc = Arc::new(Mutex::new(Channel::from_tcp_writer(
         writer,
         None,
         ChannelType::Unknown,
@@ -55,12 +59,13 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
         });
 
         let e = loop {
-            match timeout(
-                Duration::from_secs(45),
-                framed_arc.clone().lock().await.next(),
-            )
-            .await
-            {
+            // 读锁只包住 next().await，避免 match 臂内处理逻辑被临时锁生命周期拖住。
+            let read_result = {
+                let mut framed = framed_arc.lock().await;
+                timeout(Duration::from_secs(45), framed.next()).await
+            };
+
+            match read_result {
                 //timeout返回 Ok说明读取未超时
                 Ok(res) => {
                     match res {
@@ -102,7 +107,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
             let chan = channel.clone();
             handle_error(chan, e.unwrap()).await;
         }
-        
+
         handle_inactive(&context, channel).await;
     });
 
@@ -140,7 +145,7 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
         if arc.lock().await.is_closed() {
             return;
         }
-        
+
         let mut guard = arc.lock().await;
         if guard.channel_type != ChannelType::Unknown {
             match guard.write_and_flush(&protocol::kik_pong()).await {
@@ -159,9 +164,9 @@ async fn handle_active(context: &Context, channel: Arc<Mutex<Channel>>) -> anyho
         .clone()
         .lock()
         .await
-        .write_and_flush(&protocol::transfer_encode_frame(
-            InitFrame::KikDataConnReq(id),
-        ))
+        .write_and_flush(&protocol::transfer_encode_frame(InitFrame::KikDataConnReq(
+            id,
+        )))
         .await
 }
 
@@ -183,7 +188,9 @@ async fn handle_read(
     let channel_type = channel.clone().lock().await.channel_type.clone();
     match channel_type {
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
-        ChannelType::Unknown => read_handle::handle_init_message(context, channel, msg, auth_tx).await,
+        ChannelType::Unknown => {
+            read_handle::handle_init_message(context, channel, msg, auth_tx).await
+        }
         _ => {
             unreachable!("不会这样")
         }

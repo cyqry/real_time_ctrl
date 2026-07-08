@@ -32,7 +32,7 @@ impl CmdResp {
     pub fn get_resp(&self) -> &Resp {
         &self.resp
     }
-    
+
     pub fn get_cmd_id(&self) -> &String {
         &self.cmd_id
     }
@@ -84,6 +84,9 @@ impl BufSerializable for ServerResp {
     }
 
     fn from_buf(mut bys: BytesMut) -> Option<Self> {
+        if bys.remaining() < 1 {
+            return None;
+        }
         let code = bys.get_u8();
         match code {
             0 => Some(ServerResp::Success(ServerSuccessResp::from_buf(bys)?)),
@@ -119,6 +122,9 @@ impl BufSerializable for Resp {
     }
 
     fn from_buf(mut bys: BytesMut) -> Option<Self> {
+        if bys.remaining() < 1 {
+            return None;
+        }
         let code = bys.get_u8();
         match code {
             0 => Some(Resp::Server(ServerResp::from_buf(bys)?)),
@@ -171,4 +177,18 @@ fn test_cmd_resp_serialization() {
         }
         _ => panic!("Unexpected response type"),
     }
+}
+
+#[test]
+fn empty_resp_returns_none() {
+    assert!(Resp::from_buf(BytesMut::new()).is_none());
+    assert!(ServerResp::from_buf(BytesMut::new()).is_none());
+}
+
+#[test]
+fn short_server_error_returns_none() {
+    let mut bys = BytesMut::new();
+    bys.put_u8(1);
+
+    assert!(ServerResp::from_buf(bys).is_none());
 }

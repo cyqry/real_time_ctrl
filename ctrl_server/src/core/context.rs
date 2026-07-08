@@ -1,11 +1,20 @@
 use common::channel::Channel;
 use ctrl_common::kik::Kik;
-use std::collections::HashMap;
+use log::error;
+use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use log::error;
+use std::time::SystemTime;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+
+#[derive(Clone, Debug)]
+pub struct CtrlSession {
+    pub session_id: String,
+    pub ctrl_channel_id: String,
+    pub created_at: SystemTime,
+    used_data_nonces: HashSet<String>,
+}
 
 #[derive(Clone)]
 //不要直接修改context,Context也可看为一个指针
@@ -21,12 +30,13 @@ pub struct Context {
         >,
     >,
     next_ctrl_data: Arc<AtomicU16>,
+    ctrl_session: Arc<RwLock<Option<CtrlSession>>>,
     now_cmd_id: Arc<RwLock<Option<String>>>,
     //todo 最外层优化为原子锁
     //当前正在控制的kik
     //之所以要在Kik内部加一个arc，是因为会被kik_map变量共享引用，Kik的conn和vec都只能在堆中存在一份，kik_info是可克隆的，conn和vec锁分开是因为他们没有关系
     kik_op: Arc<RwLock<Option<Kik>>>,
-    
+
     //所有在线的被控端map<String,Kik>
     pub kik_map: Arc<RwLock<HashMap<String, Kik>>>,
 
@@ -39,6 +49,7 @@ impl Context {
         Context {
             ctrl_op: Arc::new(RwLock::new(None)),
             next_ctrl_data: Arc::new(AtomicU16::new(0)),
+            ctrl_session: Arc::new(RwLock::new(None)),
             now_cmd_id: Arc::new(RwLock::new(None)),
             kik_op: Arc::new(RwLock::new(None)),
             kik_map: Arc::new(RwLock::new(HashMap::new())),
@@ -79,7 +90,7 @@ impl Context {
             Some(_) => false,
         }
     }
-    
+
     pub async fn delete_now_cmd_id(&self) {
         *(self.now_cmd_id.clone().write().await) = None;
     }
@@ -95,6 +106,7 @@ impl Context {
             //由于这个Map只属于这里，只被这里控制，就像直接是一个栈变量，所以可以直接clone
             let (conn_op, data_conns) = guard.clone().unwrap();
             *guard = Some((None, data_conns));
+            self.clear_ctrl_session().await;
             return conn_op;
         }
         None
@@ -131,8 +143,7 @@ impl Context {
             }
         };
     }
-    
-    
+
     pub async fn clear_all_ctrl_data(&self) {
         match *(self.ctrl_op.clone().write().await) {
             None => {}
@@ -140,8 +151,37 @@ impl Context {
                 data_conns.clear();
             }
         };
-    } 
-    
+    }
+
+    pub async fn set_ctrl_session(&self, session_id: String, ctrl_channel_id: String) {
+        let session = CtrlSession {
+            session_id,
+            ctrl_channel_id,
+            created_at: SystemTime::now(),
+            used_data_nonces: HashSet::new(),
+        };
+        *self.ctrl_session.write().await = Some(session);
+    }
+
+    pub async fn clear_ctrl_session(&self) {
+        *self.ctrl_session.write().await = None;
+    }
+
+    pub async fn validate_ctrl_data_session(&self, session_id: &str, channel_nonce: &str) -> bool {
+        let mut guard = self.ctrl_session.write().await;
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        if session.session_id != session_id {
+            return false;
+        }
+        if session.used_data_nonces.contains(channel_nonce) {
+            return false;
+        }
+        session.used_data_nonces.insert(channel_nonce.to_string());
+        true
+    }
+
     pub async fn insert_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
         match *(self.ctrl_op.clone().write().await) {
             None => {}
@@ -182,7 +222,6 @@ impl Context {
         if option.is_some() {
             option.unwrap().delete_kik_conn().await;
         }
-      
     }
 
     pub async fn delete_kik_if_not_online(&self, kik_id: &str) -> Option<Kik> {
@@ -198,7 +237,6 @@ impl Context {
         } else {
             None
         }
-     
     }
 
     async fn find_kik(&self, kik_id: &str) -> Option<Kik> {
@@ -213,7 +251,7 @@ impl Context {
         self.kik_map.read().await.get(kik_id).cloned()
     }
 
-   async  fn just_delete_kik(&self, kik_id: &str) -> Option<Kik> {
+    async fn just_delete_kik(&self, kik_id: &str) -> Option<Kik> {
         //先从 self.kik_op找
         let kik_op = {
             let mut guard = self.kik_op.write().await;
@@ -235,7 +273,7 @@ impl Context {
             map_kik
         }
     }
-    
+
     pub async fn delete_kik_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
         //先从 kik_op中找
         {
@@ -251,7 +289,8 @@ impl Context {
             .lock()
             .await
             .get::<String>("kik_id")
-            .expect("kik data conn必需要有kik_id!!").to_string();
+            .expect("kik data conn必需要有kik_id!!")
+            .to_string();
         match self.kik_map.clone().read().await.get(kik_id.as_str()) {
             None => {}
             Some(kik) => {
@@ -264,7 +303,6 @@ impl Context {
         *(self.kik_op.clone().write().await) = Some(kik);
     }
 
-    
     //当前正在控制的kik，一定是初始化完成的kik连接即initialized一定为true
     pub async fn get_kik(&self) -> Option<Kik> {
         let guard = self.kik_op.read().await;
@@ -300,11 +338,10 @@ impl Context {
         }
         None
     }
-    
+
     pub async fn kiks_emtpy(&self) -> bool {
         self.kik_map.clone().read().await.is_empty()
     }
-
 
     pub(crate) fn set_kik_state(&self) {
         todo!()

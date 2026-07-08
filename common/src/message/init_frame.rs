@@ -1,77 +1,69 @@
-use bytes::{Buf, BufMut, BytesMut};
 use crate::kik_info::KikInfo;
 use crate::protocol::BufSerializable;
+use bytes::{Buf, BufMut, BytesMut};
 
 #[derive(Debug, Clone)]
 pub enum InitFrame {
     CtrlAuthReply(bool),
     CtrlAuthReq(String),
-    //与AuthReq携带一样的身份信息，作为控制端接收数据的连接
+    // 旧数据通道鉴权帧，保留给显式明文兼容模式。
     CtrlDataConnReq(String),
     CtrlDataConnAuthReply(bool),
 
-    //被控端发起被控请求，可能是重连或者新建连接
+    // 被控端上线和数据连接帧。ctrl_kik 默认仍保持最小客户端模型。
     KikReq(KikInfo),
-    //服务端为被控端分配id(id具有足够随机性,作为被控端的身份识别)
     KikId(String),
-    //被控端数据连接请求(id具有足够随机性,作为被控端的身份识别)，当有数据连接，加入全连接(被控上线并初始化完成)map<String,Pool>
     KikDataConnReq(String),
-    //被控端数据连接成功与否
     KikDataConn(bool),
-}
 
+    // v2 控制端鉴权：TLS 内使用 nonce + HMAC，避免静态摘要直接过线。
+    CtrlAuthStart(String),
+    CtrlAuthChallenge(String),
+    CtrlAuthProof {
+        client_nonce: String,
+        proof: String,
+    },
+    CtrlAuthSession(String),
+
+    // v2 数据通道绑定：数据通道必须绑定已认证的控制会话。
+    CtrlDataSessionReq {
+        session_id: String,
+        channel_nonce: String,
+        proof: String,
+    },
+    CtrlDataSessionReply(bool),
+}
 
 impl BufSerializable for InitFrame {
     fn to_buf(&self) -> BytesMut {
         match self {
-            InitFrame::CtrlAuthReply(success) => {
-                let mut buf = BytesMut::with_capacity(2);
-                buf.put_u8(0);
-                buf.put_u8(if *success { 1 } else { 0 });
-                buf
-            }
-            InitFrame::CtrlAuthReq(info) => {
-                let mut buf = BytesMut::with_capacity(1 + info.len());
-                buf.put_u8(1);
-                buf.put(info.as_bytes());
-                buf
-            }
-            InitFrame::CtrlDataConnReq(info) => {
-                let mut buf = BytesMut::with_capacity(1 + info.len());
-                buf.put_u8(2);
-                buf.put(info.as_bytes());
-                buf
-            }
-            InitFrame::CtrlDataConnAuthReply(success) => {
-                let mut buf = BytesMut::with_capacity(2);
-                buf.put_u8(3);
-                buf.put_u8(if *success { 1 } else { 0 });
-                buf
-            }
+            InitFrame::CtrlAuthReply(success) => bool_frame(0, *success),
+            InitFrame::CtrlAuthReq(info) => legacy_string_frame(1, info),
+            InitFrame::CtrlDataConnReq(info) => legacy_string_frame(2, info),
+            InitFrame::CtrlDataConnAuthReply(success) => bool_frame(3, *success),
             InitFrame::KikReq(info) => {
-                let mut buf = BytesMut::with_capacity(1 + info.to_buf().len());
+                let info_buf = info.to_buf();
+                let mut buf = BytesMut::with_capacity(1 + info_buf.len());
                 buf.put_u8(4);
-                buf.put(info.to_buf());
+                buf.put(info_buf);
                 buf
             }
-            InitFrame::KikId(id) => {
-                let mut buf = BytesMut::with_capacity(1 + id.len());
-                buf.put_u8(5);
-                buf.put(id.as_bytes());
-                buf
-            }
-            InitFrame::KikDataConnReq(id) => {
-                let mut buf = BytesMut::with_capacity(1 + id.len());
-                buf.put_u8(6);
-                buf.put(id.as_bytes());
-                buf
-            }
-            InitFrame::KikDataConn(success) => {
-                let mut buf = BytesMut::with_capacity(2);
-                buf.put_u8(7);
-                buf.put_u8(if *success { 1 } else { 0 });
-                buf
-            }
+            InitFrame::KikId(id) => legacy_string_frame(5, id),
+            InitFrame::KikDataConnReq(id) => legacy_string_frame(6, id),
+            InitFrame::KikDataConn(success) => bool_frame(7, *success),
+            InitFrame::CtrlAuthStart(client_nonce) => single_string_frame(8, client_nonce),
+            InitFrame::CtrlAuthChallenge(server_nonce) => single_string_frame(9, server_nonce),
+            InitFrame::CtrlAuthProof {
+                client_nonce,
+                proof,
+            } => multi_string_frame(10, &[client_nonce, proof]),
+            InitFrame::CtrlAuthSession(session_id) => single_string_frame(11, session_id),
+            InitFrame::CtrlDataSessionReq {
+                session_id,
+                channel_nonce,
+                proof,
+            } => multi_string_frame(12, &[session_id, channel_nonce, proof]),
+            InitFrame::CtrlDataSessionReply(success) => bool_frame(13, *success),
         }
     }
 
@@ -79,173 +71,198 @@ impl BufSerializable for InitFrame {
     where
         Self: Sized,
     {
-        // 至少需要一个字节用于 code
         if bys.remaining() < 1 {
             return None;
         }
         let code = bys.get_u8();
 
         match code {
-            0 => {
-                // CtrlAuthReply: 1 字节布尔值，之后不能有额外数据
-                if bys.remaining() < 1 {
+            0 => Some(InitFrame::CtrlAuthReply(read_bool(&mut bys)?)),
+            1 => Some(InitFrame::CtrlAuthReq(read_remaining_string(bys)?)),
+            2 => Some(InitFrame::CtrlDataConnReq(read_remaining_string(bys)?)),
+            3 => Some(InitFrame::CtrlDataConnAuthReply(read_bool(&mut bys)?)),
+            4 => Some(InitFrame::KikReq(KikInfo::from_buf(bys)?)),
+            5 => Some(InitFrame::KikId(read_remaining_string(bys)?)),
+            6 => Some(InitFrame::KikDataConnReq(read_remaining_string(bys)?)),
+            7 => Some(InitFrame::KikDataConn(read_bool(&mut bys)?)),
+            8 => Some(InitFrame::CtrlAuthStart(read_exact_one_string(&mut bys)?)),
+            9 => Some(InitFrame::CtrlAuthChallenge(read_exact_one_string(&mut bys)?)),
+            10 => {
+                let client_nonce = read_one_string(&mut bys)?;
+                let proof = read_one_string(&mut bys)?;
+                if bys.has_remaining() {
                     return None;
                 }
-                let value = bys.get_u8() == 1;
-                if bys.remaining() != 0 {
+                Some(InitFrame::CtrlAuthProof {
+                    client_nonce,
+                    proof,
+                })
+            }
+            11 => Some(InitFrame::CtrlAuthSession(read_exact_one_string(&mut bys)?)),
+            12 => {
+                let session_id = read_one_string(&mut bys)?;
+                let channel_nonce = read_one_string(&mut bys)?;
+                let proof = read_one_string(&mut bys)?;
+                if bys.has_remaining() {
                     return None;
                 }
-                Some(InitFrame::CtrlAuthReply(value))
+                Some(InitFrame::CtrlDataSessionReq {
+                    session_id,
+                    channel_nonce,
+                    proof,
+                })
             }
-            1 => {
-                // CtrlAuthReq: 剩余全部字节作为字符串
-                let data = bys.split_to(bys.remaining());
-                let s = String::from_utf8(data.to_vec()).ok()?;
-                Some(InitFrame::CtrlAuthReq(s))
-            }
-            2 => {
-                // CtrlDataConnReq: 剩余全部字节作为字符串
-                let data = bys.split_to(bys.remaining());
-                let s = String::from_utf8(data.to_vec()).ok()?;
-                Some(InitFrame::CtrlDataConnReq(s))
-            }
-            3 => {
-                // CtrlDataConnAuthReply: 1 字节布尔值，之后不能有额外数据
-                if bys.remaining() < 1 {
-                    return None;
-                }
-                let value = bys.get_u8() == 1;
-                if bys.remaining() != 0 {
-                    return None;
-                }
-                Some(InitFrame::CtrlDataConnAuthReply(value))
-            }
-            4 => {
-                // KikReq: 依赖 KikInfo::from_buf 解析，它会消费整个 BytesMut
-                // 注意：如果 KikInfo::from_buf 没有消费完整缓冲区，剩余数据会被丢弃
-                let frame = KikInfo::from_buf(bys)?;
-                Some(InitFrame::KikReq(frame))
-            }
-            5 => {
-                // KikId: 剩余全部字节作为字符串
-                let data = bys.split_to(bys.remaining());
-                let s = String::from_utf8(data.to_vec()).ok()?;
-                Some(InitFrame::KikId(s))
-            }
-            6 => {
-                // KikDataConnReq: 剩余全部字节作为字符串
-                let data = bys.split_to(bys.remaining());
-                let s = String::from_utf8(data.to_vec()).ok()?;
-                Some(InitFrame::KikDataConnReq(s))
-            }
-            7 => {
-                // KikDataConn: 1 字节布尔值，之后不能有额外数据
-                if bys.remaining() < 1 {
-                    return None;
-                }
-                let value = bys.get_u8() == 1;
-                if bys.remaining() != 0 {
-                    return None;
-                }
-                Some(InitFrame::KikDataConn(value))
-            }
+            13 => Some(InitFrame::CtrlDataSessionReply(read_bool(&mut bys)?)),
             _ => None,
         }
     }
 }
 
+fn bool_frame(code: u8, success: bool) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(2);
+    buf.put_u8(code);
+    buf.put_u8(if success { 1 } else { 0 });
+    buf
+}
 
+fn legacy_string_frame(code: u8, value: &str) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(1 + value.len());
+    buf.put_u8(code);
+    buf.put_slice(value.as_bytes());
+    buf
+}
 
+fn single_string_frame(code: u8, value: &str) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(1 + 4 + value.len());
+    buf.put_u8(code);
+    write_string(&mut buf, value);
+    buf
+}
 
+fn multi_string_frame(code: u8, values: &[&str]) -> BytesMut {
+    let size = 1 + values.iter().map(|value| 4 + value.len()).sum::<usize>();
+    let mut buf = BytesMut::with_capacity(size);
+    buf.put_u8(code);
+    for value in values {
+        write_string(&mut buf, value);
+    }
+    buf
+}
 
+fn write_string(buf: &mut BytesMut, value: &str) {
+    buf.put_u32(value.len() as u32);
+    buf.put_slice(value.as_bytes());
+}
 
+fn read_bool(buf: &mut BytesMut) -> Option<bool> {
+    if buf.remaining() != 1 {
+        return None;
+    }
+    Some(buf.get_u8() == 1)
+}
 
-mod test{
+fn read_remaining_string(mut buf: BytesMut) -> Option<String> {
+    String::from_utf8(buf.split_to(buf.remaining()).to_vec()).ok()
+}
+
+fn read_one_string(buf: &mut BytesMut) -> Option<String> {
+    if buf.remaining() < 4 {
+        return None;
+    }
+    let len = buf.get_u32() as usize;
+    if buf.remaining() < len {
+        return None;
+    }
+    String::from_utf8(buf.split_to(len).to_vec()).ok()
+}
+
+fn read_exact_one_string(buf: &mut BytesMut) -> Option<String> {
+    let value = read_one_string(buf)?;
+    if buf.has_remaining() {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+mod tests {
     use crate::kik_info::KikInfo;
     use crate::message::init_frame::InitFrame;
     use crate::protocol::BufSerializable;
+    use bytes::{BufMut, BytesMut};
 
     fn assert_round_trip(frame: InitFrame) {
         let bytes = frame.to_buf();
         let decoded = InitFrame::from_buf(bytes.clone()).expect("反序列化失败");
-        // 由于 InitFrame 实现了 Debug 和 Clone，可以直接比较
-        // 注意：对于包含 KikInfo 的变体，需要确保 KikInfo 本身也实现了 PartialEq
-        // 这里我们使用格式化字符串进行比较，因为 InitFrame 没有自动派生 PartialEq
-        // 或者我们可以比较重新序列化后的字节是否一致
-        let re_encoded = decoded.to_buf();
-        assert_eq!(bytes, re_encoded, "往返序列化后字节不一致");
-        println!("ok")
+        assert_eq!(bytes, decoded.to_buf(), "往返序列化后字节不一致");
     }
 
     #[test]
-    fn test_ctrl_auth_reply_true() {
+    fn old_ctrl_frames_round_trip() {
         assert_round_trip(InitFrame::CtrlAuthReply(true));
-    }
-
-    #[test]
-    fn test_ctrl_auth_reply_false() {
         assert_round_trip(InitFrame::CtrlAuthReply(false));
-    }
-
-    #[test]
-    fn test_ctrl_auth_req() {
-        let info = "test_auth_info".to_string();
-        assert_round_trip(InitFrame::CtrlAuthReq(info));
-    }
-
-    #[test]
-    fn test_ctrl_auth_req_empty() {
+        assert_round_trip(InitFrame::CtrlAuthReq("test_auth_info".to_string()));
         assert_round_trip(InitFrame::CtrlAuthReq(String::new()));
-    }
-
-    #[test]
-    fn test_ctrl_data_conn_req() {
-        let info = "ctrl_data_conn_identity".to_string();
-        assert_round_trip(InitFrame::CtrlDataConnReq(info));
-    }
-
-    #[test]
-    fn test_ctrl_data_conn_auth_reply_true() {
+        assert_round_trip(InitFrame::CtrlDataConnReq(
+            "ctrl_data_conn_identity".to_string(),
+        ));
         assert_round_trip(InitFrame::CtrlDataConnAuthReply(true));
-    }
-
-    #[test]
-    fn test_ctrl_data_conn_auth_reply_false() {
         assert_round_trip(InitFrame::CtrlDataConnAuthReply(false));
     }
 
     #[test]
-    fn test_kik_req() {
-        // 构造模拟的 KikInfo
-        let kik_info = KikInfo{
+    fn kik_frames_round_trip() {
+        assert_round_trip(InitFrame::KikReq(KikInfo {
             id: Some("kik_example_data".into()),
-            name: "sfsdf".to_string()
-        };
-        // 注意：原始代码中 InitFrame::KikReq 使用 KikInfo 类型，但此处测试中我们替换为 MockKikInfo。
-        // 由于实际类型不匹配，此测试需要在实际项目中进行调整。这里仅演示测试思路。
-        // 为了能够编译，可以注释掉此测试，或在实际项目中编写。
-        assert_round_trip(InitFrame::KikReq(kik_info));
-    }
-
-    #[test]
-    fn test_kik_id() {
-        let id = "random_id_12345".to_string();
-        assert_round_trip(InitFrame::KikId(id));
-    }
-
-    #[test]
-    fn test_kik_data_conn_req() {
-        let id = "kik_data_conn_id".to_string();
-        assert_round_trip(InitFrame::KikDataConnReq(id));
-    }
-
-    #[test]
-    fn test_kik_data_conn_true() {
+            name: "test".to_string(),
+        }));
+        assert_round_trip(InitFrame::KikId("random_id_12345".to_string()));
+        assert_round_trip(InitFrame::KikDataConnReq("kik_data_conn_id".to_string()));
         assert_round_trip(InitFrame::KikDataConn(true));
+        assert_round_trip(InitFrame::KikDataConn(false));
     }
 
     #[test]
-    fn test_kik_data_conn_false() {
-        assert_round_trip(InitFrame::KikDataConn(false));
+    fn ctrl_auth_v2_frames_round_trip() {
+        assert_round_trip(InitFrame::CtrlAuthStart("client_nonce".to_string()));
+        assert_round_trip(InitFrame::CtrlAuthChallenge("server_nonce".to_string()));
+        assert_round_trip(InitFrame::CtrlAuthProof {
+            client_nonce: "client_nonce".to_string(),
+            proof: "proof".to_string(),
+        });
+        assert_round_trip(InitFrame::CtrlAuthSession("session_id".to_string()));
+        assert_round_trip(InitFrame::CtrlDataSessionReq {
+            session_id: "session_id".to_string(),
+            channel_nonce: "channel_nonce".to_string(),
+            proof: "proof".to_string(),
+        });
+        assert_round_trip(InitFrame::CtrlDataSessionReply(true));
+        assert_round_trip(InitFrame::CtrlDataSessionReply(false));
+    }
+
+    #[test]
+    fn ctrl_auth_v2_rejects_short_strings() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(8);
+        buf.put_u32(16);
+        buf.put_slice(b"short");
+
+        assert!(InitFrame::from_buf(buf).is_none());
+    }
+
+    #[test]
+    fn ctrl_auth_v2_rejects_trailing_bytes() {
+        let mut buf = InitFrame::CtrlAuthStart("client".to_string()).to_buf();
+        buf.put_u8(99);
+
+        assert!(InitFrame::from_buf(buf).is_none());
+    }
+
+    #[test]
+    fn bool_frames_reject_trailing_bytes() {
+        let mut buf = InitFrame::CtrlAuthReply(true).to_buf();
+        buf.put_u8(99);
+
+        assert!(InitFrame::from_buf(buf).is_none());
     }
 }

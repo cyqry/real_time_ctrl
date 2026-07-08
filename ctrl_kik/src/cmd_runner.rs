@@ -9,13 +9,13 @@ use common::command::{Command, CtrlCommand};
 use common::file_util;
 use common::message::dok::Dok;
 use common::message::dok::Dok::FilePart;
+use common::message::kik_cmd_resp_info;
+use common::message::kik_resp::{kik_error, kik_success_data_id, kik_success_info, KikResp};
 use common::protocol::BufSerializable;
 use log::debug;
 use tokio::fs;
 use tokio_util::either::Either;
 use uuid::Uuid;
-use common::message::kik_cmd_resp_info;
-use common::message::kik_resp::{kik_error, kik_success_data_id, kik_success_info, KikResp};
 
 pub async fn run(context: &Context, cmd: Command) -> KikResp {
     match cmd {
@@ -26,13 +26,9 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                         Ok(data_id) => {
                             return kik_success_data_id(data_id);
                         }
-                        Err(e) => {
-                            kik_error(format!("Kik发送数据失败,error:{:?}", e))
-                        }
+                        Err(e) => kik_error(format!("Kik发送数据失败,error:{:?}", e)),
                     },
-                    Err(e) => {
-                        kik_error( format!("Kik读取文件失败:{}", e))
-                    }
+                    Err(e) => kik_error(format!("Kik读取文件失败:{}", e)),
                 },
                 CtrlCommand::GetBigFile(file_path, _) => {
                     match do_get_big_file(context, file_path).await {
@@ -42,12 +38,11 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                 }
                 CtrlCommand::SetBigFile(data_id, total, hash, save_path) => {
                     match set_big_file(&context, data_id, total, hash, save_path.clone()).await {
-                        Ok(_) => {
-                            kik_success_info(format!("保存大文件至Kik:{}成功", save_path))
-                        }
-                        Err(e) => {
-                            kik_success_info(format!("保存大文件至Kik:{}失败,error:{}", save_path, e))
-                        }
+                        Ok(_) => kik_success_info(format!("保存大文件至Kik:{}成功", save_path)),
+                        Err(e) => kik_success_info(format!(
+                            "保存大文件至Kik:{}失败,error:{}",
+                            save_path, e
+                        )),
                     }
                 }
                 CtrlCommand::SetFile(data_id, save_path) => {
@@ -57,11 +52,12 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                             //save_path
                             match file_util::save_file(save_path.as_str(), &data).await {
                                 Ok(_) => {
-                                    kik_success_info( format!("保存文件至Kik:{}成功", save_path))
+                                    kik_success_info(format!("保存文件至Kik:{}成功", save_path))
                                 }
-                                Err(e) => {
-                                    kik_error(format!("保存文件至Kik:{}失败,error:{}", save_path, e))
-                                }
+                                Err(e) => kik_error(format!(
+                                    "保存文件至Kik:{}失败,error:{}",
+                                    save_path, e
+                                )),
                             }
                         }
                         Err(e) => kik_error(format!("{}", e)),
@@ -79,10 +75,10 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                         }
                         _ => file_util::ls(s.as_str(), false),
                     })
-                        .await.and_then(|v| {
-                        Ok(
-                            serde_json::to_string(&v
-                                .into_iter()
+                    .await
+                    .and_then(|v| {
+                        Ok(serde_json::to_string(
+                            &v.into_iter()
                                 .map(|(filename, is_file, size, created_date, modified_date)| {
                                     kik_cmd_resp_info::Ls {
                                         size,
@@ -91,9 +87,10 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                                         created_date,
                                         modified_date,
                                     }
-                                }).collect::<Vec<kik_cmd_resp_info::Ls>>())?)
-                    })
-                    {
+                                })
+                                .collect::<Vec<kik_cmd_resp_info::Ls>>(),
+                        )?)
+                    }) {
                         Ok(json) => kik_success_info(json),
                         Err(e) => kik_error(e.to_string()),
                     }
@@ -103,13 +100,9 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                         Ok(data_id) => {
                             return kik_success_data_id(data_id);
                         }
-                        Err(e) => {
-                            kik_error(format!("Kik发送数据失败,error:{:?}", e))
-                        }
+                        Err(e) => kik_error(format!("Kik发送数据失败,error:{:?}", e)),
                     },
-                    Err(e) => {
-                        kik_error(format!("Kik截屏失败,error:{:?}", e))
-                    }
+                    Err(e) => kik_error(format!("Kik截屏失败,error:{:?}", e)),
                 },
             };
             resp
@@ -117,16 +110,10 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
         Command::Exec(s) => {
             // let v: Vec<String> = s.trim().split_whitespace().map(|x| x.to_string()).collect();
 
-            match cmd_util::cmd_exec_line(s.as_str(), false, true)
-                .await {
-                Ok(res) => {
-                    kik_success_info(res)
-                }
-                Err(e) => {
-                    kik_error(format!("cmd exec error:{}", e))
-                }
+            match cmd_util::cmd_exec_line(s.as_str(), false, true).await {
+                Ok(res) => kik_success_info(res),
+                Err(e) => kik_error(format!("cmd exec error:{}", e)),
             }
-
         }
         _ => kik_error("暂不支持该类型消息".to_string()),
     }

@@ -1,12 +1,13 @@
+use crate::api_contract::{ApiRequest, ApiResponse};
+use crate::api_service::RealCtrlApi;
+use crate::http_service::error::app_err::AppError;
+use crate::input_command::{InputCommand, InputCtrlCommand, RemoteResp};
 use anyhow::anyhow;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use spring_web::axum::body::Body;
-use spring_web::axum::http::{header, StatusCode};
+use spring_web::axum::http::{header, HeaderMap, StatusCode};
 use spring_web::axum::response::{IntoResponse, Response};
-use crate::input_command::{InputCommand, InputCtrlCommand, RemoteResp};
-use crate::local_client::client::invoke;
-use crate::pipe::pipe_common::ServerResponse;
 
 pub async fn health_check() -> &'static str {
     "OK"
@@ -18,37 +19,97 @@ pub async fn hello_world() -> Value {
     })
 }
 
-pub(crate) async fn sys_list() {
-    todo!()
+pub async fn execute_command(
+    headers: &HeaderMap,
+    api: &RealCtrlApi,
+    request: ApiRequest,
+) -> Result<ApiResponse, AppError> {
+    authorize(headers)?;
+    Ok(api.execute_request(request).await)
 }
 
+pub(crate) async fn screen(
+    headers: &HeaderMap,
+    api: &RealCtrlApi,
+) -> Result<impl IntoResponse, AppError> {
+    authorize(headers)?;
 
-// let response = local_client::client::invoke(&InputCommand::Sys(SysCommand::Now)).await?;
-// println!("{:?}", response);
-// let response = local_client::client::invoke(&InputCommand::Sys(SysCommand::List)).await?;
-// println!("{:?}", response);
-//
-// let response = local_client::client::invoke(&InputCommand::Ctrl(InputCtrlCommand::Ls("D:\\Ax201".to_string()))).await?;
-// println!("{:?}", response);
-// let response = local_client::client::invoke(&InputCommand::Exec("ipconfig".to_owned())).await?;
-// println!("{:?}", response);
+    let resp = api
+        .execute(InputCommand::Ctrl(InputCtrlCommand::Screen("_".to_owned())))
+        .await
+        .map_err(AppError::Internal)?;
 
-pub(crate) async fn screen() -> anyhow::Result<impl IntoResponse> {
-    let encoded_name = percent_encoding::utf8_percent_encode("screen.png", percent_encoding::NON_ALPHANUMERIC);
-    let disposition = format!("attachment; filename=\"{}\"", encoded_name);
-    let resp = invoke(&InputCommand::Ctrl(InputCtrlCommand::Screen("_".to_owned()))).await?;
-   let v = match resp {
-        ServerResponse::Success(RemoteResp::SuccessData(v)) => {
-            v
-        }
-        _ => {
-            return Err(anyhow!("截屏失败"));
-        }
+    let v = match resp {
+        RemoteResp::SuccessData(v) => v,
+        RemoteResp::Error(_, message) => return Err(AppError::BadRequest(message)),
+        _ => return Err(AppError::Internal(anyhow!("截图返回了不支持的响应类型"))),
     };
+
+    let encoded_name =
+        percent_encoding::utf8_percent_encode("screen.png", percent_encoding::NON_ALPHANUMERIC);
+    let disposition = format!("attachment; filename=\"{}\"", encoded_name);
     let body = Bytes::from_owner(v);
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_TYPE, "image/png")
         .header(header::CONTENT_DISPOSITION, disposition)
-        .body(Body::from(body))?)
+        .body(Body::from(body))
+        .map_err(|e| AppError::Internal(anyhow!(e)))?)
+}
+
+fn authorize(headers: &HeaderMap) -> Result<(), AppError> {
+    let Some(expected) = configured_api_token() else {
+        return Ok(());
+    };
+
+    let Some(actual) = token_from_headers(headers) else {
+        return Err(AppError::Unauthorized("缺少本地 API token".to_string()));
+    };
+
+    if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized("本地 API token 无效".to_string()))
+    }
+}
+
+fn configured_api_token() -> Option<String> {
+    std::env::var("REAL_CTRL_API_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn token_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get("x-real-ctrl-token") {
+        return value.to_str().ok().map(|v| v.to_string());
+    }
+
+    let authorization = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    authorization
+        .strip_prefix("Bearer ")
+        .map(|token| token.to_string())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let a = left.get(idx).copied().unwrap_or(0);
+        let b = right.get(idx).copied().unwrap_or(0);
+        diff |= (a ^ b) as usize;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_checks_content_and_len() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
 }

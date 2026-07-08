@@ -30,9 +30,9 @@ pub async fn cut_screen() -> anyhow::Result<Vec<u8>> {
         // let screen_height = GetSystemMetrics(winapi::um::winuser::SM_CYSCREEN);
 
         //使用库获取，保证全
-        let (screen_width, screen_height) = get_xy()? ;
-        let screen_width=screen_width as c_int;
-        let screen_height=screen_height as c_int;
+        let (screen_width, screen_height) = get_xy()?;
+        let screen_width = screen_width as c_int;
+        let screen_height = screen_height as c_int;
 
         // 创建一个与桌面设备上下文兼容的内存设备上下文和位图
         let mem_dc = CreateCompatibleDC(hdc);
@@ -148,7 +148,6 @@ fn get_pixels_from_hbitmap(
 
 #[tokio::test]
 pub async fn test() {
-
     // println!(
     //     "{:?}",
     //     file_util::save_file(
@@ -164,7 +163,6 @@ pub async fn test() {
     // println!("{},{}", w,h);
     let x = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let y = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-
 
     println!("{}", x);
 }

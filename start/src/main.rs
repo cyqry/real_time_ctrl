@@ -301,11 +301,21 @@ pub async fn current() -> anyhow::Result<String> {
 
 #[tokio::test]
 pub async fn test() {
-    // let run_path = "D:/safe/user.txt";
-    // println!("{}", current().await.unwrap());
-    // // println!("{:?}", win_exec_any_file(OsStr::new(run_path)).as_ref());
-    let v1 = read_file(r"E:\RsCode\myCode\real_time_ctrl\target\release\start.exe").await.unwrap();
-    let v2 = read_file(r"E:\RsCode\myCode\real_time_ctrl\target\release\start_d.exe").await.unwrap();
+    let test_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("start_read_file_test");
+    let v1_path = test_dir.join("start.bin");
+    let v2_path = test_dir.join("start_d.bin");
+
+    // 测试数据必须由测试自己生成，不能依赖开发机私有 release 产物。
+    let _ = fs::remove_dir_all(&test_dir).await;
+    fs::create_dir_all(&test_dir).await.unwrap();
+    save_file(&v1_path, b"real_time_ctrl_start").await.unwrap();
+    save_file(&v2_path, b"real_time_ctrl_start").await.unwrap();
+
+    let v1 = read_file(&v1_path).await.unwrap();
+    let v2 = read_file(&v2_path).await.unwrap();
 
     assert_eq!(v1.len(), v2.len());
     let mut diff = vec![];
@@ -316,5 +326,5 @@ pub async fn test() {
         }
     }
 
-    println!("{:?}", diff.len());
+    assert!(diff.is_empty());
 }

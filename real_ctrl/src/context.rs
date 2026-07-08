@@ -32,6 +32,7 @@ pub struct Context {
 //
 pub struct Agent {
     pub config: Config,
+    pub session_id: Option<String>,
     recv: mpsc::Receiver<CmdResp>,
     conn: Arc<Mutex<Channel>>,
 }
@@ -126,9 +127,10 @@ impl Context {
 
 impl Agent {
     pub async fn create(config: &Config) -> anyhow::Result<Self> {
-        let (conn, recv) = ctrl_conn(config).await?;
+        let (conn, recv, session_id) = ctrl_conn(config).await?;
         Ok(Agent {
             config: config.clone(),
+            session_id,
             conn,
             recv,
         })
@@ -143,9 +145,10 @@ impl Agent {
         let mut re = anyhow::Error::msg("unreachable!");
         for _ in 0..retry_count {
             match ctrl_conn(&self.config).await {
-                Ok((conn, tx)) => {
+                Ok((conn, tx, session_id)) => {
                     self.conn = conn;
                     self.recv = tx;
+                    self.session_id = session_id;
                     return Ok(());
                 }
                 Err(e) => {

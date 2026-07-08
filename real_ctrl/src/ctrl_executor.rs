@@ -1,13 +1,15 @@
 use crate::context::{id, Context};
-use crate::input_command::{RemoteResp, InputCtrlCommand, RemoteSuccessResp};
-use anyhow::{anyhow, Context as AnyhowContext, };
+use crate::input_command::{InputCtrlCommand, RemoteResp, RemoteSuccessResp};
+use anyhow::{anyhow, Context as AnyhowContext};
 use bytes::{BufMut, BytesMut};
 // use common::async_util::AsyncExecutor;
 use common::command::{Command, CtrlCommand};
-use common::message::kik_resp::{ClientSuccessResp, KikResp};
 use common::message::dok::{Dok, ErrCode};
+use common::message::kik_cmd_resp_info;
+use common::message::kik_resp::{ClientSuccessResp, KikResp};
 use common::protocol::{BufSerializable, CmdOptions, ReqCmd};
 use common::{async_util, file_util, protocol};
+use ctrl_common::ctrl_frame::Frame;
 use ctrl_common::ctrl_resp::{CmdResp, Resp, ServerResp, ServerSuccessResp};
 use futures::future::ok;
 use sha2::digest::DynDigest;
@@ -17,43 +19,40 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
-use common::message::kik_cmd_resp_info;
-use ctrl_common::ctrl_frame::Frame;
 
 pub async fn execute(
     context: &Context,
     input_ctrl_cmd: InputCtrlCommand,
-    origin_data:bool,
+    origin_data: bool,
 ) -> anyhow::Result<RemoteResp> {
     let (cmd, cmd_options) = process_cmd(context, input_ctrl_cmd.clone()).await?;
 
     let req_cmd = ReqCmd::new(id(), cmd_options, Command::Ctrl(cmd.clone()));
-    match context
-        .agent
-        .write()
-        .await
-        .req(&req_cmd)
-        .await?
-        .get_resp()
-    {
-        Resp::Kik(KikResp::Success(ClientSuccessResp::Info(info))) | Resp::Server(ServerResp::Success(ServerSuccessResp::Info(info))) => {
+    match context.agent.write().await.req(&req_cmd).await?.get_resp() {
+        Resp::Kik(KikResp::Success(ClientSuccessResp::Info(info)))
+        | Resp::Server(ServerResp::Success(ServerSuccessResp::Info(info))) => {
             //解析响应的info信息
-            Ok(RemoteResp::Success(to_remote_resp(input_ctrl_cmd, info.to_string())?))
+            Ok(RemoteResp::Success(to_remote_resp(
+                input_ctrl_cmd,
+                info.to_string(),
+            )?))
         }
-        Resp::Kik(KikResp::Error(err_code, info)) => Ok(RemoteResp::Error(
-            err_code.clone() as u32,
-            info.to_string(),
-        )),
-        Resp::Server(ServerResp::Error(err_code, info)) => Ok(RemoteResp::Error(
-            err_code.clone() as u32,
-            info.to_string(),
-        )),
+        Resp::Kik(KikResp::Error(err_code, info)) => {
+            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+        }
+        Resp::Server(ServerResp::Error(err_code, info)) => {
+            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+        }
         Resp::Kik(KikResp::Success(ClientSuccessResp::DataId(data_id))) => {
             if origin_data {
-                let v = context.wait_data(data_id.as_str()).await.context("获取数据失败")?;
+                let v = context
+                    .wait_data(data_id.as_str())
+                    .await
+                    .context("获取数据失败")?;
                 Ok(RemoteResp::SuccessData(v))
             } else {
-                let ok_info = process_ctrl_cmd_data_id_resp(context, input_ctrl_cmd, data_id).await?;
+                let ok_info =
+                    process_ctrl_cmd_data_id_resp(context, input_ctrl_cmd, data_id).await?;
                 Ok(RemoteResp::Success(RemoteSuccessResp::Info(ok_info)))
             }
 
@@ -66,21 +65,21 @@ pub async fn execute(
             //         return Err(anyhow!("获取数据失败,error:{}",e));
             //     }
             // }
-
         }
     }
 }
 
-
 //根据请求类型反序列化响应info
 fn to_remote_resp(cmd: InputCtrlCommand, info: String) -> anyhow::Result<RemoteSuccessResp> {
     let res = match cmd {
-        InputCtrlCommand::GetFile(_, _) | InputCtrlCommand::GetBigFile(_, _) | InputCtrlCommand::SetFile(_, _) | InputCtrlCommand::SetBigFile(_, _) => {
-            RemoteSuccessResp::Info(info)
-        }
-        InputCtrlCommand::Ls(_) => {
-            RemoteSuccessResp::Ls(serde_json::from_str::<Vec<kik_cmd_resp_info::Ls>>(info.as_str()).context(format!("json解析失败，原info:{}", info))?)
-        }
+        InputCtrlCommand::GetFile(_, _)
+        | InputCtrlCommand::GetBigFile(_, _)
+        | InputCtrlCommand::SetFile(_, _)
+        | InputCtrlCommand::SetBigFile(_, _) => RemoteSuccessResp::Info(info),
+        InputCtrlCommand::Ls(_) => RemoteSuccessResp::Ls(
+            serde_json::from_str::<Vec<kik_cmd_resp_info::Ls>>(info.as_str())
+                .context(format!("json解析失败，原info:{}", info))?,
+        ),
         _ => {
             unreachable!("不应该到达")
         }
@@ -88,7 +87,10 @@ fn to_remote_resp(cmd: InputCtrlCommand, info: String) -> anyhow::Result<RemoteS
     Ok(res)
 }
 
-async fn process_cmd(context: &Context, input_ctrl_cmd: InputCtrlCommand) -> anyhow::Result<(CtrlCommand, CmdOptions)> {
+async fn process_cmd(
+    context: &Context,
+    input_ctrl_cmd: InputCtrlCommand,
+) -> anyhow::Result<(CtrlCommand, CmdOptions)> {
     let (cmd, cmd_options) = match input_ctrl_cmd {
         InputCtrlCommand::SetFile(file_path, target_path) => {
             do_set_file(context, file_path, target_path).await?
@@ -106,16 +108,18 @@ async fn process_cmd(context: &Context, input_ctrl_cmd: InputCtrlCommand) -> any
 }
 
 //自动处理逻辑
-async fn process_ctrl_cmd_data_id_resp(context: &Context, input_ctrl_cmd: InputCtrlCommand, data_id: &String) -> anyhow::Result<String> {
+async fn process_ctrl_cmd_data_id_resp(
+    context: &Context,
+    input_ctrl_cmd: InputCtrlCommand,
+    data_id: &String,
+) -> anyhow::Result<String> {
     let ok_info = match input_ctrl_cmd {
         InputCtrlCommand::GetFile(_, save_path) => {
             //get data
             match context.wait_data(data_id.as_str()).await {
                 Ok(data) => match file_util::save_file(save_path.as_str(), &data).await {
                     Ok(_) => Ok(format!("保存文件至:{}", save_path)),
-                    Err(e) => {
-                        Err(anyhow!(format!("保存文件至:{}失败,error:{}", save_path, e)))
-                    }
+                    Err(e) => Err(anyhow!(format!("保存文件至:{}失败,error:{}", save_path, e))),
                 },
                 Err(e) => Err(anyhow!(format!("接收文件失败,{}", e))),
             }
@@ -124,9 +128,10 @@ async fn process_ctrl_cmd_data_id_resp(context: &Context, input_ctrl_cmd: InputC
             match context.wait_data(data_id.as_str()).await {
                 Ok(data) => match file_util::save_file(save_path.as_str(), &data).await {
                     Ok(_) => Ok(format!("保存大文件至:{}", save_path)),
-                    Err(e) => {
-                        Err(anyhow!(format!("保存大文件至:{}失败,error:{}", save_path, e)))
-                    }
+                    Err(e) => Err(anyhow!(format!(
+                        "保存大文件至:{}失败,error:{}",
+                        save_path, e
+                    ))),
                 },
                 Err(e) => Err(anyhow!(format!("接收大文件失败,{}", e))),
             }
@@ -140,13 +145,12 @@ async fn process_ctrl_cmd_data_id_resp(context: &Context, input_ctrl_cmd: InputC
                     if path.is_dir() {
                         path = path.join("1.png");
                     };
-                    match file_util::save_file_with_unique_name(path.as_path(), &data).await
-                    {
+                    match file_util::save_file_with_unique_name(path.as_path(), &data).await {
                         Ok(p) => Ok(format!("保存Kik的截屏至:{}", p.to_string_lossy())),
                         Err(e) => Err(anyhow!(format!(
-                                    "保存Kik的截屏至:{}失败,error:{}",
-                                    save_path, e
-                                ))),
+                            "保存Kik的截屏至:{}失败,error:{}",
+                            save_path, e
+                        ))),
                     }
                 }
                 Err(e) => Err(anyhow!(format!("接收文件失败,{}", e))),
@@ -158,7 +162,6 @@ async fn process_ctrl_cmd_data_id_resp(context: &Context, input_ctrl_cmd: InputC
     }?;
     Ok(ok_info)
 }
-
 
 async fn do_set_file(
     context: &Context,
@@ -254,5 +257,3 @@ async fn do_set_big_file(
         cmd_options,
     ))
 }
-
-

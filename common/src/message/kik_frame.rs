@@ -1,11 +1,11 @@
 use crate::command::Command;
 use crate::kik_info::KikInfo;
+use crate::message::kik_frame::KikFrame::*;
 use crate::message::kik_resp::{ClientSuccessResp, KikResp};
 use crate::protocol::{BufSerializable, ReqCmd};
 use bytes::{Buf, BufMut, BytesMut};
 use log::debug;
 use std::io::Read;
-use crate::message::kik_frame::KikFrame::*;
 
 #[derive(Debug, Clone)]
 pub enum KikFrame {
@@ -94,10 +94,16 @@ impl BufSerializable for KikFrame {
                     return None;
                 }
                 let len = bys.get_u32();
+                if bys.remaining() < len as usize {
+                    return None;
+                }
                 let resp = KikResp::from_buf(bys.split_to(len as usize))?;
                 Some(RespExtra(resp, String::from_utf8(bys.to_vec()).ok()?))
             }
             12 => {
+                if bys.remaining() < 4 {
+                    return None;
+                }
                 let id_len = bys.get_u32();
                 if bys.remaining() < id_len as usize {
                     return None;
@@ -119,6 +125,30 @@ fn test() {
         KikResp::Success(ClientSuccessResp::Info("草了".to_string())),
         "werwrwrwerwrweerwr".to_string(),
     )
-        .to_buf();
+    .to_buf();
     println!("{:?}", KikFrame::from_buf(bytes_mut).unwrap());
+}
+
+#[test]
+fn empty_frame_returns_none() {
+    assert!(KikFrame::from_buf(BytesMut::new()).is_none());
+}
+
+#[test]
+fn short_resp_extra_returns_none() {
+    let mut bys = BytesMut::new();
+    bys.put_u8(13);
+    bys.put_u32(8);
+    bys.put_slice(&[1, 2]);
+
+    assert!(KikFrame::from_buf(bys).is_none());
+}
+
+#[test]
+fn short_data_frame_returns_none() {
+    let mut bys = BytesMut::new();
+    bys.put_u8(12);
+    bys.put_u8(1);
+
+    assert!(KikFrame::from_buf(bys).is_none());
 }

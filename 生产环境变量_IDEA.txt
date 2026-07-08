@@ -1,0 +1,12 @@
+生产环境变量（IDEA 分号分隔）
+
+ctrl_server：
+CTRL_SERVER_BIND_HOST=127.0.0.1;CTRL_SERVER_PORT=9002;CTRL_SERVER_TLS_PORT=9443;CTRL_SERVER_TLS_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;CTRL_SERVER_TLS_KEY=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.key;RUST_BACKTRACE=1
+
+real_ctrl / real_ctrl_invoker_http_service：
+REAL_CTRL_SERVER_HOST=127.0.0.1;REAL_CTRL_SERVER_PORT=9002;REAL_CTRL_TLS_PORT=9443;REAL_CTRL_TLS_SERVER_NAME=real-ctrl-server;REAL_CTRL_TLS_CA_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;REAL_CTRL_TLS_SERVER_SPKI_SHA256=913de71e8a1817ffc42a4e00f753f8b0fc2918fda596aed6c1a11b61cc1510b5;REAL_CTRL_API_TOKEN=62JH2HDCI_LKMUXuWhoOLTnHZjjve1LQqXwqjPqgkBc;RUST_BACKTRACE=1
+
+说明：
+- ctrl_kik 不配置环境变量，继续使用编译期 HOST()/PORT()/LOCK_FILE_PATH()。
+- 以上证书是本仓库内生成的 127.0.0.1 本机部署证书；如果替换生产证书，必须同步替换 REAL_CTRL_TLS_CA_CERT 和 REAL_CTRL_TLS_SERVER_SPKI_SHA256。
+- real_ctrl HTTP 默认读取 config/app.toml，本项目当前默认绑定 127.0.0.1:9000。

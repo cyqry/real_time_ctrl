@@ -1,9 +1,9 @@
+use crate::ctrl_resp::CmdResp;
 use bytes::{Buf, BufMut, BytesMut};
 use common::command::Command;
 use common::kik_info::KikInfo;
-use common::message::kik_resp::{KikResp};
+use common::message::kik_resp::KikResp;
 use common::protocol::{BufSerializable, ReqCmd};
-use crate::ctrl_resp::CmdResp;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -56,11 +56,17 @@ impl BufSerializable for Frame {
     }
 
     fn from_buf(mut bys: BytesMut) -> Option<Self> {
+        if bys.remaining() < 1 {
+            return None;
+        }
         let code = bys.get_u8();
         match code {
             11 => Some(Frame::Cmd(ReqCmd::from_buf(bys)?)),
             12 => Some(Frame::Resp(CmdResp::from_buf(bys)?)),
             13 => {
+                if bys.remaining() < 4 {
+                    return None;
+                }
                 let id_len = bys.get_u32() as usize;
                 if bys.len() < id_len {
                     return None;
@@ -72,6 +78,39 @@ impl BufSerializable for Frame {
             14 => Some(Frame::Ping),
             15 => Some(Frame::Pong),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_frame_returns_none() {
+        assert!(Frame::from_buf(BytesMut::new()).is_none());
+    }
+
+    #[test]
+    fn short_data_frame_returns_none() {
+        let mut bys = BytesMut::new();
+        bys.put_u8(13);
+        bys.put_u8(1);
+
+        assert!(Frame::from_buf(bys).is_none());
+    }
+
+    #[test]
+    fn data_frame_round_trip() {
+        let frame = Frame::Data("data-id".to_string(), BytesMut::from(&b"hello"[..]));
+        let decoded = Frame::from_buf(frame.to_buf()).unwrap();
+
+        match decoded {
+            Frame::Data(id, data) => {
+                assert_eq!(id, "data-id");
+                assert_eq!(data.as_ref(), b"hello");
+            }
+            _ => panic!("unexpected frame"),
         }
     }
 }

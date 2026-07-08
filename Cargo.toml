@@ -1,50 +1,32 @@
-#ctrl_kik时放开
-#cargo-features = ["trim-paths"]
-
 [workspace]
-members = ["real_ctrl", "ctrl_kik", "ctrl_server", "win_common", "common", "start", "ctrl_common", "screen_stream"]
+members = [
+    "real_ctrl",
+    "ctrl_kik",
+    "ctrl_server",
+    "win_common",
+    "common",
+    "start",
+    "ctrl_common",
+    "screen_stream",
+]
 resolver = "2"
 
-#ctrl_server,real_ctrl 时放开
 [profile.release]
+# 保留既有 release 行为，避免影响当前分发流程。
 strip = false
 lto = true
 opt-level = "z"
 
-#ctrl_kik时放开
-#[profile.release]
-#debug = 0
-#lto = true
-#strip = "symbols" # 比 `strip = true` 更彻底
-#codegen-units = 1
-#opt-level = "z"
-#panic = "abort"
-#trim-paths = "all"
-
-
-#[profile.ctrl_kik-release]
-#inherits = "release"
-#debug = 0
-#lto = true
-#strip = "symbols" # 比 `strip = true` 更彻底
-#codegen-units = 1
-#opt-level = "z"
-#panic = "abort"
-#trim-paths = "all"
-#
-#[profile.start-release]
-#inherits = "release"
-#debug = 0
-#lto = "fat"
-#strip = "symbols" # 比 `strip = true` 更彻底
-#codegen-units = 1
-#opt-level = "s"
-#panic = "abort"
-#trim-paths = "all"
-#
-#
-#[profile.real_ctrl-release]
-#inherits = "release"
-#strip = false
-#lto = true
-#opt-level = "z"
+[profile.hardened]
+# 生产发布建议使用：
+# cargo build -p real_ctrl --profile hardened
+# cargo build -p ctrl_server --profile hardened
+# cargo build -p ctrl_kik --profile hardened
+inherits = "release"
+debug = 0
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+incremental = false
+opt-level = "z"

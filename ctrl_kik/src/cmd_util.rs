@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use bytes::BufMut;
 use encoding_rs::GBK;
 use std::ffi::OsStr;
@@ -9,12 +10,11 @@ use std::process;
 use std::process::Stdio;
 use std::ptr::null_mut;
 use std::string::FromUtf8Error;
-use anyhow::anyhow;
 use tokio::process::Command;
 
+use common::file_util;
 use winapi::um::processthreadsapi::STARTUPINFOW;
 use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION};
-use common::file_util;
 
 pub fn whoami() -> String {
     format!(
@@ -57,12 +57,7 @@ pub async fn cmd_exec(
     ))
 }
 
-pub async fn cmd_exec_line(
-    cmd_line: &str,
-    open_window: bool,
-    gbk: bool,
-) -> anyhow::Result<String> {
-
+pub async fn cmd_exec_line(cmd_line: &str, open_window: bool, gbk: bool) -> anyhow::Result<String> {
     let mut cmd = Command::new("cmd.exe");
 
     let mut command = if open_window {
@@ -127,10 +122,7 @@ pub fn cmd_exec_file<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
 //注意即使返回ok，winapi在执行其的时候看似执行成功，但这里执行的目标文件若非  #![windows_subsystem = "windows"]  的，实际上不会执行成功。
 //todo 添加获取到的参数
 pub fn win_exec_any_file(path: &OsStr) -> anyhow::Result<()> {
-    let path_wide: Vec<u16> = path
-        .encode_wide()
-        .chain(once(0))
-        .collect();
+    let path_wide: Vec<u16> = path.encode_wide().chain(once(0)).collect();
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
@@ -152,16 +144,18 @@ pub fn win_exec_any_file(path: &OsStr) -> anyhow::Result<()> {
 
     if success == 0 {
         match file_util::copy_and_rename(&PathBuf::from(path)) {
-            Ok(new_path) => {
-                match cmd_exec_file(new_path.clone()) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(anyhow!("winapi失败后，使用cmd执行文件{:?}也失败,{}",new_path,e));
-                    }
+            Ok(new_path) => match cmd_exec_file(new_path.clone()) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(anyhow!(
+                        "winapi失败后，使用cmd执行文件{:?}也失败,{}",
+                        new_path,
+                        e
+                    ));
                 }
-            }
+            },
             Err(e) => {
-                return Err(anyhow!("winapi失败后，copy_and_rename失败,{}",e));
+                return Err(anyhow!("winapi失败后，copy_and_rename失败,{}", e));
             }
         }
     }
@@ -189,11 +183,7 @@ pub async fn test() {
     );
     println!(
         "line输出:||{}||",
-        cmd_exec_line(
-            " echo   %USERPROFILE%",
-            false,
-            true
-        )
+        cmd_exec_line(" echo   %USERPROFILE%", false, true)
             .await
             .unwrap()
     );

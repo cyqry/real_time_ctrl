@@ -65,10 +65,7 @@ impl Kik {
 
     pub async fn insert_data_conn(&self, data_chan: Arc<Mutex<Channel>>) {
         let id = data_chan.lock().await.get_id().to_string();
-        self.data_conns
-            .lock()
-            .await
-            .insert(id, data_chan);
+        self.data_conns.lock().await.insert(id, data_chan);
     }
 
     pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {

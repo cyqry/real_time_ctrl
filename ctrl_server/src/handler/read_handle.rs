@@ -3,31 +3,34 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::command::{Command, CtrlCommand, SysCommand};
 use common::config::Config;
-use ctrl_common::kik::Kik;
 use common::kik_info::KikInfo;
 use common::message::init_frame::InitFrame;
 use common::message::kik_frame::KikFrame;
 use common::message::kik_resp;
 use common::protocol::{BufSerializable, ReqCmd};
+use common::session_auth::{random_nonce_hex, verify_ctrl_auth_proof, verify_ctrl_data_proof};
 use common::{async_util, protocol};
+use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
 use ctrl_common::ctrl_frame::Frame;
 use ctrl_common::ctrl_protocol::{
     ctrl_kik_resp, ctrl_server_resp, ctrl_server_resp_error, ctrl_server_resp_success,
 };
 use ctrl_common::ctrl_resp::ServerResp;
+use ctrl_common::kik::Kik;
+use futures::stream;
 use log::{debug, info, warn};
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
-use futures::stream;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
-use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
 
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的帧类型")
@@ -69,17 +72,32 @@ pub async fn handle_ctrl(
                                 let resp = if can_ctrl_kiks.is_empty() {
                                     ctrl_server_resp_error(cmd_id, "没有可控制的Kik".to_owned())
                                 } else {
-                                    let list:Vec<KikInfoVo> =  stream::iter(can_ctrl_kiks.into_iter()).then(|(id, k)| {
-                                        async move{
-                                            KikInfoVo {
-                                                id,
-                                                name: k.kik_client_info.kik_info.name,
-                                                ip: k.kik_client_info.ip.read().await.to_string(),
-                                                recent_online_time: k.kik_client_info.recent_online_time.read().await.clone(),
-                                            }
-                                        }
-                                    }).collect().await;
-                                    ctrl_server_resp_success(cmd_id, serde_json::to_string(&list).unwrap())
+                                    let list: Vec<KikInfoVo> =
+                                        stream::iter(can_ctrl_kiks.into_iter())
+                                            .then(|(id, k)| async move {
+                                                KikInfoVo {
+                                                    id,
+                                                    name: k.kik_client_info.kik_info.name,
+                                                    ip: k
+                                                        .kik_client_info
+                                                        .ip
+                                                        .read()
+                                                        .await
+                                                        .to_string(),
+                                                    recent_online_time: k
+                                                        .kik_client_info
+                                                        .recent_online_time
+                                                        .read()
+                                                        .await
+                                                        .clone(),
+                                                }
+                                            })
+                                            .collect()
+                                            .await;
+                                    ctrl_server_resp_success(
+                                        cmd_id,
+                                        serde_json::to_string(&list).unwrap(),
+                                    )
                                 };
                                 channel.clone().lock().await.write_and_flush(&resp).await?;
                             }
@@ -94,8 +112,18 @@ pub async fn handle_ctrl(
                                             serde_json::to_string(&KikInfoVo {
                                                 id,
                                                 name: choose_kik.kik_client_info.kik_info.name,
-                                                ip: choose_kik.kik_client_info.ip.read().await.clone(),
-                                                recent_online_time: choose_kik.kik_client_info.recent_online_time.read().await.clone(),
+                                                ip: choose_kik
+                                                    .kik_client_info
+                                                    .ip
+                                                    .read()
+                                                    .await
+                                                    .clone(),
+                                                recent_online_time: choose_kik
+                                                    .kik_client_info
+                                                    .recent_online_time
+                                                    .read()
+                                                    .await
+                                                    .clone(),
                                             })?,
                                         )
                                     } else {
@@ -111,14 +139,19 @@ pub async fn handle_ctrl(
                             }
                             SysCommand::Now => {
                                 let info = match context.get_kik().await {
-                                    None => SysNow::None,//"没有正在控制的Kik"
+                                    None => SysNow::None, //"没有正在控制的Kik"
                                     Some(kik) => {
                                         if kik.exist_kik_conn().await {
                                             SysNow::Kik(KikInfoVo {
                                                 id: kik.kik_client_info.kik_info.id.unwrap(),
                                                 name: kik.kik_client_info.kik_info.name,
                                                 ip: kik.kik_client_info.ip.read().await.clone(),
-                                                recent_online_time: kik.kik_client_info.recent_online_time.read().await.clone(),
+                                                recent_online_time: kik
+                                                    .kik_client_info
+                                                    .recent_online_time
+                                                    .read()
+                                                    .await
+                                                    .clone(),
                                             })
                                         } else {
                                             SysNow::NotOnline //"被控制的kik已下线".to_string()
@@ -128,7 +161,10 @@ pub async fn handle_ctrl(
                                 channel
                                     .lock()
                                     .await
-                                    .write_and_flush(&ctrl_server_resp_success(cmd_id, serde_json::to_string(&info)?))
+                                    .write_and_flush(&ctrl_server_resp_success(
+                                        cmd_id,
+                                        serde_json::to_string(&info)?,
+                                    ))
                                     .await?;
                             }
                         },
@@ -253,7 +289,13 @@ pub async fn handle_ctrl(
                                                 //说明三次都读的过期或异常数据，有问题，放弃这个kik
                                                 //日志报告
                                                 context
-                                                    .offline_kik(kik.kik_client_info.kik_info.id.unwrap().as_str())
+                                                    .offline_kik(
+                                                        kik.kik_client_info
+                                                            .kik_info
+                                                            .id
+                                                            .unwrap()
+                                                            .as_str(),
+                                                    )
                                                     .await;
                                                 channel
                                                     .clone()
@@ -287,7 +329,6 @@ pub async fn handle_ctrl(
     Ok(())
 }
 
-
 pub async fn handle_ctrl_data(
     context: Context,
     _: Arc<Mutex<Channel>>,
@@ -301,7 +342,7 @@ pub async fn handle_ctrl_data(
             // async_executor.submit(Box::new(move || {
             //     Box::pin(async {})
             // })).await;
-            
+
             //todo 学习该项目源码完善async_executor（这个项目有bug，这里使用时偶尔会出现异步任务没有开始执行的问题）
             // let thread_pool = ThreadPool::new(ThreadPoolConfig {
             //     worker_threads: 1,
@@ -311,7 +352,6 @@ pub async fn handle_ctrl_data(
             //目前这种方式可能会比较消耗服务器内存
             // let len = data.len();
             // debug!("开始发送长度为{}的数据", len);
-            
 
             //因为kik不在意data顺序，这里可以异步地发给多个连接
             //如果kik不在线，就不管
@@ -333,7 +373,6 @@ pub async fn handle_ctrl_data(
                     info!("数据发送失败当前没有在线kik")
                 }
             });
-          
 
             // debug!("长度为{}的数据发送完毕", len);
             // let result = handle.await_result().await;
@@ -435,6 +474,99 @@ pub async fn handle_init_message(
     //初始化id
     debug!("init frame:{:?}", frame);
     match frame {
+        InitFrame::CtrlAuthStart(client_nonce) => {
+            e2e_trace("server: received ctrl auth start");
+            let server_nonce = random_nonce_hex();
+            {
+                let mut guard = channel.lock().await;
+                guard.put("ctrl_auth_v2_client_nonce".to_string(), client_nonce);
+                guard.put(
+                    "ctrl_auth_v2_server_nonce".to_string(),
+                    server_nonce.clone(),
+                );
+            }
+            channel
+                .lock()
+                .await
+                .write_and_flush(&protocol::transfer_encode_frame(
+                    InitFrame::CtrlAuthChallenge(server_nonce),
+                ))
+                .await?;
+            e2e_trace("server: sent ctrl auth challenge");
+        }
+        InitFrame::CtrlAuthProof {
+            client_nonce,
+            proof,
+        } => {
+            e2e_trace("server: received ctrl auth proof");
+            let (expected_client_nonce, server_nonce) = {
+                let guard = channel.lock().await;
+                let expected_client_nonce = guard
+                    .get::<String>("ctrl_auth_v2_client_nonce")
+                    .cloned()
+                    .ok_or(anyhow::Error::msg("缺少控制端认证 client nonce"))?;
+                let server_nonce = guard
+                    .get::<String>("ctrl_auth_v2_server_nonce")
+                    .cloned()
+                    .ok_or(anyhow::Error::msg("缺少控制端认证 server nonce"))?;
+                (expected_client_nonce, server_nonce)
+            };
+
+            let secret = config.id.encrypt();
+            if expected_client_nonce == client_nonce
+                && verify_ctrl_auth_proof(&secret, &client_nonce, &server_nonce, &proof)
+            {
+                e2e_trace("server: ctrl auth proof verified");
+                let session_id = random_nonce_hex();
+                let auth = ctrl_auth_v2_success(&context, &channel, session_id).await;
+                channel.lock().await.channel_type = ChannelType::Ctrl;
+                auth?;
+                e2e_trace("server: sent ctrl auth session");
+            } else {
+                e2e_trace("server: ctrl auth proof rejected");
+                channel
+                    .lock()
+                    .await
+                    .write_and_flush(&protocol::transfer_encode_frame(InitFrame::CtrlAuthReply(
+                        false,
+                    )))
+                    .await?;
+                return Err(anyhow::Error::msg("控制连接 v2 校验失败"));
+            }
+        }
+        InitFrame::CtrlDataSessionReq {
+            session_id,
+            channel_nonce,
+            proof,
+        } => {
+            e2e_trace("server: received ctrl data session req");
+            let secret = config.id.encrypt();
+            let proof_ok = verify_ctrl_data_proof(&secret, &session_id, &channel_nonce, &proof);
+            let session_ok = if proof_ok {
+                context
+                    .validate_ctrl_data_session(&session_id, &channel_nonce)
+                    .await
+            } else {
+                false
+            };
+            if session_ok {
+                e2e_trace("server: ctrl data session verified");
+                let auth = ctrl_data_auth_v2_success(&context, &channel).await;
+                channel.lock().await.channel_type = ChannelType::CtrlData;
+                auth?;
+                e2e_trace("server: sent ctrl data session reply");
+            } else {
+                e2e_trace("server: ctrl data session rejected");
+                channel
+                    .lock()
+                    .await
+                    .write_and_flush(&protocol::transfer_encode_frame(
+                        InitFrame::CtrlDataSessionReply(false),
+                    ))
+                    .await?;
+                return Err(anyhow::Error::msg("数据连接 v2 会话绑定失败"));
+            }
+        }
         InitFrame::CtrlAuthReq(s) => {
             if s == config.id.encrypt() {
                 let auth = ctrl_auth_success(&context, &channel).await;
@@ -605,13 +737,19 @@ async fn kik_reconnect_line(
         .as_ref()
         .map(|addr| addr.ip().to_string())
         .unwrap_or("未知ip".to_string());
-    info!("【{}】重连，ip:{}",kik_info.name,ip);
+    info!("【{}】重连，ip:{}", kik_info.name, ip);
     let arc = context.kik_map.clone();
     let mut kik_map = arc.write().await;
     match kik_map.get(id) {
         None => {
             // 重连发现以前的kik从map中删除，那么插入
-            let kik = Kik::new(id.as_str(), kik_info.name.as_str(), ip, SystemTime::now(), channel.clone());
+            let kik = Kik::new(
+                id.as_str(),
+                kik_info.name.as_str(),
+                ip,
+                SystemTime::now(),
+                channel.clone(),
+            );
             kik_map.insert(id.clone(), kik.clone());
             kik
         }
@@ -646,13 +784,19 @@ async fn new_kik_login_line(
         .map(|addr| addr.ip().to_string())
         .unwrap_or("未知ip".to_string());
     //将自动生成的id返回做为Kik id
-    let kik = Kik::new(id.as_str(), kik_info.name.as_str(), ip.clone(), SystemTime::now(), channel.clone());
+    let kik = Kik::new(
+        id.as_str(),
+        kik_info.name.as_str(),
+        ip.clone(),
+        SystemTime::now(),
+        channel.clone(),
+    );
     context
         .kik_map
         .write()
         .await
         .insert(id.clone(), kik.clone());
-    info!("【{}】上线，ip:{}",kik_info.name,ip);
+    info!("【{}】上线，ip:{}", kik_info.name, ip);
     push_event().await;
     kik
 }
@@ -668,6 +812,21 @@ async fn ctrl_data_auth_success(
         .await
         .write_and_flush(&protocol::transfer_encode_frame(
             InitFrame::CtrlDataConnAuthReply(true),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn ctrl_data_auth_v2_success(
+    context: &Context,
+    channel: &Arc<Mutex<Channel>>,
+) -> anyhow::Result<()> {
+    context.insert_ctrl_data_conn(channel.clone()).await;
+    channel
+        .lock()
+        .await
+        .write_and_flush(&protocol::transfer_encode_frame(
+            InitFrame::CtrlDataSessionReply(true),
         ))
         .await?;
     Ok(())
@@ -693,6 +852,48 @@ async fn ctrl_auth_success(context: &Context, channel: &Arc<Mutex<Channel>>) -> 
     Ok(())
 }
 
+async fn ctrl_auth_v2_success(
+    context: &Context,
+    channel: &Arc<Mutex<Channel>>,
+    session_id: String,
+) -> anyhow::Result<()> {
+    match context.set_ctrl_conn(channel.clone()).await {
+        None => {}
+        Some(old) => {
+            old.lock().await.try_write_half_close().await;
+            context.clear_all_ctrl_data().await;
+        }
+    };
+
+    let ctrl_channel_id = channel.lock().await.get_id().to_string();
+    context
+        .set_ctrl_session(session_id.clone(), ctrl_channel_id)
+        .await;
+    channel
+        .lock()
+        .await
+        .write_and_flush(&protocol::transfer_encode_frame(
+            InitFrame::CtrlAuthSession(session_id),
+        ))
+        .await?;
+    Ok(())
+}
+
 async fn push_event() {
     //todo 上线事件
+}
+
+fn e2e_trace(message: &str) {
+    let Some(path) = std::env::var("CTRL_SERVER_E2E_TRACE_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    // 仅 E2E 测试显式开启，用于定位本地握手；生产默认不写任何 trace 文件。
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
 }

@@ -6,7 +6,7 @@
     "START_RUN_PATH": "D:/test/dsl.exe",
     "FIX_SAVE_PATH": "D:/Cache/log.exe",
     "LOCK_FILE_PATH": "D:\\Strawberry\\licenses.txt",
-    "HOST": "ytycc.com",
+    "HOST": "localhost",
     "PORT": "9002",
     "START_ERROR_1": "start在隐藏路径执行失败",
     "START_ERROR_2": "start保存至隐藏路径失败",
