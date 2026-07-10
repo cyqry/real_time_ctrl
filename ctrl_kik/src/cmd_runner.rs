@@ -95,15 +95,18 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                         Err(e) => kik_error(e.to_string()),
                     }
                 }
-                CtrlCommand::Screen(_) => match screen::cut_screen().await {
-                    Ok(v) => match context.find_and_send_data(&v).await {
-                        Ok(data_id) => {
-                            return kik_success_data_id(data_id);
-                        }
-                        Err(e) => kik_error(format!("Kik发送数据失败,error:{:?}", e)),
-                    },
-                    Err(e) => kik_error(format!("Kik截屏失败,error:{:?}", e)),
-                },
+                CtrlCommand::Screen(_) => {
+                    let request = screen::CaptureRequest::png(screen::PngProfile::Balanced);
+                    match screen::capture_screen(request).await {
+                        Ok(v) => match context.find_and_send_data(&v).await {
+                            Ok(data_id) => {
+                                return kik_success_data_id(data_id);
+                            }
+                            Err(e) => kik_error(format!("Kik发送数据失败,error:{:?}", e)),
+                        },
+                        Err(e) => kik_error(format!("Kik截屏失败,error:{:?}", e)),
+                    }
+                }
             };
             resp
         }

@@ -44,6 +44,7 @@
 - `real_ctrl/AGENTS.md`：控制端、本地 API、服务端身份校验约束。
 - `ctrl_server/AGENTS.md`：服务端会话、转发、隔离和审计约束。
 - `ctrl_kik/AGENTS.md`：极小被控客户端约束。
+- `ctrl_kik/src/screen/AGENTS.md`：截屏后端扩展、线程所有权、会话生命周期和测试产物约束。
 
 ## 生产构建
 

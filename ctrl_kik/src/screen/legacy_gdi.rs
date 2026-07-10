@@ -1,19 +1,13 @@
 use anyhow::anyhow;
-use bytes::Buf;
-use common::file_util;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-use image::{ImageBuffer, ImageEncoder, ImageOutputFormat, Rgb, RgbImage, Rgba};
-use log::debug;
+use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
 use winapi::ctypes::c_int;
 use winapi::shared::windef::{HBITMAP, HDC};
 use winapi::um::wingdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
-    GetObjectW, SelectObject, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    SelectObject, BITMAPINFO, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
-use winapi::um::winuser::{
-    GetDC, GetDesktopWindow, GetSystemMetrics, GetWindowDC, ReleaseDC, SM_CXSCREEN,
-    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-};
+use winapi::um::winuser::{GetDesktopWindow, GetWindowDC};
 
 pub async fn cut_screen() -> anyhow::Result<Vec<u8>> {
     unsafe {
@@ -80,13 +74,6 @@ fn pixels_2_png(
 
     // 将图像缓冲区保存为PNG格式的Vec<u8>
     let mut png_data = Vec::new();
-    // 方式一，简单
-    // {
-    //     //通过标准库Cursor构造一个writer,从缓冲区已png格式写入
-    //     let mut writer = Cursor::new(&mut png_data);
-    //     img.write_to(&mut writer, ImageOutputFormat::Png).unwrap();
-    // }
-
     //方式二，可控制png格式的一些参数
     {
         let encoder = PngEncoder::new_with_quality(
@@ -102,7 +89,7 @@ fn pixels_2_png(
 fn get_xy() -> anyhow::Result<(usize, usize)> {
     use scrap::{Capturer, Display};
     let display = Display::primary()?;
-    let mut capturer = Capturer::new(display)?;
+    let capturer = Capturer::new(display)?;
     Ok((capturer.width(), capturer.height()))
 }
 
@@ -144,25 +131,4 @@ fn get_pixels_from_hbitmap(
         }
         Ok(pixels)
     }
-}
-
-#[tokio::test]
-pub async fn test() {
-    // println!(
-    //     "{:?}",
-    //     file_util::save_file(
-    //         r"C:\Users\lenovo\Desktop\Imag\1.png",
-    //         &cut_screen().await.unwrap()
-    //     )
-    //     .await
-    //     .unwrap()
-    // );
-    // let display = Display::primary().expect("无法获取主屏幕");
-    // let mut capturer = Capturer::new(display).expect("无法抓取屏幕");
-    // let (w, h) = (capturer.width(), capturer.height());
-    // println!("{},{}", w,h);
-    let x = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let y = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-
-    println!("{}", x);
 }
