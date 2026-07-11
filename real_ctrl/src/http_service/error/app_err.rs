@@ -1,4 +1,5 @@
 use crate::api_contract::ApiErrorBody;
+use crate::api_service::ApiServiceError;
 use serde_json::json;
 use spring_web::axum::http::StatusCode;
 use spring_web::axum::response::{IntoResponse, Response};
@@ -15,6 +16,12 @@ pub enum AppError {
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Internal server error")]
     Internal(anyhow::Error),
 }
@@ -27,6 +34,8 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => {
                 (StatusCode::UNAUTHORIZED, ApiErrorBody::unauthorized(msg))
             }
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, ApiErrorBody::forbidden(msg)),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, ApiErrorBody::busy(msg)),
             AppError::Internal(err) => {
                 log::error!("HTTP API 内部错误: {}", err);
                 (
@@ -42,5 +51,15 @@ impl IntoResponse for AppError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+impl From<ApiServiceError> for AppError {
+    fn from(error: ApiServiceError) -> Self {
+        match error {
+            ApiServiceError::Busy => Self::Conflict("另一个控制命令正在执行".to_string()),
+            ApiServiceError::Forbidden(message) => Self::Forbidden(message),
+            ApiServiceError::Execution(error) => Self::Internal(error),
+        }
     }
 }

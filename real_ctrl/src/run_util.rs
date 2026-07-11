@@ -3,6 +3,14 @@ use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::time;
 
+pub fn apply_log_filter(builder: &mut env_logger::Builder, default_level: &str) {
+    if std::env::var_os("RUST_LOG").is_some() {
+        builder.parse_default_env();
+    } else {
+        builder.parse_filters(default_level);
+    }
+}
+
 pub async fn single<P: AsRef<Path>>(lock_path: P) -> anyhow::Result<File> {
     use fs4::tokio::AsyncFileExt;
     if let Some(parent) = lock_path

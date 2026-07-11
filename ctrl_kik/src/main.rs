@@ -92,7 +92,6 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(_) => {}
                                 Err(e) => {
                                     debug!("{}", e);
-                                    //todo 报告错误
                                 }
                             }
                         }
@@ -104,7 +103,6 @@ async fn main() -> anyhow::Result<()> {
                 Err(error) => {
                     debug!("命令连接失败: {}", error);
                     time::sleep(Duration::from_secs(2)).await;
-                    //todo
                 }
             }
         }

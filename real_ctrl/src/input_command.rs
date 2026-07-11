@@ -59,18 +59,17 @@ impl BufSerializable for RemoteResp {
 #[cfg(target_os = "windows")]
 static DEFAULT_SCREEN_PATH: &str = "target\\screen\\1.png";
 
-impl From<InputCtrlCommand> for CtrlCommand {
-    fn from(value: InputCtrlCommand) -> Self {
+impl TryFrom<InputCtrlCommand> for CtrlCommand {
+    type Error = anyhow::Error;
+
+    fn try_from(value: InputCtrlCommand) -> Result<Self, Self::Error> {
         match value {
-            InputCtrlCommand::GetFile(a, _) => CtrlCommand::GetFile(a, "".to_string()),
-            InputCtrlCommand::GetBigFile(a, _) => CtrlCommand::GetBigFile(a, "".to_string()),
-            InputCtrlCommand::Ls(s) => CtrlCommand::Ls(s),
-            InputCtrlCommand::Screen(s) => CtrlCommand::Screen(s),
-            InputCtrlCommand::SetFile(_, _) => {
-                unreachable!("不支持")
-            }
-            InputCtrlCommand::SetBigFile(_, _) => {
-                unreachable!("不支持")
+            InputCtrlCommand::GetFile(a, _) => Ok(CtrlCommand::GetFile(a, String::new())),
+            InputCtrlCommand::GetBigFile(a, _) => Ok(CtrlCommand::GetBigFile(a, String::new())),
+            InputCtrlCommand::Ls(s) => Ok(CtrlCommand::Ls(s)),
+            InputCtrlCommand::Screen(s) => Ok(CtrlCommand::Screen(s)),
+            InputCtrlCommand::SetFile(_, _) | InputCtrlCommand::SetBigFile(_, _) => {
+                Err(anyhow!("文件上传命令必须先经过本地数据预处理"))
             }
         }
     }
@@ -95,7 +94,7 @@ impl FromStr for InputCommand {
                     Ok(InputCommand::Sys(Use(val)))
                 }
                 ["local_exit"] => Ok(InputCommand::Local(LocalExit)),
-                // todo 对于文件路径，我希望使用""包裹的参数，都对其进行转义，未使用""包裹的参数，无需转义;只有一边有"符号的是错误的语法
+                // 兼容 CLI 目前按空白切分，带空格路径应通过 HTTP/pipe 结构化 API 传入。
                 ["screen", save_path] => {
                     let save_path = save_path.trim_matches('"').to_string();
                     Ok(InputCommand::Ctrl(InputCtrlCommand::Screen(save_path)))

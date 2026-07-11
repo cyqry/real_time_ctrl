@@ -84,7 +84,9 @@ impl Decoder for LengthFieldBasedFrameDecoder {
             self.current_len = None;
             Ok(Some(res))
         } else {
-            let current_len = self.current_len.unwrap();
+            let Some(current_len) = self.current_len else {
+                return Ok(None);
+            };
             self.validate_frame_len(current_len)?;
             if src.len() < current_len {
                 return Ok(None);

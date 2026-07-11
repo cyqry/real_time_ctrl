@@ -10,6 +10,8 @@ mod logger;
 
 //编译期获取环境变量，写死在程序
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
+const DEFAULT_BIND_HOST: &str = env!("CTRL_SERVER_DEFAULT_BIND_HOST");
+const DEFAULT_SERVER_PORT: &str = env!("CTRL_SERVER_DEFAULT_PORT");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,21 +19,17 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "0.0.0.0".to_string());
+        .unwrap_or_else(|| DEFAULT_BIND_HOST.to_string());
     let server_port = env::var("CTRL_SERVER_PORT")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "9002".to_string());
+        .unwrap_or_else(|| DEFAULT_SERVER_PORT.to_string());
 
-    // 设置全局 INFO 级别
-    unsafe {
-        std::env::set_var("RUST_LOG", LOG_LEVEL);
-    }
-    // env_logger::init(); //该库 为 log 库 实现环境变量设置日志级别, 这里应该不需要
     let config = logger::LogConfig {
         dir: std::path::PathBuf::from("./logs"),
         prefix: "ctrl_server".to_string(),
+        default_filter: LOG_LEVEL.to_string(),
     };
     logger::init_logging_with_config(config)?;
     color_backtrace::install();

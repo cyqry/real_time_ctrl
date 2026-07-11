@@ -28,6 +28,9 @@
 - 任何涉及密钥、pin、token 的实现都要说明存储位置和生命周期。
 - `build.rs` 生成代码只能写入 Cargo `OUT_DIR`。编译期字符串混淆不是秘密存储，不能放入控制凭据或 API token。
 - `Channel` 的写入、flush 和 shutdown 必须受超时控制；业务 crate 不应自行绕过这些方法裸写。
+- `Channel` 的连接 ID 使用 `Option<String>` 表达初始化状态，禁止恢复 `undefined_id` 一类哨兵值或在读取未初始化 ID 时 panic。
+- 角色相关连接属性必须使用 `ChannelAttributeKey<T>`；禁止恢复裸字符串键配合调用点手写 downcast。
+- `common::Command` 只表示线上命令；本地生命周期命令保留在 `InputCommand`，不能重新塞进线协议枚举。
 
 ## 测试要求
 

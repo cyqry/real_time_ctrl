@@ -4,6 +4,9 @@ use std::env;
 use std::string::ToString;
 use std::time::Duration;
 
+const DEFAULT_TLS_PORT: &str = env!("RTC_DEFAULT_TLS_PORT");
+const DEFAULT_TLS_SERVER_NAME: &str = env!("RTC_DEFAULT_TLS_SERVER_NAME");
+
 #[derive(Clone)]
 pub struct Config {
     pub id: Id,
@@ -69,7 +72,7 @@ pub struct SecurityConfig {
     pub server_key_path: Option<String>,
     /// 仅迁移期允许服务端明文端口接收 real_ctrl；生产默认必须关闭。
     pub allow_plain_ctrl: bool,
-    /// 服务端最终授权开关；开放 API 和 ctrl_kik 构建能力不能绕过它。
+    /// 服务端最终授权开关；开放 API 和被控端命令分派不能绕过它。
     pub allow_remote_exec: bool,
 }
 
@@ -77,8 +80,8 @@ impl SecurityConfig {
     pub fn plain() -> Self {
         Self {
             client_mode: ClientTransportMode::Plain,
-            tls_port: "9443".to_string(),
-            tls_server_name: "real-ctrl-server".to_string(),
+            tls_port: DEFAULT_TLS_PORT.to_string(),
+            tls_server_name: DEFAULT_TLS_SERVER_NAME.to_string(),
             pinned_spki_sha256: None,
             ca_cert_path: None,
             server_cert_path: None,
@@ -128,7 +131,14 @@ fn env_flag(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Id;
+    use super::{Id, SecurityConfig, DEFAULT_TLS_PORT, DEFAULT_TLS_SERVER_NAME};
+
+    #[test]
+    fn plain_security_config_uses_build_defaults() {
+        let config = SecurityConfig::plain();
+        assert_eq!(config.tls_port, DEFAULT_TLS_PORT);
+        assert_eq!(config.tls_server_name, DEFAULT_TLS_SERVER_NAME);
+    }
 
     #[test]
     fn control_plane_secret_requires_minimum_length() {

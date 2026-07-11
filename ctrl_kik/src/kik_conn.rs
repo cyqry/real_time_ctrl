@@ -1,4 +1,4 @@
-use crate::context::{Context, Kik};
+use crate::context::{Context, Kik, COMMAND_SENDER};
 use crate::{cmd_util, read_handle};
 use anyhow::Error;
 use bytes::BytesMut;
@@ -13,7 +13,6 @@ use common::message::init_frame::InitFrame;
 use common::protocol;
 use common::protocol::CmdOptions;
 use log::debug;
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
@@ -55,7 +54,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     handle_active(context.clone(), name.clone(), channel.clone()).await?;
 
     //tx在连接处理线程结束后被关闭
-    let (mut tx, mut rx) = mpsc::channel::<Box<dyn Any + Send + Sync>>(5);
+    let (mut tx, mut rx) = mpsc::channel::<String>(1);
 
     let context_clone = context.clone();
     let channel_clone = channel_arc.clone();
@@ -123,38 +122,23 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     });
 
     //这次为第一次rx接收数据,用于阻塞校验
-    match timeout(Duration::from_secs(20), rx.recv()).await {
-        Ok(recv) => {
-            match recv {
-                None => {
-                    //连接已断开
-                    //todo 报告错误
-                    return Err(anyhow::Error::msg("校验时连接断开"));
-                }
-                Some(res) => {
-                    //获得服务器分配的id
-                    match res.downcast::<String>() {
-                        Ok(kik_id) => {
-                            {
-                                //todo 这部分应该在收到消息的线程就做了，这样就算服务端迅速发完响应就迅速发ping也没有问题，但业务消息由于没有确认，还是要延迟一下(需要稍久)再发
-                                let arc = channel_arc.clone();
-                                let mut guard = arc.lock().await;
-                                guard.channel_type = ChannelType::Kik;
-                                guard.set_id(*kik_id.clone());
-                            }
-                            *(context.id.lock().await) = Some(*kik_id.clone());
-                            context.set_kik(Some(Kik::new(channel_arc.clone()))).await;
-                        }
-                        _ => {
-                            return Err(anyhow::Error::msg("服务端奇怪的响应，系统错误"));
-                        }
-                    };
-                }
+    match timeout(read_timeout, rx.recv()).await {
+        Ok(recv) => match recv {
+            None => {
+                return Err(anyhow::Error::msg("校验时连接断开"));
             }
-        }
+            Some(kik_id) => {
+                {
+                    let mut guard = channel_arc.lock().await;
+                    guard.channel_type = ChannelType::Kik;
+                    guard.set_id(kik_id.clone());
+                }
+                *context.id.lock().await = Some(kik_id);
+                context.set_kik(Some(Kik::new(channel_arc.clone()))).await;
+            }
+        },
         Err(_error) => {
             channel.lock().await.try_write_half_close().await;
-            //服务器未响应，todo 报告错误
             return Err(anyhow::Error::msg("服务器超时未响应"));
         }
     };
@@ -188,12 +172,8 @@ async fn handle_active(
     name: String,
     channel: Arc<Mutex<Channel>>,
 ) -> anyhow::Result<()> {
-    //请求之前就默认这个连接已经准备好接受对方的消息了，这种方式会导致后面收不到服务器的确认，而且在收到服务器确认前 如果收到其他除了ping pong的业务消息的话 会有这边状态(id和context)不完整的问题； 其实业务消息用到context无非就是响应，所以任意业务消息响应前收到服务器确认设置好就行，就算没设置好 顶多也就是响应超时或者让连接断开 然后kik重连；
-    //如果收到确认之后再准备接收的话，那么这里服务器是无法预判你什么时候准备好了的，所以很有可能在准备接收前就发过来了非init(包括ping)消息，这边就会判断连接有问题
-    //但是这里就设置为kik的话就收不到 验证请求 的 回复(KikId) 了，所以要等验证消息收完才能设置为kik
-    // channel.lock().await.channel_type = ChannelType::Kik; //这里也许需要把context的维护也做了
-
-    //请求被控
+    // 发送注册请求后仍保持 Unknown；只有收到 KikId，外层状态机才发布 Kik 状态，
+    // 避免服务端业务帧早于本地 ID 和命令队列初始化。
     channel
         .lock()
         .await
@@ -205,8 +185,8 @@ async fn handle_active(
         )))
         .await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, CmdOptions, Command)>(8);
-    channel.lock().await.put("cmd_tx".to_string(), tx);
-    //todo 将这个线程的句柄交给连接控制主线程，方便随时杀掉；为了随时重新开新处理线程，这个线程其实应该得到命令时懒加载
+    channel.lock().await.insert_attribute(&COMMAND_SENDER, tx);
+    // Sender 绑定在连接属性上；主连接释放后发送端全部销毁，任务会自然退出。
     tokio::spawn(async move {
         while let Some((cmd_id, cmd_options, cmd)) = rx.recv().await {
             read_handle::handle_kik_cmd(context.clone(), &channel, cmd_id, cmd_options, cmd).await;
@@ -233,9 +213,9 @@ async fn handle_read(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    auth_tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    auth_tx: &mut Sender<String>,
 ) -> anyhow::Result<()> {
-    let channel_type = channel.clone().lock().await.channel_type.clone();
+    let channel_type = channel.lock().await.channel_type;
     match channel_type {
         ChannelType::Kik => read_handle::handle_kik(context, channel, msg).await,
         ChannelType::Unknown => {

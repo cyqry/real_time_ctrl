@@ -188,4 +188,4 @@ cargo build -p ctrl_kik --profile hardened
 - HTTP 增加 1 MiB body limit、370 秒请求 timeout、panic 捕获和 48 MiB API 二进制响应上限。
 - pipe 增加 30 秒读写超时、16 连接并发上限；锁文件与 pipe 锁获取均改为 fail-closed。
 - API 字段新增 request id、kik id、路径、Exec 命令最大长度和 NUL 拒绝；内部错误详情只记录日志，对外返回稳定通用错误。
-- Exec 形成 API、ctrl_server、ctrl_kik build feature 三层显式授权。
+- ctrl_kik 默认包含 Exec；管理面保留 real_ctrl API 与 ctrl_server 两层显式授权。

@@ -14,13 +14,14 @@ use tokio::sync::{RwLock, Semaphore};
 use widestring::U16CString;
 
 const PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
+const DEFAULT_SERVER_PORT: &str = env!("REAL_CTRL_DEFAULT_SERVER_PORT");
 
 pub async fn create_context() -> anyhow::Result<Context> {
     let server_port = env::var("REAL_CTRL_SERVER_PORT")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "9002".to_string());
+        .unwrap_or_else(|| DEFAULT_SERVER_PORT.to_string());
 
     let agent = Arc::new(RwLock::new(
         Agent::create(&Config {

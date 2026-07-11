@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{Mutex, RwLock};
 
-//Kik可看做指向一个(conn，data_conns)的指针
+/// 服务端持有的单个被控端会话。
+///
+/// 克隆 `Kik` 只克隆共享状态句柄，不会复制底层连接。
 #[derive(Clone)]
 pub struct Kik {
-    //Kik中的kik_info的id一定是Some的
+    // Kik 创建完成后 id 一定存在；协议层仍保留 Option 以兼容首次注册请求。
     pub kik_client_info: KikClientInfo,
-    // conn的id直接是 kik_id
-    //todo 优化为原子锁
     conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
     //data conn 的getid是 random id,  attr 一个 kik id;这里的key为 data conn的get_id
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
@@ -56,55 +56,52 @@ impl Kik {
             initialized: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    pub fn id(&self) -> Option<&str> {
+        self.kik_client_info.kik_info.id.as_deref()
+    }
+
     pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {
-        let next_arc = self.next_data_conn.clone();
-        let data_map_arc = self.data_conns.clone();
-        let data_map = data_map_arc.lock().await;
+        let data_map = self.data_conns.lock().await;
         if data_map.is_empty() {
             None
         } else {
-            let next = next_arc.fetch_add(1, Ordering::Relaxed) % data_map.len();
+            let next = self.next_data_conn.fetch_add(1, Ordering::Relaxed) % data_map.len();
             data_map.values().nth(next).cloned()
         }
     }
 
     pub fn set_kik_initialized(&self, initialized: bool) {
-        self.initialized.store(initialized, Ordering::SeqCst);
+        self.initialized.store(initialized, Ordering::Release);
     }
 
     pub fn initialized(&self) -> bool {
-        self.initialized.load(Ordering::SeqCst)
+        self.initialized.load(Ordering::Acquire)
     }
 
     pub async fn exist_kik_conn(&self) -> bool {
-        self.conn_op.clone().read().await.is_some()
+        self.conn_op.read().await.is_some()
     }
 
     pub async fn get_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
-        self.conn_op.clone().read().await.clone()
+        self.conn_op.read().await.clone()
     }
     pub async fn delete_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
-        let arc = self.conn_op.clone();
-        let mut guard = arc.write().await;
-        let option = guard.clone();
-        *guard = None;
-        option
+        self.conn_op.write().await.take()
     }
     pub async fn set_kik_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
-        let arc = self.conn_op.clone();
-        let mut guard = arc.write().await;
-        let option = guard.clone();
-        *(guard) = Some(conn);
-        option
+        self.conn_op.write().await.replace(conn)
     }
 
     pub async fn delete_data_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
-        let id = conn.lock().await.get_id().to_string();
+        let id = conn.lock().await.id().map(str::to_owned)?;
         self.data_conns.lock().await.remove(id.as_str())
     }
 
     pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) -> bool {
-        let id = conn.lock().await.get_id().to_string();
+        let Some(id) = conn.lock().await.id().map(str::to_owned) else {
+            return false;
+        };
         let mut connections = self.data_conns.lock().await;
         if connections.len() >= 4 && !connections.contains_key(&id) {
             return false;
@@ -113,24 +110,22 @@ impl Kik {
         true
     }
     pub async fn exist_data_channel(&self) -> bool {
-        !self.data_conns.clone().lock().await.is_empty()
+        !self.data_conns.lock().await.is_empty()
     }
     pub async fn clear(&self) {
-        {
-            //data_conn的清理
-            let arc = self.data_conns.clone();
-            let mut guard = arc.lock().await;
-            for x in guard.values() {
-                x.lock().await.try_write_half_close().await;
-            }
-            guard.clear();
+        // 先移出连接再等待网络关闭，避免一个慢连接长期占住会话状态锁。
+        let data_connections = self
+            .data_conns
+            .lock()
+            .await
+            .drain()
+            .map(|(_, connection)| connection)
+            .collect::<Vec<_>>();
+        for connection in data_connections {
+            connection.lock().await.try_write_half_close().await;
         }
-        //kik_conn 关闭
-        match self.conn_op.write().await.clone() {
-            None => {}
-            Some(conn) => {
-                conn.lock().await.try_write_half_close().await;
-            }
-        };
+        if let Some(connection) = self.conn_op.write().await.take() {
+            connection.lock().await.try_write_half_close().await;
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::cmd_runner;
-use crate::context::Context;
+use crate::context::{Context, COMMAND_SENDER};
 use bytes::BytesMut;
 use common::channel::Channel;
 use common::command::Command;
@@ -9,7 +9,6 @@ use common::message::kik_resp::kik_error;
 use common::protocol;
 use common::protocol::{BufSerializable, CmdOptions};
 use log::debug;
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -32,7 +31,7 @@ pub async fn handle_kik(
             channel
                 .lock()
                 .await
-                .get::<Sender<(String, CmdOptions, Command)>>("cmd_tx")
+                .attribute(&COMMAND_SENDER)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("命令处理队列未初始化"))?
                 .send(req_cmd.split())
@@ -107,18 +106,15 @@ pub async fn handle_init_message(
     _context: &Context,
     _channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    tx: &mut Sender<String>,
 ) -> anyhow::Result<()> {
     //由于服务端延迟发ping 所以还未初始化完成的kik连接 一般不会收到服务器的 KikFrame::Ping
     let frame = InitFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     match frame {
         InitFrame::KikId(id) => {
-            match tx.send(Box::new(id)).await {
-                Ok(_) => {}
-                Err(_error) => {
-                    //todo 写端关闭，神奇
-                }
-            };
+            tx.send(id)
+                .await
+                .map_err(|_| anyhow::anyhow!("初始化响应接收任务已关闭"))?;
         }
         _frame => {
             return Err(default_error());

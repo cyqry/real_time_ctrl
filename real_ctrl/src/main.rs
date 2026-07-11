@@ -4,6 +4,7 @@ use common::host::get_host_from_env_or_default;
 use real_ctrl::context::{Agent, Context};
 use real_ctrl::dispatch;
 use real_ctrl::input_command::InputCommand;
+use real_ctrl::run_util::apply_log_filter;
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
@@ -11,29 +12,28 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
+const DEFAULT_SERVER_PORT: &str = env!("REAL_CTRL_DEFAULT_SERVER_PORT");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env::set_var("RUST_LOG", LOG_LEVEL);
-    env_logger::Builder::new()
-        // 关键：定义自定义格式
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} [{}] - {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), // 添加毫秒
-                record.level(),
-                record.args()
-            )
-        })
-        .parse_default_env()
-        .init();
+    let mut logger = env_logger::Builder::new();
+    logger.format(|buf, record| {
+        writeln!(
+            buf,
+            "{} [{}] - {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), // 添加毫秒
+            record.level(),
+            record.args()
+        )
+    });
+    apply_log_filter(&mut logger, LOG_LEVEL);
+    logger.init();
 
     let server_port = env::var("REAL_CTRL_SERVER_PORT")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "9002".to_string());
+        .unwrap_or_else(|| DEFAULT_SERVER_PORT.to_string());
 
     let agent = Arc::new(RwLock::new(
         Agent::create(&Config {
@@ -57,12 +57,14 @@ async fn main() -> anyhow::Result<()> {
         if s.trim().is_empty() {
             continue;
         }
-        let i_cmd = s.trim().parse::<InputCommand>();
-        if let Err(e) = i_cmd {
-            println!("{}", e);
-            continue;
-        }
-        match dispatch::distribution(&context, i_cmd.unwrap()).await {
+        let i_cmd = match s.trim().parse::<InputCommand>() {
+            Ok(command) => command,
+            Err(error) => {
+                println!("{}", error);
+                continue;
+            }
+        };
+        match dispatch::distribution(&context, i_cmd).await {
             Ok(s) => {
                 println!("{}", s);
             }

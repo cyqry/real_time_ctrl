@@ -151,6 +151,10 @@ impl ApiErrorBody {
         Self::new("forbidden", message)
     }
 
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new("busy", message)
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::new("unauthorized", message)
     }

@@ -13,9 +13,6 @@ fn pre_token(username: &str, password: &str) -> String {
 
 fn final_token(mut pre_token: &str) -> String {
     pre_token = pre_token.trim();
-    if pre_token.is_empty() {
-        panic!("错误的参数");
-    }
     if pre_token.len() > 5 {
         md5(&pre_token[0..5]) + &sha256(&pre_token[5..])
     } else {

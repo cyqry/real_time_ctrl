@@ -13,12 +13,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
 use tokio::time;
 use uuid::Uuid;
 
 type DataMessage = (String, BytesMut);
 type SharedDataReceiver = Arc<Mutex<Receiver<DataMessage>>>;
+
+#[derive(Clone)]
+struct CommandGate(Arc<Semaphore>);
+
+impl CommandGate {
+    fn new() -> Self {
+        Self(Arc::new(Semaphore::new(1)))
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        self.0.clone().try_acquire_owned()
+    }
+}
 
 #[derive(Clone)]
 pub struct Context {
@@ -27,6 +40,7 @@ pub struct Context {
     data_conns: Arc<RwLock<HashMap<String, Arc<Mutex<Channel>>>>>,
     next_data_conn: Arc<AtomicUsize>,
     data_x: (Sender<DataMessage>, SharedDataReceiver),
+    command_gate: CommandGate,
 }
 
 //
@@ -45,15 +59,28 @@ impl Context {
             data_conns: Arc::new(RwLock::new(HashMap::new())),
             next_data_conn: Arc::new(AtomicUsize::new(0)),
             data_x: (tx, Arc::new(Mutex::new(rx))),
+            // 服务端协议当前只允许一个活动命令。门禁覆盖完整命令生命周期，
+            // 包括控制响应后的数据读取，避免并发 API 请求互相消费数据帧。
+            command_gate: CommandGate::new(),
         }
     }
-    pub async fn insert_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
-        let id = data_conn.lock().await.get_id().to_string();
+
+    pub fn try_acquire_command(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        self.command_gate.try_acquire()
+    }
+    pub async fn insert_ctrl_data_conn(
+        &self,
+        data_conn: Arc<Mutex<Channel>>,
+    ) -> anyhow::Result<()> {
+        let id = data_conn.lock().await.require_id()?.to_string();
         self.data_conns.write().await.insert(id, data_conn);
+        Ok(())
     }
     pub async fn delete_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
-        let id = data_conn.clone().lock().await.get_id().to_string();
-        self.data_conns.write().await.remove(id.as_str());
+        let id = data_conn.lock().await.id().map(str::to_owned);
+        if let Some(id) = id {
+            self.data_conns.write().await.remove(&id);
+        }
     }
     pub fn get_data_tx(&self) -> Sender<(String, BytesMut)> {
         self.data_x.0.clone()
@@ -168,7 +195,7 @@ impl Agent {
         let _ = self.conn.clone().lock().await.write_half_close().await;
     }
     pub async fn re_conn(&mut self, retry_count: u32) -> anyhow::Result<()> {
-        let mut re = anyhow::Error::msg("unreachable!");
+        let mut last_error = None;
         for _ in 0..retry_count {
             match ctrl_conn(&self.config).await {
                 Ok((conn, tx, session_id)) => {
@@ -178,13 +205,13 @@ impl Agent {
                     return Ok(());
                 }
                 Err(e) => {
-                    re = e;
+                    last_error = Some(e);
                     time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             }
         }
-        Err(re)
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("控制连接重试次数必须大于 0")))
     }
 
     pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
@@ -210,4 +237,19 @@ impl Agent {
 
 pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandGate;
+
+    #[test]
+    fn command_gate_rejects_parallel_command_until_permit_is_released() {
+        let gate = CommandGate::new();
+        let permit = gate.try_acquire().unwrap();
+        assert!(gate.try_acquire().is_err());
+
+        drop(permit);
+        assert!(gate.try_acquire().is_ok());
+    }
 }

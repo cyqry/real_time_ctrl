@@ -10,7 +10,6 @@ use common::ltc_codec::{
 use common::message::init_frame::InitFrame;
 use common::protocol;
 use log::debug;
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
@@ -53,7 +52,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
     handle_active(&context, channel.clone()).await?;
 
     //tx在连接处理线程结束后被关闭
-    let (mut tx, mut rx) = mpsc::channel::<Box<dyn Any + Send + Sync>>(5);
+    let (mut tx, mut rx) = mpsc::channel::<String>(1);
 
     let context_clone = context.clone();
     let read_timeout = config.read_timeout;
@@ -128,21 +127,13 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
         None => {
             return Err(anyhow!("发送端关闭，连接结束"));
         }
-        Some(res) => {
-            //获得服务器响应的kik_id
-            match res.downcast::<String>() {
-                Ok(kik_id) => {
-                    {
-                        let arc = channel_arc.clone();
-                        let mut guard = arc.lock().await;
-                        guard.put("kik_id".to_string(), *kik_id.clone());
-                        guard.set_id(Uuid::new_v4().to_string());
-                        guard.channel_type = ChannelType::KikData;
-                    }
-                    context.insert_data_conn(channel_arc.clone()).await?;
-                }
-                _ => return Err(anyhow!("服务端返回了错误的数据连接初始化响应")),
-            };
+        Some(_kik_id) => {
+            {
+                let mut guard = channel_arc.lock().await;
+                guard.set_id(Uuid::new_v4().to_string());
+                guard.channel_type = ChannelType::KikData;
+            }
+            context.insert_data_conn(channel_arc.clone()).await?;
         }
     };
     Ok(handle)
@@ -198,9 +189,9 @@ async fn handle_read(
     context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
-    auth_tx: &mut Sender<Box<dyn Any + Send + Sync>>,
+    auth_tx: &mut Sender<String>,
 ) -> anyhow::Result<()> {
-    let channel_type = channel.clone().lock().await.channel_type.clone();
+    let channel_type = channel.lock().await.channel_type;
     match channel_type {
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => {

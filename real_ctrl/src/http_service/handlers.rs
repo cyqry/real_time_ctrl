@@ -4,9 +4,11 @@ use crate::http_service::error::app_err::AppError;
 use crate::input_command::{InputCommand, InputCtrlCommand, RemoteResp};
 use anyhow::anyhow;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use spring_web::axum::body::Body;
 use spring_web::axum::http::{header, HeaderMap, StatusCode};
 use spring_web::axum::response::{IntoResponse, Response};
+use subtle::ConstantTimeEq;
 
 pub async fn health_check() -> &'static str {
     "OK"
@@ -30,7 +32,7 @@ pub(crate) async fn screen(
     let resp = api
         .execute(InputCommand::Ctrl(InputCtrlCommand::Screen("_".to_owned())))
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(AppError::from)?;
 
     let v = match resp {
         RemoteResp::SuccessData(v) => v,
@@ -90,14 +92,10 @@ fn token_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for idx in 0..max_len {
-        let a = left.get(idx).copied().unwrap_or(0);
-        let b = right.get(idx).copied().unwrap_or(0);
-        diff |= (a ^ b) as usize;
-    }
-    diff == 0
+    // 先哈希为固定长度，再使用经过审计的常量时间原语比较，避免手写循环被优化器改写。
+    let left_digest = Sha256::digest(left);
+    let right_digest = Sha256::digest(right);
+    bool::from(left_digest.ct_eq(&right_digest))
 }
 
 #[cfg(test)]

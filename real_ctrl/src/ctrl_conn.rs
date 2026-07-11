@@ -196,7 +196,7 @@ async fn handle_read(
     client_mode: &ClientTransportMode,
     auth_phase: &mut AuthPhase,
 ) -> Option<()> {
-    let channel_type = channel.lock().await.channel_type.clone();
+    let channel_type = channel.lock().await.channel_type;
     if channel_type == ChannelType::Unknown {
         let frame = InitFrame::from_buf(msg)?;
         match frame {

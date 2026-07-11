@@ -8,6 +8,8 @@ use common::message::dok::Dok::FilePart;
 use common::message::kik_cmd_resp_info;
 use common::message::kik_resp::{kik_error, kik_success_data_id, kik_success_info, KikResp};
 use common::protocol::BufSerializable;
+use log::warn;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio_util::either::Either;
@@ -35,10 +37,9 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                 CtrlCommand::SetBigFile(data_id, total, hash, save_path) => {
                     match set_big_file(context, data_id, total, hash, save_path.clone()).await {
                         Ok(_) => kik_success_info(format!("保存大文件至Kik:{}成功", save_path)),
-                        Err(e) => kik_success_info(format!(
-                            "保存大文件至Kik:{}失败,error:{}",
-                            save_path, e
-                        )),
+                        Err(e) => {
+                            kik_error(format!("保存大文件至Kik:{}失败,error:{}", save_path, e))
+                        }
                     }
                 }
                 CtrlCommand::SetFile(data_id, save_path) => {
@@ -106,19 +107,10 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
             };
             resp
         }
-        Command::Exec(s) => {
-            if !cfg!(feature = "dangerous-exec") {
-                return kik_error(
-                    "当前 ctrl_kik 构建未启用 dangerous-exec，拒绝任意命令执行".to_string(),
-                );
-            }
-            // let v: Vec<String> = s.trim().split_whitespace().map(|x| x.to_string()).collect();
-
-            match cmd_util::cmd_exec_line(s.as_str(), false, true).await {
-                Ok(res) => kik_success_info(res),
-                Err(e) => kik_error(format!("cmd exec error:{}", e)),
-            }
-        }
+        Command::Exec(s) => match cmd_util::cmd_exec_line(s.as_str(), false, true).await {
+            Ok(res) => kik_success_info(res),
+            Err(e) => kik_error(format!("cmd exec error:{}", e)),
+        },
         _ => kik_error("暂不支持该类型消息".to_string()),
     }
 }
@@ -155,7 +147,6 @@ async fn set_big_file(
     if hash.len() != 32 {
         return Err(anyhow!("SHA-256 长度必须为 32 bytes"));
     }
-    let mut sum = 0;
     let destination = PathBuf::from(&save_path);
     let file_name = destination
         .file_name()
@@ -172,26 +163,92 @@ async fn set_big_file(
         .await?;
     drop(temp_file);
 
-    while sum < total {
-        let data = context.read_data(data_id.clone()).await?;
-        let dok = Dok::from_buf(data).ok_or(anyhow!("大文件数据格式错误!"))?;
-        if let FilePart(start, end, data) = dok {
-            sum += data.len() as u64;
-            file_util::write_range_file(&temp_file_path, start, end, data).await?;
-            if sum == total {
-                file_util::set_file_size(&temp_file_path, total).await?;
-                break;
-            } else if sum > total {
-                return Err(anyhow!("获取大文件数据错误!!!"));
-            }
-        } else {
-            return Err(anyhow!("大文件保存失败"));
+    let result = receive_big_file(
+        context,
+        &data_id,
+        total,
+        &hash,
+        &temp_file_path,
+        &destination,
+    )
+    .await;
+    if result.is_err() {
+        if let Err(cleanup_error) = fs::remove_file(&temp_file_path).await {
+            warn!(
+                "清理失败的大文件临时文件失败: path={}, error={}",
+                temp_file_path.display(),
+                cleanup_error
+            );
         }
     }
+    result
+}
+
+async fn receive_big_file(
+    context: &Context,
+    data_id: &str,
+    total: u64,
+    hash: &[u8],
+    temp_file_path: &Path,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    let mut received = 0u64;
+    let mut ranges = BTreeMap::<u64, u64>::new();
+
+    while received < total {
+        let data = context.read_data(data_id.to_string()).await?;
+        let dok = Dok::from_buf(data).ok_or(anyhow!("大文件数据格式错误!"))?;
+        match dok {
+            FilePart(start, end, data) => {
+                register_file_part(&mut ranges, start, end, data.len(), total)?;
+                received = received
+                    .checked_add(data.len() as u64)
+                    .ok_or_else(|| anyhow!("大文件接收字节数溢出"))?;
+                if received > total {
+                    return Err(anyhow!("大文件接收字节数超过声明大小"));
+                }
+                file_util::write_range_file(temp_file_path, start, end, data).await?;
+            }
+            Dok::Err(code) => return Err(anyhow!("发送端报告大文件传输失败: {code:?}")),
+        }
+    }
+    file_util::set_file_size(temp_file_path, total).await?;
     if !hash.eq(&file_util::compute_hash(temp_file_path.to_string_lossy()).await?) {
         return Err(anyhow!("hash校验失败，数据错误"));
     }
-    replace_file(&temp_file_path, &destination).await?;
+    replace_file(temp_file_path, destination).await?;
+    Ok(())
+}
+
+fn register_file_part(
+    ranges: &mut BTreeMap<u64, u64>,
+    start: u64,
+    end: u64,
+    data_len: usize,
+    total: u64,
+) -> anyhow::Result<()> {
+    if start > end || end >= total {
+        return Err(anyhow!("大文件分片范围越界: {start}..={end}"));
+    }
+    let declared_len = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| anyhow!("大文件分片长度溢出"))?;
+    if declared_len != data_len as u64 {
+        return Err(anyhow!("大文件分片范围与数据长度不一致"));
+    }
+    if ranges
+        .range(..=start)
+        .next_back()
+        .is_some_and(|(_, previous_end)| *previous_end >= start)
+        || ranges
+            .range(start..)
+            .next()
+            .is_some_and(|(next_start, _)| *next_start <= end)
+    {
+        return Err(anyhow!("大文件分片范围重复或重叠: {start}..={end}"));
+    }
+    ranges.insert(start, end);
     Ok(())
 }
 
@@ -227,4 +284,41 @@ async fn replace_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
     .await
     .map_err(|error| anyhow!("文件替换任务失败: {error}"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{register_file_part, run};
+    use crate::context::Context;
+    use common::command::Command;
+    use common::message::kik_resp::{ClientSuccessResp, KikResp};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn big_file_ranges_accept_out_of_order_but_reject_overlap() {
+        let mut ranges = BTreeMap::new();
+        register_file_part(&mut ranges, 10, 19, 10, 30).unwrap();
+        register_file_part(&mut ranges, 0, 9, 10, 30).unwrap();
+        register_file_part(&mut ranges, 20, 29, 10, 30).unwrap();
+
+        assert!(register_file_part(&mut ranges, 5, 14, 10, 30).is_err());
+        assert!(register_file_part(&mut ranges, 0, 8, 10, 30).is_err());
+        assert!(register_file_part(&mut ranges, 30, 30, 1, 30).is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_is_available_in_default_build() {
+        let response = run(
+            &Context::new(),
+            Command::Exec("echo rtc-exec-default".to_string()),
+        )
+        .await;
+
+        match response {
+            KikResp::Success(ClientSuccessResp::Info(output)) => {
+                assert!(output.contains("rtc-exec-default"));
+            }
+            other => panic!("默认构建 Exec 返回了异常响应: {other:?}"),
+        }
+    }
 }

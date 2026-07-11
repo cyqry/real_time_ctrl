@@ -1,3 +1,4 @@
+use crate::core::connection_meta::KIK_ID;
 use crate::core::context::Context;
 use crate::handler::read_handle;
 use anyhow::Error;
@@ -176,7 +177,7 @@ async fn handle_transport_parts(
                     .await
                     {
                         Ok(_) => {
-                            let channel_type = channel.lock().await.channel_type.clone();
+                            let channel_type = channel.lock().await.channel_type;
                             let max_frame_len = max_frame_len_for_channel_type(&channel_type);
                             framed_arc
                                 .lock()
@@ -244,7 +245,7 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
         .as_ref()
         .map(|addr| addr.ip().to_string())
         .unwrap_or("未知ip".to_string());
-    let channel_type = channel.lock().await.channel_type.clone();
+    let channel_type = channel.lock().await.channel_type;
     match channel_type {
         ChannelType::Ctrl => {
             context.delete_ctrl_conn_if(&channel).await;
@@ -255,7 +256,10 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
         }
         ChannelType::Kik => {
             // kik连接的id直接是kikid
-            let id = channel.lock().await.get_id().to_string();
+            let Some(id) = channel.lock().await.id().map(str::to_owned) else {
+                warn!("Kik 连接关闭时尚未分配 ID");
+                return;
+            };
             // context.set_kik_state();
             // 因为Kik连接断开了，所以万一在被控制，需要清理
             let _ = context.delete_kik_conn_if_id(id.as_str()).await;
@@ -266,7 +270,7 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
         ChannelType::KikData => {
             //清理
             context.delete_kik_data_conn(channel.clone()).await;
-            let kik_id = channel.lock().await.get::<String>("kik_id").cloned();
+            let kik_id = channel.lock().await.attribute(&KIK_ID).cloned();
             if let Some(kik_id) = kik_id {
                 if let Some(kik) = context.delete_kik_if_not_online(&kik_id).await {
                     info!("【{}】下线，ip:{}", kik.kik_client_info.kik_info.name, ip);
@@ -286,7 +290,7 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
         if channel.lock().await.is_closed() {
             return;
         }
-        let channel_type = channel.clone().lock().await.channel_type.clone();
+        let channel_type = channel.lock().await.channel_type;
         let ping = match channel_type {
             ChannelType::Ctrl | ChannelType::CtrlData => Some(ctrl_ping()),
             ChannelType::Kik | ChannelType::KikData => Some(kik_ping()),
@@ -321,7 +325,8 @@ async fn handle_read(
     msg: BytesMut,
     transport_policy: TransportPolicy,
 ) -> anyhow::Result<()> {
-    let channel_type = channel.clone().lock().await.channel_type.clone(); //这里不克隆直接match的话又会出现match的生命周期问题，导致死锁。
+    // 先复制枚举再进入 match，确保 Channel 锁在业务处理前释放。
+    let channel_type = channel.lock().await.channel_type;
     match channel_type {
         ChannelType::Ctrl => {
             read_handle::handle_ctrl(context, channel, msg, config.security.allow_remote_exec).await

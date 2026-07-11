@@ -21,10 +21,10 @@ struct LocalTimer {
     offset: FixedOffset,
 }
 impl LocalTimer {
-    pub fn new() -> Self {
-        //北京时间
-        let offset = FixedOffset::east_opt(8 * 3600).unwrap();
-        Self { offset }
+    pub fn new() -> anyhow::Result<Self> {
+        let offset = FixedOffset::east_opt(8 * 3600)
+            .ok_or_else(|| anyhow::anyhow!("无法构造东八区日志时区"))?;
+        Ok(Self { offset })
     }
 }
 impl FormatTime for LocalTimer {
@@ -38,6 +38,7 @@ impl FormatTime for LocalTimer {
 pub struct LogConfig {
     pub dir: PathBuf,
     pub prefix: String,
+    pub default_filter: String,
 }
 
 impl Default for LogConfig {
@@ -45,18 +46,22 @@ impl Default for LogConfig {
         Self {
             dir: PathBuf::from("./logs"),
             prefix: "app".to_string(),
+            default_filter: "INFO".to_string(),
         }
     }
 }
 
 pub fn init_logging_with_config(config: LogConfig) -> anyhow::Result<()> {
+    if LOG_GUARDS.get().is_some() {
+        return Err(anyhow::anyhow!("日志系统不能重复初始化"));
+    }
     // 创建日志目录
     fs::create_dir_all(&config.dir)?;
 
     //日志的格式
     let log_format = fmt::format()
         .with_ansi(false) // 文件日志禁用 ANSI 颜色
-        .with_timer(LocalTimer::new())
+        .with_timer(LocalTimer::new()?)
         .with_target(false)
         .with_file(true)
         .with_line_number(true)
@@ -97,7 +102,8 @@ pub fn init_logging_with_config(config: LogConfig) -> anyhow::Result<()> {
         .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
 
     // 创建 EnvFilter 来读取 RUST_LOG 环境变量
-    let env_filter = EnvFilter::from_default_env();
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.default_filter));
 
     //  初始化订阅者，同时注册两个日志层
     // SubscriberExt::with() 允许我们附加多个层
@@ -105,7 +111,8 @@ pub fn init_logging_with_config(config: LogConfig) -> anyhow::Result<()> {
         .with(env_filter) // 添加环境过滤器
         .with(default_layer) // 注册非 ERROR 日志层
         .with(error_layer) // 注册 ERROR 日志层
-        .init();
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("初始化日志订阅器失败: {error}"))?;
 
     if LOG_GUARDS.set((default_guard, error_guard)).is_err() {
         return Err(anyhow::anyhow!("日志系统不能重复初始化"));

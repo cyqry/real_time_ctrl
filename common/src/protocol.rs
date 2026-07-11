@@ -73,7 +73,13 @@ impl BufSerializable for ReqCmd {
         let mut bytes_mut = BytesMut::with_capacity(id_len);
         bytes_mut.put_u32(id_len as u32);
         bytes_mut.put_slice(self.id.as_bytes());
-        let cop_json = serde_json::to_string(&self.cmd_options).unwrap();
+        // CmdOptions 当前只有一个 bool；手工生成与 serde_json 相同的稳定字节，
+        // 避免在无失败返回值的历史编码 trait 中引入序列化 panic。
+        let cop_json = if self.cmd_options.timeout {
+            r#"{"timeout":true}"#
+        } else {
+            r#"{"timeout":false}"#
+        };
         let json_len = cop_json.len();
         bytes_mut.put_u32(json_len as u32);
         bytes_mut.put_slice(cop_json.as_bytes());

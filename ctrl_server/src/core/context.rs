@@ -1,3 +1,4 @@
+use crate::core::connection_meta::KIK_ID;
 use common::channel::Channel;
 use ctrl_common::kik::Kik;
 use log::error;
@@ -7,11 +8,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{Mutex, RwLock};
 
-#[derive(Clone, Debug)]
-pub struct CtrlSession {
-    pub session_id: String,
-    pub ctrl_channel_id: String,
-    pub created_at: SystemTime,
+struct CtrlSession {
+    session_id: String,
+    created_at: SystemTime,
     used_data_nonces: HashSet<String>,
 }
 
@@ -20,61 +19,52 @@ const MAX_CTRL_DATA_CHANNELS: usize = 8;
 const MAX_USED_DATA_NONCES: usize = 1024;
 
 type SharedChannel = Arc<Mutex<Channel>>;
-type CtrlConnections = Option<(Option<SharedChannel>, HashMap<String, SharedChannel>)>;
 
+#[derive(Default)]
+struct CtrlState {
+    connection: Option<SharedChannel>,
+    data_connections: HashMap<String, SharedChannel>,
+    session: Option<CtrlSession>,
+}
+
+/// 服务端共享运行状态。克隆该类型只克隆内部状态句柄。
 #[derive(Clone)]
-//不要直接修改context,Context也可看为一个指针
 pub struct Context {
-    //todo 最外层优化为原子锁
-    //当前控制者和它的数据连接
-    ctrl_op: Arc<RwLock<CtrlConnections>>,
+    // 控制连接、数据连接与会话必须在同一个锁内切换，避免旧连接清理新会话。
+    ctrl: Arc<RwLock<CtrlState>>,
     next_ctrl_data: Arc<AtomicUsize>,
-    ctrl_session: Arc<RwLock<Option<CtrlSession>>>,
-    now_cmd_id: Arc<RwLock<Option<String>>>,
-    //todo 最外层优化为原子锁
-    //当前正在控制的kik
-    //之所以要在Kik内部加一个arc，是因为会被kik_map变量共享引用，Kik的conn和vec都只能在堆中存在一份，kik_info是可克隆的，conn和vec锁分开是因为他们没有关系
-    kik_op: Arc<RwLock<Option<Kik>>>,
-
-    //所有在线的被控端map<String,Kik>
-    pub kik_map: Arc<RwLock<HashMap<String, Kik>>>,
+    active_command_id: Arc<Mutex<Option<String>>>,
+    selected_kik: Arc<RwLock<Option<Kik>>>,
+    pub(crate) kiks: Arc<RwLock<HashMap<String, Kik>>>,
 }
 
 impl Context {
     pub fn init() -> Self {
         Context {
-            ctrl_op: Arc::new(RwLock::new(None)),
+            ctrl: Arc::new(RwLock::new(CtrlState::default())),
             next_ctrl_data: Arc::new(AtomicUsize::new(0)),
-            ctrl_session: Arc::new(RwLock::new(None)),
-            now_cmd_id: Arc::new(RwLock::new(None)),
-            kik_op: Arc::new(RwLock::new(None)),
-            kik_map: Arc::new(RwLock::new(HashMap::new())),
+            active_command_id: Arc::new(Mutex::new(None)),
+            selected_kik: Arc::new(RwLock::new(None)),
+            kiks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub async fn find_ctrl_data(&self) -> Option<Arc<Mutex<Channel>>> {
-        let next_arc = self.next_ctrl_data.clone();
-        let ctrl_arc = self.ctrl_op.clone();
-        let ctrl_guard = ctrl_arc.read().await;
-        if ctrl_guard.is_some() {
-            let data_map = ctrl_guard.clone().unwrap().1;
-            if data_map.is_empty() {
-                None
-            } else {
-                let next = next_arc.fetch_add(1, Ordering::Relaxed) % data_map.len();
-                data_map.values().nth(next).cloned()
-            }
-        } else {
-            None
+        let ctrl = self.ctrl.read().await;
+        if ctrl.data_connections.is_empty() {
+            return None;
         }
+        let next =
+            self.next_ctrl_data.fetch_add(1, Ordering::Relaxed) % ctrl.data_connections.len();
+        ctrl.data_connections.values().nth(next).cloned()
     }
 
-    pub async fn now_cmd_id(&self) -> Option<String> {
-        self.now_cmd_id.clone().read().await.clone()
+    pub async fn active_command_id(&self) -> Option<String> {
+        self.active_command_id.lock().await.clone()
     }
-    pub async fn set_now_cmd_id_if_none(&self, id: String) -> bool {
-        let arc = self.now_cmd_id.clone();
-        let mut now_id = arc.write().await;
+
+    pub async fn try_begin_command(&self, id: String) -> bool {
+        let mut now_id = self.active_command_id.lock().await;
         match now_id.as_ref() {
             None => {
                 *now_id = Some(id);
@@ -84,35 +74,31 @@ impl Context {
         }
     }
 
-    pub async fn delete_now_cmd_id(&self) {
-        *(self.now_cmd_id.clone().write().await) = None;
+    pub async fn finish_command(&self) {
+        *self.active_command_id.lock().await = None;
     }
 
     pub async fn exist_ctrl(&self) -> bool {
-        self.ctrl_op
-            .read()
-            .await
-            .as_ref()
-            .and_then(|(channel, _)| channel.as_ref())
-            .is_some()
+        self.ctrl.read().await.connection.is_some()
     }
 
     pub async fn delete_ctrl_conn_if(&self, channel: &Arc<Mutex<Channel>>) -> bool {
-        let data_connections = {
-            let mut guard = self.ctrl_op.write().await;
-            let is_current = guard
+        let data_connections: Vec<SharedChannel> = {
+            let mut ctrl = self.ctrl.write().await;
+            let is_current = ctrl
+                .connection
                 .as_ref()
-                .and_then(|(current, _)| current.as_ref())
                 .is_some_and(|current| Arc::ptr_eq(current, channel));
             if !is_current {
                 return false;
             }
-            guard
-                .take()
-                .map(|(_, data)| data.into_values().collect::<Vec<_>>())
-                .unwrap_or_default()
+            ctrl.connection = None;
+            ctrl.session = None;
+            ctrl.data_connections
+                .drain()
+                .map(|(_, data)| data)
+                .collect()
         };
-        self.clear_ctrl_session().await;
         for data_connection in data_connections {
             data_connection.lock().await.try_write_half_close().await;
         }
@@ -121,16 +107,33 @@ impl Context {
 
     /// 替换控制连接时同时隔离旧数据通道；旧连接的 inactive 回调不能清掉新会话。
     pub async fn set_ctrl_conn(&self, channel: Arc<Mutex<Channel>>) {
+        self.replace_ctrl(channel, None).await;
+    }
+
+    pub async fn set_ctrl_conn_with_session(
+        &self,
+        channel: Arc<Mutex<Channel>>,
+        session_id: String,
+    ) {
+        let session = CtrlSession {
+            session_id,
+            created_at: SystemTime::now(),
+            used_data_nonces: HashSet::new(),
+        };
+        self.replace_ctrl(channel, Some(session)).await;
+    }
+
+    async fn replace_ctrl(&self, channel: Arc<Mutex<Channel>>, session: Option<CtrlSession>) {
         let (old_ctrl, old_data_connections) = {
-            let mut guard = self.ctrl_op.write().await;
-            let previous = guard.take();
-            *guard = Some((Some(channel), HashMap::new()));
-            match previous {
-                Some((old_ctrl, old_data)) => {
-                    (old_ctrl, old_data.into_values().collect::<Vec<_>>())
-                }
-                None => (None, Vec::new()),
-            }
+            let mut ctrl = self.ctrl.write().await;
+            let old_ctrl = ctrl.connection.replace(channel);
+            let old_data = ctrl
+                .data_connections
+                .drain()
+                .map(|(_, data)| data)
+                .collect::<Vec<_>>();
+            ctrl.session = session;
+            (old_ctrl, old_data)
         };
         if let Some(old_ctrl) = old_ctrl {
             old_ctrl.lock().await.try_write_half_close().await;
@@ -140,48 +143,22 @@ impl Context {
         }
     }
 
-    pub async fn get_ctrl_conn(&self) -> Option<Arc<Mutex<Channel>>> {
-        let arc = self.ctrl_op.clone();
-        let guard = arc.read().await;
-        match *guard {
-            None => None,
-            Some((ref ctrl_conn, ref _data_conns)) => ctrl_conn.clone(),
+    pub async fn delete_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
+        let id = data_conn.lock().await.id().map(str::to_owned);
+        if let Some(id) = id {
+            self.ctrl.write().await.data_connections.remove(&id);
         }
     }
 
-    pub async fn delete_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
-        match *(self.ctrl_op.clone().write().await) {
-            None => {}
-            Some((ref _ctrl_conn, ref mut data_conns)) => {
-                data_conns.remove(data_conn.lock().await.get_id());
-            }
-        };
-    }
-
-    pub async fn set_ctrl_session(&self, session_id: String, ctrl_channel_id: String) {
-        let session = CtrlSession {
-            session_id,
-            ctrl_channel_id,
-            created_at: SystemTime::now(),
-            used_data_nonces: HashSet::new(),
-        };
-        *self.ctrl_session.write().await = Some(session);
-    }
-
-    pub async fn clear_ctrl_session(&self) {
-        *self.ctrl_session.write().await = None;
-    }
-
     pub async fn validate_ctrl_data_session(&self, session_id: &str, channel_nonce: &str) -> bool {
-        let current_ctrl_id = match self.get_ctrl_conn().await {
-            Some(channel) => channel.lock().await.get_id().to_string(),
-            None => return false,
-        };
-        let mut guard = self.ctrl_session.write().await;
-        let Some(session) = guard.as_mut() else {
+        let mut ctrl = self.ctrl.write().await;
+        if ctrl.connection.is_none() {
+            return false;
+        }
+        let Some(session) = ctrl.session.as_mut() else {
             return false;
         };
-        if session.session_id != session_id || session.ctrl_channel_id != current_ctrl_id {
+        if session.session_id != session_id {
             return false;
         }
         if session
@@ -189,7 +166,7 @@ impl Context {
             .elapsed()
             .map_or(true, |age| age > CTRL_SESSION_TTL)
         {
-            *guard = None;
+            ctrl.session = None;
             return false;
         }
         if session.used_data_nonces.contains(channel_nonce) {
@@ -203,19 +180,15 @@ impl Context {
     }
 
     pub async fn insert_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) -> bool {
-        match *(self.ctrl_op.clone().write().await) {
-            None => false,
-            Some((ref ctrl_conn, ref mut data_conns)) => {
-                if ctrl_conn.is_none() || data_conns.len() >= MAX_CTRL_DATA_CHANNELS {
-                    return false;
-                }
-                data_conns.insert(
-                    data_conn.clone().lock().await.get_id().to_string(),
-                    data_conn,
-                );
-                true
-            }
+        let Some(id) = data_conn.lock().await.id().map(str::to_owned) else {
+            return false;
+        };
+        let mut ctrl = self.ctrl.write().await;
+        if ctrl.connection.is_none() || ctrl.data_connections.len() >= MAX_CTRL_DATA_CHANNELS {
+            return false;
         }
+        ctrl.data_connections.insert(id, data_conn);
+        true
     }
 
     //手动下线kik, 通过手动关闭连接自动触发下线
@@ -228,21 +201,19 @@ impl Context {
 
     //清理对应id kik的 kik_conn,
     pub async fn delete_kik_conn_if_id(&self, id: &str) {
-        //先从 kik_op找
-        {
-            let arc = self.kik_op.clone();
-            let guard = arc.write().await;
-            if let Some(kik) = guard.as_ref() {
-                if kik.kik_client_info.kik_info.id.as_deref() == Some(id) {
-                    kik.delete_kik_conn().await;
-                    return;
-                }
-            }
+        // 先复制句柄再释放外层锁，不能在等待内部连接锁时阻塞当前选择状态。
+        let selected = self
+            .selected_kik
+            .read()
+            .await
+            .clone()
+            .filter(|kik| kik.kik_client_info.kik_info.id.as_deref() == Some(id));
+        if let Some(kik) = selected {
+            kik.delete_kik_conn().await;
+            return;
         }
-        //再去map中找
-        let arc = self.kik_map.clone();
-        let kik_map = arc.read().await;
-        if let Some(kik) = kik_map.get(id) {
+        let mapped = self.kiks.read().await.get(id).cloned();
+        if let Some(kik) = mapped {
             kik.delete_kik_conn().await;
         }
     }
@@ -259,21 +230,19 @@ impl Context {
     }
 
     async fn find_kik(&self, kik_id: &str) -> Option<Kik> {
-        //先从 self.kik_op找
-        let guard = self.kik_op.read().await;
+        let guard = self.selected_kik.read().await;
         if let Some(ref kik) = *guard {
             if kik.kik_client_info.kik_info.id.as_deref() == Some(kik_id) {
                 return Some(kik.clone());
             }
         }
         //map中的
-        self.kik_map.read().await.get(kik_id).cloned()
+        self.kiks.read().await.get(kik_id).cloned()
     }
 
     async fn just_delete_kik(&self, kik_id: &str) -> Option<Kik> {
-        //先从 self.kik_op找
-        let kik_op = {
-            let mut guard = self.kik_op.write().await;
+        let selected_kik = {
+            let mut guard = self.selected_kik.write().await;
             if let Some(ref kik) = *guard {
                 if kik.kik_client_info.kik_info.id.as_deref() == Some(kik_id) {
                     guard.take()
@@ -285,19 +254,19 @@ impl Context {
             }
         };
         //删除map中的
-        let map_kik = self.kik_map.write().await.remove(kik_id);
-        if kik_op.is_some() {
-            kik_op
+        let mapped_kik = self.kiks.write().await.remove(kik_id);
+        if selected_kik.is_some() {
+            selected_kik
         } else {
-            map_kik
+            mapped_kik
         }
     }
 
     pub async fn delete_kik_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
-        //先从 kik_op中找
+        // 先从当前选中项清理，再清理在线表中的同一共享会话。
         {
-            let kik_op = self.kik_op.clone().read().await.clone();
-            if let Some(kik) = kik_op {
+            let selected_kik = self.selected_kik.read().await.clone();
+            if let Some(kik) = selected_kik {
                 kik.delete_data_conn(data_conn.clone()).await;
             }
         }
@@ -305,40 +274,34 @@ impl Context {
         //不要与下面写在一行，因为引用传递导致的生命周期问题或者match的一个生命周期问题，所不会getid了就释放，然后在match中 delete时又lock了所以死锁
         let kik_id = {
             let guard = data_conn.lock().await;
-            let Some(kik_id) = guard.get::<String>("kik_id") else {
+            let Some(kik_id) = guard.attribute(&KIK_ID) else {
                 return;
             };
             kik_id.to_string()
         };
-        match self.kik_map.clone().read().await.get(kik_id.as_str()) {
-            None => {}
-            Some(kik) => {
-                kik.delete_data_conn(data_conn).await;
-            }
-        };
+        let mapped = self.kiks.read().await.get(kik_id.as_str()).cloned();
+        if let Some(kik) = mapped {
+            kik.delete_data_conn(data_conn).await;
+        }
     }
 
     pub async fn set_kik(&self, kik: Kik) {
-        *(self.kik_op.clone().write().await) = Some(kik);
+        *self.selected_kik.write().await = Some(kik);
     }
 
     //当前正在控制的kik，一定是初始化完成的kik连接即initialized一定为true
     pub async fn get_kik(&self) -> Option<Kik> {
-        let guard = self.kik_op.read().await;
-        match *guard {
-            None => {}
-            Some(ref k) => {
-                if !k.initialized() {
-                    error!("取当前正在控制kik时，未初始化完成")
-                }
-            }
+        let kik = self.selected_kik.read().await.clone()?;
+        if !kik.initialized() {
+            error!("取当前正在控制 Kik 时连接尚未初始化完成");
+            return None;
         }
-        guard.clone()
+        Some(kik)
     }
 
     pub async fn get_can_ctrl_kik(&self) -> Vec<(String, Kik)> {
         let snapshot = self
-            .kik_map
+            .kiks
             .read()
             .await
             .iter()
@@ -354,9 +317,69 @@ impl Context {
     }
 
     pub async fn get_initialized_kik_by_id(&self, id: &str) -> Option<Kik> {
-        let read = self.kik_map.read().await;
+        let read = self.kiks.read().await;
         let kik = read.get(id);
 
         kik.filter(|kik| kik.initialized()).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::channel::ChannelType;
+    use std::io;
+
+    fn channel(id: &str, channel_type: ChannelType) -> SharedChannel {
+        let (_peer, stream) = tokio::io::duplex(64);
+        Arc::new(Mutex::new(Channel::new(
+            Box::pin(stream),
+            Some(id.to_string()),
+            channel_type,
+            Err(io::Error::new(io::ErrorKind::NotConnected, "test")),
+            Err(io::Error::new(io::ErrorKind::NotConnected, "test")),
+        )))
+    }
+
+    #[tokio::test]
+    async fn stale_ctrl_cleanup_cannot_remove_new_session() {
+        let context = Context::init();
+        let old = channel("old", ChannelType::Ctrl);
+        let new = channel("new", ChannelType::Ctrl);
+
+        context
+            .set_ctrl_conn_with_session(old.clone(), "old-session".to_string())
+            .await;
+        context
+            .set_ctrl_conn_with_session(new, "new-session".to_string())
+            .await;
+
+        assert!(!context.delete_ctrl_conn_if(&old).await);
+        assert!(
+            context
+                .validate_ctrl_data_session("new-session", "new-nonce")
+                .await
+        );
+        assert!(
+            !context
+                .validate_ctrl_data_session("old-session", "old-nonce")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn current_ctrl_cleanup_removes_session_and_data_channels() {
+        let context = Context::init();
+        let ctrl = channel("ctrl", ChannelType::Ctrl);
+        let data = channel("data", ChannelType::CtrlData);
+
+        context
+            .set_ctrl_conn_with_session(ctrl.clone(), "session".to_string())
+            .await;
+        assert!(context.insert_ctrl_data_conn(data).await);
+        assert!(context.delete_ctrl_conn_if(&ctrl).await);
+
+        assert!(context.find_ctrl_data().await.is_none());
+        assert!(!context.validate_ctrl_data_session("session", "nonce").await);
     }
 }

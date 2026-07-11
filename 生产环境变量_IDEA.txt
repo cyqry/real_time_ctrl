@@ -1,7 +1,39 @@
 生产环境变量（IDEA 分号分隔）
 
+一键生成完整生产参数（证书、私钥、随机 secret、API token、SPKI pin 和 IDEA 配置）：
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\generate_production_identity.ps1
+
+生成结果位于 target\prod。脚本默认拒绝覆盖已有身份；轮换时显式追加 -Force。
+IDEA 分号配置会生成到：
+- target\prod\env\idea_ctrl_server.txt
+- target\prod\env\idea_real_ctrl.txt
+PowerShell 可加载配置会生成到：
+- target\prod\env\ctrl_server.env.ps1
+- target\prod\env\real_ctrl.env.ps1
+- target\prod\env\production.env.ps1
+
+本机三进程启动方式（先完成 hardened 构建）：
+
+终端一，启动服务端：
+. .\target\prod\env\ctrl_server.env.ps1
+.\target\hardened\ctrl_server.exe
+
+终端二，启动被控端（不需要环境变量）：
+.\target\hardened\ctrl_kik.exe
+
+终端三，启动命名管道和 HTTP API：
+. .\target\prod\env\real_ctrl.env.ps1
+.\target\hardened\real_ctrl_invoker_http_service.exe
+
+如果只在一个终端做临时联调，可加载 production.env.ps1；生产服务应按进程分别加载，避免 ctrl_server 继承不需要的 API token。
+
+以下地址、端口和锁路径已有 build.rs 编译默认值，只有部署拓扑不同时才需要覆盖：
+CTRL_SERVER_BIND_HOST=0.0.0.0;CTRL_SERVER_PORT=9002;CTRL_SERVER_TLS_PORT=9443;REAL_CTRL_SERVER_HOST=localhost;REAL_CTRL_SERVER_PORT=9002;REAL_CTRL_TLS_PORT=9443;REAL_CTRL_TLS_SERVER_NAME=real-ctrl-server;REAL_CTRL_HTTP_LOCK_PATH=target/runtime/real_ctrl_invoker_http_service.lock
+
+下面示例仍列出完整值，便于 IDE 联调。认证 secret、证书路径和 SPKI pin 没有编译默认值，必须由部署身份材料提供。
+
 ctrl_server：
-CTRL_SERVER_BIND_HOST=127.0.0.1;CTRL_SERVER_PORT=9002;CTRL_SERVER_TLS_PORT=9443;CTRL_SERVER_TLS_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;CTRL_SERVER_TLS_KEY=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.key;CTRL_SERVER_AUTH_SECRET=<从部署秘密存储注入的至少32字符随机值>;RUST_BACKTRACE=1
+CTRL_SERVER_BIND_HOST=127.0.0.1;CTRL_SERVER_PORT=9002;CTRL_SERVER_TLS_PORT=9443;CTRL_SERVER_TLS_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;CTRL_SERVER_TLS_KEY=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.key;CTRL_SERVER_AUTH_SECRET=<从部署秘密存储注入的至少32字符随机值:ddddddd234222ee23e233e2e32e2e2e232e>;RUST_BACKTRACE=1
 
 real_ctrl / real_ctrl_invoker_http_service：
 REAL_CTRL_SERVER_HOST=127.0.0.1;REAL_CTRL_SERVER_PORT=9002;REAL_CTRL_TLS_PORT=9443;REAL_CTRL_TLS_SERVER_NAME=real-ctrl-server;REAL_CTRL_TLS_CA_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;REAL_CTRL_TLS_SERVER_SPKI_SHA256=<服务端叶子证书SPKI-SHA256十六进制>;REAL_CTRL_AUTH_SECRET=<与服务端一致的部署秘密>;REAL_CTRL_API_TOKEN=<至少32字符的独立随机API令牌>;RUST_BACKTRACE=1
@@ -10,6 +42,9 @@ REAL_CTRL_SERVER_HOST=127.0.0.1;REAL_CTRL_SERVER_PORT=9002;REAL_CTRL_TLS_PORT=94
 - ctrl_kik 不配置环境变量，继续使用编译期 HOST()/PORT()/LOCK_FILE_PATH()。
 - 控制面认证秘密不再写入 common/config.json 或二进制；生产应由 Windows 服务配置、CI/CD secret 或等价秘密存储注入，且不能与 HTTP token 复用。
 - 明文控制兼容需服务端和客户端分别显式设置 CTRL_SERVER_ALLOW_PLAIN_CTRL=1 / REAL_CTRL_ALLOW_PLAIN=1；生产禁止设置。
-- Exec 默认经过三层关闭：real_ctrl API、ctrl_server 策略和 ctrl_kik 构建。确需启用时分别配置 REAL_CTRL_API_ALLOW_EXEC=1、CTRL_SERVER_ALLOW_EXEC=1，并用 --features dangerous-exec 构建 ctrl_kik。
+- ctrl_kik 默认包含 Exec；开放 API 调用仍需分别配置 REAL_CTRL_API_ALLOW_EXEC=1、CTRL_SERVER_ALLOW_EXEC=1。
 - 以上证书是本仓库内生成的 127.0.0.1 本机部署证书；如果替换生产证书，必须同步替换 REAL_CTRL_TLS_CA_CERT 和 REAL_CTRL_TLS_SERVER_SPKI_SHA256。
+- 服务端不在本机时，生成时传入 -ServerAddress <服务端IP或域名>；证书 SAN 与 real_ctrl 连接地址会同步更新。
+- 私钥为无人值守服务可直接加载的无口令 PKCS#8 文件，依靠脚本设置的 Windows ACL 保护；部署到专用服务账户时需给该账户单独授予读取权限。
+- 不带 -Force 重复运行会拒绝覆盖。使用 -Force 会同时轮换 secret、API token、证书和 pin，所有相关进程必须一起重启。
 - real_ctrl HTTP 默认读取 config/app.toml，本项目当前默认绑定 127.0.0.1:9000。

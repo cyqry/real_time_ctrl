@@ -116,7 +116,7 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("数据连接在鉴权完成前断开"))?;
     match auth_response.get_resp() {
         Server(ServerResp::Success(ServerSuccessResp::Info(auth))) if auth == "##authtrue" => {
-            context.insert_ctrl_data_conn(channel_arc).await;
+            context.insert_ctrl_data_conn(channel_arc).await?;
             debug!("数据连接校验成功");
         }
         _ => return Err(anyhow::anyhow!("服务端返回了不支持的数据连接初始化响应")),
@@ -127,7 +127,7 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
 
 async fn handle_inactive(context: &Context, channel: Arc<Mutex<Channel>>) {
     channel.lock().await.try_write_half_close().await;
-    let channel_type = channel.clone().lock().await.channel_type.clone();
+    let channel_type = channel.lock().await.channel_type;
     if channel_type == ChannelType::CtrlData {
         context.delete_ctrl_data_conn(channel).await;
     }

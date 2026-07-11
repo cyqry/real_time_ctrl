@@ -94,7 +94,7 @@ async fn process_cmd(
             CtrlCommand::GetBigFile(src_path, dst_path),
             CmdOptions::default().with_timeout(false),
         ),
-        icc => (icc.into(), CmdOptions::default()),
+        icc => (CtrlCommand::try_from(icc)?, CmdOptions::default()),
     };
     Ok((cmd, cmd_options))
 }

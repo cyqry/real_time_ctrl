@@ -10,6 +10,7 @@
 
 ## 全局边界
 
+- `start`、`ctrl_kik/src/screen` 与 `screen_stream` 当前阶段均冻结，不做格式化、重构或行为修改。
 - `screen_stream` 当前阶段不改动。需要远程屏幕流安全接入时，只通过它已有的 `AsyncRead/AsyncWrite` 边界适配。
 - 生成或修改的项目文件必须留在本仓库内。Cargo 依赖、Rust 工具链缓存和全局依赖按系统默认路径处理。
 - 代码注释优先使用中文。注释只解释安全边界、协议约束、复杂状态机和维护风险，避免解释显而易见的语句。
@@ -53,12 +54,13 @@
 - 生产发布优先使用 `--profile hardened`，不要只依赖默认 debug/release。
 - `hardened` profile 用于符号剥离、fat LTO、单 codegen unit、panic abort；这只能提高逆向成本，不能替代协议安全和权限边界。
 - Windows 生产构建统一优先使用 `scripts/build_hardened.ps1`，由脚本额外启用 Control Flow Guard，并可选调用 `signtool` 完成 SHA-256 代码签名。
-- `Exec` 需要三层显式开启：`REAL_CTRL_API_ALLOW_EXEC=1`、`CTRL_SERVER_ALLOW_EXEC=1`、`ctrl_kik --features dangerous-exec`；缺少任一层都必须拒绝。
+- `ctrl_kik` 默认编译并执行 `Exec`，与其他远程命令使用同一分派路径；管理面仍由 `REAL_CTRL_API_ALLOW_EXEC=1` 和 `CTRL_SERVER_ALLOW_EXEC=1` 两层显式授权。
 
 ## 开放 API
 
 - `real_ctrl` 的 HTTP 与新版命名管道 API 必须共用稳定契约，不要让协议层直接绕过服务层。
 - 默认本地入口不能暴露公网地址；确需远程 HTTP 访问时必须显式配置 token 和原因。
+- 当前服务端协议只允许一个活动控制命令；HTTP 与管道必须共用同一个命令门禁，忙时返回稳定 `busy` 错误，不能并发消费数据响应。
 
 ## 端到端验收
 

@@ -3,12 +3,6 @@ name = "ctrl_kik"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-# 任意命令执行是高危能力，生产默认不编译；启用时服务端仍需单独授权。
-dangerous-exec = []
-
-
-
 [dependencies]
 common = { path = "../common" }
 tokio = { version = "1.26.0", features = ["full"] }

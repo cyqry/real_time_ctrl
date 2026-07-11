@@ -9,7 +9,7 @@ pub enum Dok {
     Err(ErrCode),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrCode {
     ReadError = 1,
     WriteError = 2,
@@ -52,7 +52,7 @@ impl BufSerializable for Dok {
                 buf.put_u8(1);
 
                 // 写入错误码
-                buf.put_u8((*err_code).clone() as u8);
+                buf.put_u8(*err_code as u8);
 
                 buf
             }

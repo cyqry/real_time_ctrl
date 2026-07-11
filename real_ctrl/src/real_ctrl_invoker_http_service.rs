@@ -6,7 +6,7 @@ use log::error;
 use real_ctrl::api_service::RealCtrlApi;
 use real_ctrl::http_service::routes;
 use real_ctrl::local_server::server::{create_context, server as run_pipe_server};
-use real_ctrl::run_util::single;
+use real_ctrl::run_util::{apply_log_filter, single};
 use spring::config::{ConfigRegistry, Configurable};
 use spring::plugin::MutableComponentRegistry;
 use spring::{auto_config, App};
@@ -28,6 +28,7 @@ impl Configurable for HttpExposureConfig {
 }
 
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
+const DEFAULT_HTTP_LOCK_PATH: &str = env!("REAL_CTRL_DEFAULT_HTTP_LOCK_PATH");
 
 #[auto_config(WebConfigurator)]
 #[tokio::main]
@@ -36,21 +37,20 @@ async fn main() -> Result<()> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "target/runtime/real_ctrl_invoker_http_service.lock".to_string());
+        .unwrap_or_else(|| DEFAULT_HTTP_LOCK_PATH.to_string());
     let _single_lock = single(lock_path).await?;
-    env::set_var("RUST_LOG", LOG_LEVEL);
-    env_logger::Builder::new()
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} [{}] - {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                record.level(),
-                record.args()
-            )
-        })
-        .parse_default_env()
-        .init();
+    let mut logger = env_logger::Builder::new();
+    logger.format(|buf, record| {
+        writeln!(
+            buf,
+            "{} [{}] - {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            record.level(),
+            record.args()
+        )
+    });
+    apply_log_filter(&mut logger, LOG_LEVEL);
+    logger.init();
 
     let context = create_context().await?;
     let pipe_context = context.clone();

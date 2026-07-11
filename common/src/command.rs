@@ -11,7 +11,6 @@ const MAX_HASH_BYTES: usize = 64;
 #[derive(Debug, Clone)]
 pub enum Command {
     Sys(SysCommand),
-    Local(LocalCommand),
     Ctrl(CtrlCommand),
     Exec(String),
 }
@@ -21,7 +20,6 @@ pub enum LocalCommand {
     LocalExit,
 }
 
-//todo 增加Any帧，则协议内容由双方协商，服务端不管
 #[derive(Debug, Clone)]
 pub enum CtrlCommand {
     GetFile(String, String),
@@ -32,7 +30,6 @@ pub enum CtrlCommand {
     Screen(String),
 }
 
-//todo Down kik
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SysCommand {
     List,
@@ -102,9 +99,6 @@ impl BufSerializable for Command {
             Command::Exec(e) => {
                 bytes_mut.put_u8(2);
                 bytes_mut.put_slice(e.as_bytes());
-            }
-            _ => {
-                panic!("不支持转buf的cmd");
             }
         };
         bytes_mut

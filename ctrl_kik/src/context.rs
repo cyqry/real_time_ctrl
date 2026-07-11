@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context as AnyhowContext};
 use bytes::{BufMut, BytesMut};
-use common::channel::Channel;
+use common::channel::{Channel, ChannelAttributeKey};
+use common::command::Command;
 use common::message::kik_frame::KikFrame;
 use common::protocol;
+use common::protocol::CmdOptions;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,6 +17,10 @@ use uuid::Uuid;
 const DATA_QUEUE_CAPACITY: usize = 8;
 const DATA_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const DATA_READ_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+
+pub(crate) type CommandMessage = (String, CmdOptions, Command);
+pub(crate) const COMMAND_SENDER: ChannelAttributeKey<Sender<CommandMessage>> =
+    ChannelAttributeKey::new("command_sender");
 
 #[derive(Clone)]
 pub struct Context {
@@ -45,13 +51,14 @@ impl Kik {
         }
     }
 
-    pub async fn insert_data_conn(&self, data_chan: Arc<Mutex<Channel>>) {
-        let id = data_chan.lock().await.get_id().to_string();
+    pub async fn insert_data_conn(&self, data_chan: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
+        let id = data_chan.lock().await.require_id()?.to_string();
         self.data_conns.lock().await.insert(id, data_chan);
+        Ok(())
     }
 
     pub async fn delete_data_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
-        let id = conn.lock().await.get_id().to_string();
+        let id = conn.lock().await.id().map(str::to_owned)?;
         self.data_conns.lock().await.remove(&id)
     }
 
@@ -144,7 +151,7 @@ impl Context {
             .await
             .clone()
             .ok_or_else(|| anyhow!("命令通道尚未初始化"))?;
-        kik.insert_data_conn(conn).await;
+        kik.insert_data_conn(conn).await?;
         Ok(())
     }
 

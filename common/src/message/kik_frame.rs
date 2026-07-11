@@ -15,7 +15,6 @@ pub enum KikFrame {
 
     Data(String, BytesMut), //数据传输的data帧
 
-    //todo 增加ping pong负载，如果存在负载则需响应，用于探活
     Ping,
     Pong,
 }
