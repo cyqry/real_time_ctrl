@@ -1,4 +1,4 @@
-use crate::command::{Command, CtrlCommand};
+use crate::command::Command;
 use crate::message::kik_frame::KikFrame;
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,9 @@ pub trait BufSerializable {
     where
         Self: Sized;
 }
+
+pub const MAX_CORRELATION_ID_BYTES: usize = 128;
+const MAX_COMMAND_OPTIONS_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CmdOptions {
@@ -66,12 +69,12 @@ impl ReqCmd {
 
 impl BufSerializable for ReqCmd {
     fn to_buf(&self) -> BytesMut {
-        let id_len = self.id.as_bytes().len();
+        let id_len = self.id.len();
         let mut bytes_mut = BytesMut::with_capacity(id_len);
         bytes_mut.put_u32(id_len as u32);
         bytes_mut.put_slice(self.id.as_bytes());
         let cop_json = serde_json::to_string(&self.cmd_options).unwrap();
-        let json_len = cop_json.as_bytes().len();
+        let json_len = cop_json.len();
         bytes_mut.put_u32(json_len as u32);
         bytes_mut.put_slice(cop_json.as_bytes());
         bytes_mut.put(self.cmd.to_buf());
@@ -86,7 +89,8 @@ impl BufSerializable for ReqCmd {
             return None;
         }
         let id_len = bys.get_u32();
-        if bys.len() < id_len as usize {
+        if id_len == 0 || id_len as usize > MAX_CORRELATION_ID_BYTES || bys.len() < id_len as usize
+        {
             return None;
         }
         let id = String::from_utf8(bys.split_to(id_len as usize).to_vec()).ok()?;
@@ -94,7 +98,10 @@ impl BufSerializable for ReqCmd {
             return None;
         }
         let json_len = bys.get_u32();
-        if bys.len() < json_len as usize {
+        if json_len == 0
+            || json_len as usize > MAX_COMMAND_OPTIONS_BYTES
+            || bys.len() < json_len as usize
+        {
             return None;
         }
         let cmd_options = serde_json::from_str::<CmdOptions>(
@@ -112,9 +119,6 @@ impl BufSerializable for ReqCmd {
     }
 }
 
-
-
-
 //对应 ltc解码器 data长度 data内容的格式
 pub fn transfer_encode(bts: BytesMut) -> BytesMut {
     if bts.len() > u32::MAX as usize {
@@ -131,13 +135,11 @@ pub fn transfer_b_encode(bts: &[u8], start: usize, end: usize) -> BytesMut {
     if len > u32::MAX as usize {
         panic!("要传输的数据太大")
     }
-    let mut bytes_mut = BytesMut::with_capacity((len + 4));
+    let mut bytes_mut = BytesMut::with_capacity(len + 4);
     bytes_mut.put_slice(&(len as u32).to_be_bytes());
     bytes_mut.put_slice(&bts[start..end]);
     bytes_mut
 }
-
-
 
 pub fn transfer_encode_frame(frame: impl BufSerializable) -> BytesMut {
     let bytes_mut = frame.to_buf();
@@ -148,13 +150,13 @@ pub fn kik_ping() -> BytesMut {
     transfer_encode_frame(KikFrame::Ping)
 }
 
-
 pub fn kik_pong() -> BytesMut {
     transfer_encode_frame(KikFrame::Pong)
 }
 
 #[test]
 pub fn test() {
+    use crate::command::CtrlCommand;
     println!(
         "{:?}",
         ReqCmd::from_buf(

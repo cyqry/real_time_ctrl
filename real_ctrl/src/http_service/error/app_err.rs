@@ -27,10 +27,13 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => {
                 (StatusCode::UNAUTHORIZED, ApiErrorBody::unauthorized(msg))
             }
-            AppError::Internal(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiErrorBody::internal(err.to_string()),
-            ),
+            AppError::Internal(err) => {
+                log::error!("HTTP API 内部错误: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiErrorBody::internal("内部服务错误"),
+                )
+            }
         };
 
         let body = Json(json!({

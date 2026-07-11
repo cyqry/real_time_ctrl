@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use common::message::kik_resp::KikResp;
-use common::protocol::BufSerializable;
+use common::protocol::{BufSerializable, MAX_CORRELATION_ID_BYTES};
 
 #[derive(Debug, Clone)]
 pub enum Resp {
@@ -91,7 +91,7 @@ impl BufSerializable for ServerResp {
         match code {
             0 => Some(ServerResp::Success(ServerSuccessResp::from_buf(bys)?)),
             1 => {
-                if bys.len() < 1 {
+                if bys.is_empty() {
                     return None;
                 }
                 let err_code = bys.get_u8();
@@ -136,7 +136,7 @@ impl BufSerializable for Resp {
 
 impl BufSerializable for CmdResp {
     fn to_buf(&self) -> BytesMut {
-        let id_len = self.cmd_id.as_bytes().len();
+        let id_len = self.cmd_id.len();
         let mut bytes_mut = BytesMut::with_capacity(id_len);
         bytes_mut.put_u32(id_len as u32);
         bytes_mut.put_slice(self.cmd_id.as_bytes());
@@ -149,7 +149,8 @@ impl BufSerializable for CmdResp {
             return None;
         }
         let id_len = bys.get_u32();
-        if bys.len() < id_len as usize {
+        if id_len == 0 || id_len as usize > MAX_CORRELATION_ID_BYTES || bys.len() < id_len as usize
+        {
             return None;
         }
         let cmd_id = String::from_utf8(bys.split_to(id_len as usize).to_vec()).ok()?;

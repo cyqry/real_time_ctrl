@@ -1,6 +1,6 @@
-use crate::protocol::{BufSerializable};
-use bytes::{Buf, BufMut, BytesMut};
 use crate::protocol;
+use crate::protocol::BufSerializable;
+use bytes::{Buf, BufMut, BytesMut};
 #[derive(Clone, Debug)]
 pub enum KikResp {
     Success(ClientSuccessResp),
@@ -18,9 +18,9 @@ impl BufSerializable for ClientSuccessResp {
         let mut bytes = BytesMut::new();
         match self {
             ClientSuccessResp::Info(s) => {
-                bytes.put_u8(0);                     // 变体标识
-                bytes.put_u32(s.len() as u32);       // 字符串长度前缀
-                bytes.put_slice(s.as_bytes());       // 内容
+                bytes.put_u8(0); // 变体标识
+                bytes.put_u32(s.len() as u32); // 字符串长度前缀
+                bytes.put_slice(s.as_bytes()); // 内容
             }
             ClientSuccessResp::DataId(id) => {
                 bytes.put_u8(1);
@@ -43,7 +43,7 @@ impl BufSerializable for ClientSuccessResp {
                     return None;
                 }
                 let len = buf.get_u32() as usize;
-                if buf.remaining() < len {
+                if len > crate::ltc_codec::CONTROL_MAX_FRAME_LENGTH || buf.remaining() != len {
                     return None;
                 }
                 // 只取出指定长度的字节，避免复制全部剩余数据
@@ -57,7 +57,7 @@ impl BufSerializable for ClientSuccessResp {
                     return None;
                 }
                 let len = buf.get_u32() as usize;
-                if buf.remaining() < len {
+                if len == 0 || len > 128 || buf.remaining() != len {
                     return None;
                 }
                 // 只取出指定长度的字节，避免复制全部剩余数据
@@ -106,7 +106,7 @@ impl BufSerializable for KikResp {
                 }
                 let err_code = buf.get_u8();
                 let len = buf.get_u32() as usize;
-                if buf.remaining() < len {
+                if len > 64 * 1024 || buf.remaining() != len {
                     return None;
                 }
                 let data = buf.split_to(len);
@@ -118,16 +118,13 @@ impl BufSerializable for KikResp {
     }
 }
 
-
 pub fn kik_success_info(info: String) -> KikResp {
     KikResp::Success(ClientSuccessResp::Info(info))
 }
 
-
 pub fn kik_success_data_id(id: String) -> KikResp {
     KikResp::Success(ClientSuccessResp::DataId(id))
 }
-
 
 pub fn kik_error(message: String) -> KikResp {
     KikResp::Error(protocol::ErrCode::EXCEPTION as u8, message)

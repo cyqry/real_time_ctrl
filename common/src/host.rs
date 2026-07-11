@@ -58,8 +58,8 @@ fn resolve_configured_host(host: String) -> String {
         return host;
     }
     resolve_domain(host.as_str())
-        .unwrap_or(vec![])
-        .get(0)
+        .unwrap_or_default()
+        .first()
         .map(|ip| ip.to_string())
         .unwrap_or(host)
 }
@@ -88,38 +88,9 @@ fn get_cache() -> &'static DnsCache {
 
 #[tokio::test]
 async fn test() -> Result<(), Box<dyn std::error::Error>> {
-    // 测试解析几个域名
-    let test_domains = ["google.com", "github.com", "rust-lang.org", "example.com"];
-
-    for domain in test_domains {
-        match resolve_domain(domain) {
-            Ok(ips) => {
-                println!("{} 解析结果: {}个IP", domain, ips.len());
-                for (i, ip) in ips.iter().enumerate() {
-                    println!("  {}. {}", i + 1, ip);
-                }
-            }
-            Err(e) => println!("解析 {} 失败: {}", domain, e),
-        }
-        println!("---");
-    }
-
-    // 测试缓存效果
-    println!("\n=== 测试缓存 ===");
-    for _ in 0..3 {
-        let start = std::time::Instant::now();
-        let result = resolve_domain("google.com");
-        let duration = start.elapsed();
-
-        match result {
-            Ok(ips) => println!(
-                "google.com -> {:?} (耗时: {:?})",
-                ips.get(0).unwrap_or(&"127.0.0.1".parse()?),
-                duration
-            ),
-            Err(e) => println!("错误: {} (耗时: {:?})", e, duration),
-        }
-    }
-
+    let first = resolve_domain("localhost")?;
+    let second = resolve_domain("localhost")?;
+    assert!(!first.is_empty());
+    assert_eq!(first, second);
     Ok(())
 }

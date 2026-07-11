@@ -1,6 +1,5 @@
 use crate::context::Context;
 use common::command::LocalCommand;
-use common::global_const::LOCAL_PREFIX;
 
 pub async fn execute(context: &Context, cmd: LocalCommand) -> anyhow::Result<String> {
     match cmd {

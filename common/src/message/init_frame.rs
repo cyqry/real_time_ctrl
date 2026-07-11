@@ -2,6 +2,8 @@ use crate::kik_info::KikInfo;
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 
+const MAX_AUTH_FIELD_BYTES: usize = 256;
+
 #[derive(Debug, Clone)]
 pub enum InitFrame {
     CtrlAuthReply(bool),
@@ -78,15 +80,23 @@ impl BufSerializable for InitFrame {
 
         match code {
             0 => Some(InitFrame::CtrlAuthReply(read_bool(&mut bys)?)),
-            1 => Some(InitFrame::CtrlAuthReq(read_remaining_string(bys)?)),
-            2 => Some(InitFrame::CtrlDataConnReq(read_remaining_string(bys)?)),
+            1 => Some(InitFrame::CtrlAuthReq(read_remaining_string(
+                bys, 256, true,
+            )?)),
+            2 => Some(InitFrame::CtrlDataConnReq(read_remaining_string(
+                bys, 256, true,
+            )?)),
             3 => Some(InitFrame::CtrlDataConnAuthReply(read_bool(&mut bys)?)),
             4 => Some(InitFrame::KikReq(KikInfo::from_buf(bys)?)),
-            5 => Some(InitFrame::KikId(read_remaining_string(bys)?)),
-            6 => Some(InitFrame::KikDataConnReq(read_remaining_string(bys)?)),
+            5 => Some(InitFrame::KikId(read_remaining_string(bys, 128, false)?)),
+            6 => Some(InitFrame::KikDataConnReq(read_remaining_string(
+                bys, 128, false,
+            )?)),
             7 => Some(InitFrame::KikDataConn(read_bool(&mut bys)?)),
             8 => Some(InitFrame::CtrlAuthStart(read_exact_one_string(&mut bys)?)),
-            9 => Some(InitFrame::CtrlAuthChallenge(read_exact_one_string(&mut bys)?)),
+            9 => Some(InitFrame::CtrlAuthChallenge(read_exact_one_string(
+                &mut bys,
+            )?)),
             10 => {
                 let client_nonce = read_one_string(&mut bys)?;
                 let proof = read_one_string(&mut bys)?;
@@ -161,7 +171,10 @@ fn read_bool(buf: &mut BytesMut) -> Option<bool> {
     Some(buf.get_u8() == 1)
 }
 
-fn read_remaining_string(mut buf: BytesMut) -> Option<String> {
+fn read_remaining_string(mut buf: BytesMut, max_bytes: usize, allow_empty: bool) -> Option<String> {
+    if (!allow_empty && buf.is_empty()) || buf.len() > max_bytes {
+        return None;
+    }
     String::from_utf8(buf.split_to(buf.remaining()).to_vec()).ok()
 }
 
@@ -170,7 +183,7 @@ fn read_one_string(buf: &mut BytesMut) -> Option<String> {
         return None;
     }
     let len = buf.get_u32() as usize;
-    if buf.remaining() < len {
+    if len > MAX_AUTH_FIELD_BYTES || buf.remaining() < len {
         return None;
     }
     String::from_utf8(buf.split_to(len).to_vec()).ok()

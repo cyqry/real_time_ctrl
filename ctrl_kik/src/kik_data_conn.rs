@@ -1,46 +1,52 @@
 use crate::context::Context;
-use crate::{cmd_util, read_handle};
+use crate::read_handle;
 use anyhow::{anyhow, Error};
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
-use common::kik_info::KikInfo;
-use common::ltc_codec::{LengthFieldBasedFrameDecoder, DATA_MAX_FRAME_LENGTH};
-use common::message::init_frame;
+use common::ltc_codec::{
+    LengthFieldBasedFrameDecoder, DATA_MAX_FRAME_LENGTH, INIT_MAX_FRAME_LENGTH,
+};
 use common::message::init_frame::InitFrame;
 use common::protocol;
-use common::protocol::BufSerializable;
 use log::debug;
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::BufReader;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time;
 use tokio::time::timeout;
-use tokio::{join, time};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use uuid::Uuid;
 
 pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
-    let socket =
-        TcpStream::connect(format!("{}:{}", config.server_host, config.server_port)).await?;
+    let endpoint = format!("{}:{}", config.server_host, config.server_port);
+    let socket = timeout(config.read_timeout, TcpStream::connect(&endpoint))
+        .await
+        .map_err(|_| anyhow!("连接服务端数据端口超时"))??;
+    socket.set_nodelay(true)?;
     let (reader, writer) = socket.into_split();
     // Kik 数据通道承载截图和文件内容，先保留兼容旧路径的大帧上限。
     let framed_read = FramedRead::new(
         BufReader::new(reader),
-        LengthFieldBasedFrameDecoder::new_with_max_frame_len(DATA_MAX_FRAME_LENGTH),
+        LengthFieldBasedFrameDecoder::new_with_max_frame_len(INIT_MAX_FRAME_LENGTH),
     );
-    let mut framed_arc = Arc::new(Mutex::new(framed_read));
+    let framed_arc = Arc::new(Mutex::new(framed_read));
 
     let channel_arc = Arc::new(Mutex::new(Channel::from_tcp_writer(
         writer,
         None,
         ChannelType::Unknown,
     )));
+    channel_arc
+        .lock()
+        .await
+        .set_write_timeout(config.write_timeout);
 
     //active逻辑
     let channel = channel_arc.clone();
@@ -50,6 +56,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
     let (mut tx, mut rx) = mpsc::channel::<Box<dyn Any + Send + Sync>>(5);
 
     let context_clone = context.clone();
+    let read_timeout = config.read_timeout;
     let handle = tokio::spawn(async move {
         let context = context_clone;
         //心跳逻辑
@@ -62,7 +69,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
             // 读锁只包住 next().await，避免 match 臂内处理逻辑被临时锁生命周期拖住。
             let read_result = {
                 let mut framed = framed_arc.lock().await;
-                timeout(Duration::from_secs(45), framed.next()).await
+                timeout(read_timeout, framed.next()).await
             };
 
             match read_result {
@@ -72,13 +79,18 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
                         Some(Ok(msg)) => {
                             //read逻辑
                             let channel = channel.clone();
-                            match handle_read(&context, channel, msg, &mut tx).await {
-                                Err(e) => {
-                                    //说明处理读的过程中产生了错误，那么不在管这个连接
-                                    break Some(e);
-                                }
-                                Ok(_) => {}
-                            };
+                            if let Err(error) =
+                                handle_read(&context, channel.clone(), msg, &mut tx).await
+                            {
+                                break Some(error);
+                            }
+                            if channel.lock().await.channel_type == ChannelType::KikData {
+                                framed_arc
+                                    .lock()
+                                    .await
+                                    .decoder_mut()
+                                    .set_max_frame_len(DATA_MAX_FRAME_LENGTH);
+                            }
                             continue;
                         }
                         Some(Err(e)) => {
@@ -94,25 +106,25 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
                 }
                 Err(e) => {
                     println!("超时未读断开");
-                    match channel.clone().lock().await.write_half_close().await {
-                        Ok(_) => {}
-                        Err(_) => {}
-                    };
+                    let _ = channel.clone().lock().await.write_half_close().await;
                     break Some(anyhow::Error::new(e));
                 }
             };
         };
 
-        if e.is_some() {
+        if let Some(error) = e {
             let chan = channel.clone();
-            handle_error(chan, e.unwrap()).await;
+            handle_error(chan, error).await;
         }
 
         handle_inactive(&context, channel).await;
     });
 
     //这次为第一次rx接收数据,用于阻塞校验
-    match rx.recv().await {
+    match timeout(config.read_timeout, rx.recv())
+        .await
+        .map_err(|_| anyhow!("等待数据连接初始化响应超时"))?
+    {
         None => {
             return Err(anyhow!("发送端关闭，连接结束"));
         }
@@ -127,11 +139,9 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
                         guard.set_id(Uuid::new_v4().to_string());
                         guard.channel_type = ChannelType::KikData;
                     }
-                    context.insert_data_conn(channel_arc.clone()).await;
+                    context.insert_data_conn(channel_arc.clone()).await?;
                 }
-                _ => {
-                    panic!("不可能出现！系统错误");
-                }
+                _ => return Err(anyhow!("服务端返回了错误的数据连接初始化响应")),
             };
         }
     };
@@ -159,7 +169,12 @@ async fn hearbeat(channel: Arc<Mutex<Channel>>) {
 }
 
 async fn handle_active(context: &Context, channel: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
-    let id = context.id.clone().lock().await.as_ref().unwrap().clone();
+    let id = context
+        .id
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow!("命令连接尚未取得 kik id"))?;
     channel
         .clone()
         .lock()
@@ -175,7 +190,7 @@ async fn handle_inactive(context: &Context, c: Arc<Mutex<Channel>>) {
     context.delete_data_conn(c).await;
 }
 
-async fn handle_error(p0: Arc<Mutex<Channel>>, e: Error) {
+async fn handle_error(_channel: Arc<Mutex<Channel>>, e: Error) {
     debug!("handle_error:{}", e);
 }
 
@@ -189,10 +204,10 @@ async fn handle_read(
     match channel_type {
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => {
-            read_handle::handle_init_message(context, channel, msg, auth_tx).await
+            read_handle::handle_init_message(context, channel.clone(), msg, auth_tx).await?;
+            channel.lock().await.channel_type = ChannelType::KikData;
+            Ok(())
         }
-        _ => {
-            unreachable!("不会这样")
-        }
+        _ => Err(anyhow!("数据连接状态与帧类型不匹配")),
     }
 }

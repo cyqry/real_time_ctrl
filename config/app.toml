@@ -12,6 +12,17 @@ allow_methods = ["GET", "POST", "OPTIONS"]
 allow_headers = ["Content-Type", "Authorization", "X-Real-Ctrl-Token"]
 max_age = 3600
 
+[web.middlewares.limit_payload]
+enable = true
+body_limit = "1mb"
+
+[web.middlewares.timeout_request]
+enable = true
+timeout = 370000
+
+[web.middlewares.catch_panic]
+enable = true
+
 [custom]
 app_name = "real_ctrl"
 version = "0.1.0"

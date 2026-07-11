@@ -180,3 +180,12 @@ cargo build -p ctrl_kik --profile hardened
 - 不要让 HTTP handler 直接拼内部命令并绕过 `RealCtrlApi`。
 - 不要默认开启 `Exec`；如果必须开放，要显式设置 `REAL_CTRL_API_ALLOW_EXEC=1` 并记录调用方。
 - 不要把 `config/app.toml` 默认绑定改回 `0.0.0.0`。
+
+## 生产收敛补充（2026-07-11）
+
+- 新增 `real_ctrl/src/lib.rs` 作为三个 bin 的统一组合根，API、连接、策略和协议适配不再重复编译三份。
+- HTTP 非 loopback 绑定在启动阶段强制要求至少 32 字符 token；配置文件缺失会失败，不会使用框架 `0.0.0.0` 默认值。
+- HTTP 增加 1 MiB body limit、370 秒请求 timeout、panic 捕获和 48 MiB API 二进制响应上限。
+- pipe 增加 30 秒读写超时、16 连接并发上限；锁文件与 pipe 锁获取均改为 fail-closed。
+- API 字段新增 request id、kik id、路径、Exec 命令最大长度和 NUL 拒绝；内部错误详情只记录日志，对外返回稳定通用错误。
+- Exec 形成 API、ctrl_server、ctrl_kik build feature 三层显式授权。

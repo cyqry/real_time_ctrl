@@ -2,16 +2,11 @@ use crate::context::{id, Context};
 use crate::input_command::{RemoteResp, RemoteSuccessResp};
 use common::command::{Command, SysCommand};
 use common::protocol::{CmdOptions, ReqCmd};
-use ctrl_common::ctrl_resp::{CmdResp, Resp, ServerResp, ServerSuccessResp};
-use rustyline::Cmd;
-use serde_json::to_string;
+use ctrl_common::ctrl_resp::{Resp, ServerResp, ServerSuccessResp};
 
 pub async fn execute(context: &Context, cmd: SysCommand) -> anyhow::Result<RemoteResp> {
     match context
-        .agent
-        .write()
-        .await
-        .req(&ReqCmd::new(
+        .request(&ReqCmd::new(
             id(),
             CmdOptions::default(),
             Command::Sys(cmd.clone()),
@@ -23,11 +18,9 @@ pub async fn execute(context: &Context, cmd: SysCommand) -> anyhow::Result<Remot
             Ok(RemoteResp::Success(to_remote_resp(cmd, info)?))
         }
         Resp::Server(ServerResp::Error(err_code, info)) => {
-            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+            Ok(RemoteResp::Error(*err_code as u32, info.to_string()))
         }
-        _ => {
-            unreachable!("should not happen")
-        }
+        _ => Err(anyhow::anyhow!("服务端响应类型与系统命令不匹配")),
     }
 }
 

@@ -1,4 +1,4 @@
-use std::time::{Instant, Duration};
+use std::time::Instant;
 
 pub struct Timer {
     start: Instant,
@@ -22,6 +22,12 @@ impl Timer {
 
     pub fn reset(&mut self) {
         self.start = Instant::now();
+    }
+}
+
+impl Default for Timer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

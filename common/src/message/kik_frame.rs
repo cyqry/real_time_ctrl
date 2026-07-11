@@ -1,11 +1,10 @@
 use crate::command::Command;
-use crate::kik_info::KikInfo;
 use crate::message::kik_frame::KikFrame::*;
-use crate::message::kik_resp::{ClientSuccessResp, KikResp};
+use crate::message::kik_resp::KikResp;
 use crate::protocol::{BufSerializable, ReqCmd};
 use bytes::{Buf, BufMut, BytesMut};
-use log::debug;
-use std::io::Read;
+
+const MAX_DATA_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum KikFrame {
@@ -83,10 +82,13 @@ impl BufSerializable for KikFrame {
                     return None;
                 }
                 let len = bys.get_u32();
-                if bys.remaining() < len as usize {
+                if len == 0 || len as usize > 64 * 1024 || bys.remaining() < len as usize {
                     return None;
                 }
                 let cmd = Command::from_buf(bys.split_to(len as usize))?;
+                if bys.is_empty() || bys.len() > MAX_DATA_ID_BYTES {
+                    return None;
+                }
                 Some(CmdExtra(cmd, String::from_utf8(bys.to_vec()).ok()?))
             }
             13 => {
@@ -94,10 +96,16 @@ impl BufSerializable for KikFrame {
                     return None;
                 }
                 let len = bys.get_u32();
-                if bys.remaining() < len as usize {
+                if len == 0
+                    || len as usize > crate::ltc_codec::CONTROL_MAX_FRAME_LENGTH
+                    || bys.remaining() < len as usize
+                {
                     return None;
                 }
                 let resp = KikResp::from_buf(bys.split_to(len as usize))?;
+                if bys.is_empty() || bys.len() > MAX_DATA_ID_BYTES {
+                    return None;
+                }
                 Some(RespExtra(resp, String::from_utf8(bys.to_vec()).ok()?))
             }
             12 => {
@@ -105,15 +113,18 @@ impl BufSerializable for KikFrame {
                     return None;
                 }
                 let id_len = bys.get_u32();
-                if bys.remaining() < id_len as usize {
+                if id_len == 0
+                    || id_len as usize > MAX_DATA_ID_BYTES
+                    || bys.remaining() < id_len as usize
+                {
                     return None;
                 }
                 let id = String::from_utf8(bys.split_to(id_len as usize).to_vec()).ok()?;
                 Some(Data(id, bys))
             }
             11 => Some(Cmd(ReqCmd::from_buf(bys)?)),
-            1 => Some(Ping),
-            0 => Some(Pong),
+            1 if bys.is_empty() => Some(Ping),
+            0 if bys.is_empty() => Some(Pong),
             _ => None,
         }
     }
@@ -121,6 +132,7 @@ impl BufSerializable for KikFrame {
 
 #[test]
 fn test() {
+    use crate::message::kik_resp::ClientSuccessResp;
     let bytes_mut = KikFrame::RespExtra(
         KikResp::Success(ClientSuccessResp::Info("草了".to_string())),
         "werwrwrwerwrweerwr".to_string(),

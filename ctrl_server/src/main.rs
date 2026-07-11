@@ -1,10 +1,8 @@
 use common::config::{Config, Id, SecurityConfig};
-use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
 use core::context::Context;
 use core::server;
-use log::{debug, error, info, warn};
+use std::env;
 use std::time::Duration;
-use std::{env, panic, thread};
 
 mod core;
 mod handler;
@@ -14,7 +12,7 @@ mod logger;
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let bind_host = env::var("CTRL_SERVER_BIND_HOST")
         .ok()
         .map(|v| v.trim().to_string())
@@ -34,9 +32,8 @@ async fn main() {
     let config = logger::LogConfig {
         dir: std::path::PathBuf::from("./logs"),
         prefix: "ctrl_server".to_string(),
-        ..Default::default()
     };
-    logger::init_logging_with_config(config).unwrap();
+    logger::init_logging_with_config(config)?;
     color_backtrace::install();
     // 进程级别钩子
     // panic::set_hook(Box::new(|panic_info| {
@@ -45,13 +42,10 @@ async fn main() {
     //     error!("panic_info:{:?}", panic_info);
     //
     // }));
-    match server::run(
+    server::run(
         Context::init(),
         Config {
-            id: Id {
-                username: USER_NAME(),
-                password: PASSWORD(),
-            },
+            id: Id::control_plane_from_env("CTRL_SERVER_AUTH_SECRET")?,
             server_host: bind_host,
             server_port,
             read_timeout: Duration::from_secs(45),
@@ -59,38 +53,6 @@ async fn main() {
             security: SecurityConfig::ctrl_server_from_env(),
         },
     )
-    .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            error!("服务停止!{}", e);
-        }
-    };
-}
-
-#[tokio::test]
-async fn tets() {
-    let data: Vec<(Option<String>, bool, u64, Option<String>, Option<String>)> = vec![
-        (
-            Some("file1.txt".to_string()),
-            true,
-            1024,
-            Some("2021-01-01".to_string()),
-            Some("2021-01-02".to_string()),
-        ),
-        (
-            Some("file2_with_long_name.txt".to_string()),
-            false,
-            2048,
-            None,
-            Some("2021-01-03".to_string()),
-        ),
-        (
-            None,
-            false,
-            4096,
-            Some("2021-01-04".to_string()),
-            Some("2021-01-05".to_string()),
-        ),
-    ];
+    .await?;
+    Ok(())
 }

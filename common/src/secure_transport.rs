@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -27,7 +28,10 @@ pub async fn connect_real_ctrl(config: &Config) -> anyhow::Result<TransportParts
     match config.security.client_mode {
         ClientTransportMode::Plain => {
             let endpoint = format!("{}:{}", config.server_host, config.server_port);
-            let stream = TcpStream::connect(endpoint).await?;
+            let stream = timeout(config.read_timeout, TcpStream::connect(&endpoint))
+                .await
+                .with_context(|| format!("连接明文兼容端口超时: {endpoint}"))??;
+            stream.set_nodelay(true)?;
             Ok(split_stream(stream))
         }
         ClientTransportMode::PinnedTls => connect_pinned_tls(config).await,
@@ -61,10 +65,14 @@ pub fn build_server_tls_acceptor(security: &SecurityConfig) -> anyhow::Result<Op
 pub async fn accept_tls(
     acceptor: TlsAcceptor,
     stream: TcpStream,
+    handshake_timeout: std::time::Duration,
 ) -> anyhow::Result<TransportParts> {
     let local_addr = stream.local_addr();
     let peer_addr = stream.peer_addr();
-    let tls_stream = acceptor.accept(stream).await?;
+    stream.set_nodelay(true)?;
+    let tls_stream = timeout(handshake_timeout, acceptor.accept(stream))
+        .await
+        .context("TLS 握手超时")??;
     let (reader, writer) = tokio::io::split(tls_stream);
 
     Ok(TransportParts {
@@ -97,8 +105,8 @@ pub fn normalize_sha256_pin(pin: &str) -> String {
 }
 
 pub fn certificate_spki_sha256_hex(cert_der: &[u8]) -> anyhow::Result<String> {
-    let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| anyhow!("解析服务端证书失败: {e}"))?;
+    let (_, cert) =
+        X509Certificate::from_der(cert_der).map_err(|e| anyhow!("解析服务端证书失败: {e}"))?;
     let spki_der = cert.tbs_certificate.subject_pki.raw;
     let digest = Sha256::digest(spki_der);
     Ok(hex::encode(digest))
@@ -118,6 +126,7 @@ async fn connect_pinned_tls(config: &Config) -> anyhow::Result<TransportParts> {
         .pinned_spki_sha256
         .as_deref()
         .ok_or_else(|| anyhow!("REAL_CTRL_TLS_SERVER_SPKI_SHA256 未配置，拒绝启动强安全连接"))?;
+    validate_sha256_pin(expected_pin)?;
     let ca_cert_path = config
         .security
         .ca_cert_path
@@ -125,7 +134,10 @@ async fn connect_pinned_tls(config: &Config) -> anyhow::Result<TransportParts> {
         .ok_or_else(|| anyhow!("REAL_CTRL_TLS_CA_CERT 未配置，拒绝启动强安全连接"))?;
 
     let endpoint = format!("{}:{}", config.server_host, config.security.tls_port);
-    let stream = TcpStream::connect(endpoint).await?;
+    let stream = timeout(config.read_timeout, TcpStream::connect(&endpoint))
+        .await
+        .with_context(|| format!("连接 TLS 管理端口超时: {endpoint}"))??;
+    stream.set_nodelay(true)?;
     let local_addr = stream.local_addr();
     let peer_addr = stream.peer_addr();
 
@@ -142,7 +154,9 @@ async fn connect_pinned_tls(config: &Config) -> anyhow::Result<TransportParts> {
     let connector = TlsConnector::from(Arc::new(client_config));
     let server_name = ServerName::try_from(config.security.tls_server_name.clone())
         .map_err(|_| anyhow!("REAL_CTRL_TLS_SERVER_NAME 不是合法 DNS 名称"))?;
-    let tls_stream = connector.connect(server_name, stream).await?;
+    let tls_stream = timeout(config.read_timeout, connector.connect(server_name, stream))
+        .await
+        .context("TLS 握手超时")??;
 
     let (_, session) = tls_stream.get_ref();
     let peer_certs = session
@@ -176,6 +190,16 @@ fn verify_spki_pin(cert: &CertificateDer<'_>, expected_pin: &str) -> anyhow::Res
     Ok(())
 }
 
+fn validate_sha256_pin(pin: &str) -> anyhow::Result<()> {
+    let normalized = normalize_sha256_pin(pin);
+    if normalized.len() != 64 || !normalized.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "REAL_CTRL_TLS_SERVER_SPKI_SHA256 必须是 64 位十六进制 SHA-256"
+        ));
+    }
+    Ok(())
+}
+
 fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path).with_context(|| format!("打开证书文件失败: {path}"))?;
     let mut reader = BufReader::new(file);
@@ -206,6 +230,9 @@ mod tests {
             normalize_sha256_pin("SHA256:AA:bb:00"),
             "aabb00".to_string()
         );
-        assert_eq!(normalize_sha256_pin(" sha256:aabb00 "), "aabb00".to_string());
+        assert_eq!(
+            normalize_sha256_pin(" sha256:aabb00 "),
+            "aabb00".to_string()
+        );
     }
 }

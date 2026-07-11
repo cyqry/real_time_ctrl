@@ -1,12 +1,10 @@
 use crate::cmd_runner;
 use crate::context::Context;
 use bytes::BytesMut;
-use common::channel::{Channel, ChannelType};
-use common::command::{Command, SysCommand};
-use common::config::Config;
+use common::channel::Channel;
+use common::command::Command;
 use common::message::init_frame::InitFrame;
 use common::message::kik_frame::KikFrame;
-use common::message::kik_resp;
 use common::message::kik_resp::kik_error;
 use common::protocol;
 use common::protocol::{BufSerializable, CmdOptions};
@@ -14,10 +12,8 @@ use log::debug;
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{mpsc, Mutex};
-use tokio::time;
-use tokio::time::error::Elapsed;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 fn default_error() -> anyhow::Error {
@@ -25,7 +21,7 @@ fn default_error() -> anyhow::Error {
 }
 
 pub async fn handle_kik(
-    context: &Context,
+    _context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
@@ -36,10 +32,12 @@ pub async fn handle_kik(
             channel
                 .lock()
                 .await
-                .get::<UnboundedSender<(String, CmdOptions, Command)>>("cmd_tx")
-                .expect("没有命令发送者")
+                .get::<Sender<(String, CmdOptions, Command)>>("cmd_tx")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("命令处理队列未初始化"))?
                 .send(req_cmd.split())
-                .expect("处理线程关闭");
+                .await
+                .map_err(|_| anyhow::anyhow!("命令处理线程已关闭"))?;
         }
         KikFrame::Ping => {}
         KikFrame::Pong => {}
@@ -85,7 +83,7 @@ pub async fn handle_kik_cmd(
 
 pub async fn handle_kik_data(
     context: &Context,
-    channel: Arc<Mutex<Channel>>,
+    _channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
     let frame = KikFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
@@ -106,8 +104,8 @@ pub async fn handle_kik_data(
 }
 
 pub async fn handle_init_message(
-    context: &Context,
-    channel: Arc<Mutex<Channel>>,
+    _context: &Context,
+    _channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
     tx: &mut Sender<Box<dyn Any + Send + Sync>>,
 ) -> anyhow::Result<()> {
@@ -117,12 +115,12 @@ pub async fn handle_init_message(
         InitFrame::KikId(id) => {
             match tx.send(Box::new(id)).await {
                 Ok(_) => {}
-                Err(e) => {
+                Err(_error) => {
                     //todo 写端关闭，神奇
                 }
             };
         }
-        f => {
+        _frame => {
             return Err(default_error());
         }
     }

@@ -1,10 +1,9 @@
-
 use std::any::Any;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
-use std::time::SystemTime;
+use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
 
@@ -26,7 +25,7 @@ pub struct Channel {
     addr: (io::Result<SocketAddr>, io::Result<SocketAddr>),
     attr: HashMap<String, Box<dyn Any + Send + Sync>>,
     closed: AtomicBool,
-    create_time: SystemTime,
+    write_timeout: Duration,
 }
 
 impl Channel {
@@ -43,8 +42,8 @@ impl Channel {
             addr: (local_addr, peer_addr),
             writer: BufWriter::new(writer),
             attr: HashMap::new(),
-            create_time: SystemTime::now(),
             closed: AtomicBool::new(false),
+            write_timeout: Duration::from_secs(45),
         }
     }
 
@@ -64,7 +63,7 @@ impl Channel {
     pub fn get_peer_addr(&self) -> &std::io::Result<SocketAddr> {
         &self.addr.1
     }
-    
+
     pub fn get_id(&self) -> &str {
         if self.id == "undefined_id" {
             panic!("未初始化的id被取")
@@ -73,6 +72,10 @@ impl Channel {
     }
     pub fn set_id(&mut self, id: String) {
         self.id = id;
+    }
+
+    pub fn set_write_timeout(&mut self, write_timeout: Duration) {
+        self.write_timeout = write_timeout;
     }
 
     pub fn get_stream_info(&self) -> String {
@@ -84,9 +87,9 @@ impl Channel {
     }
 
     pub fn get<T: 'static + Any + Send + Sync>(&self, key: &str) -> Option<&T> {
-        let option = self.attr.get(key);
-        let option1 = option.and_then(|value| value.downcast_ref::<T>());
-        option1.and_then(|v| Some(v))
+        self.attr
+            .get(key)
+            .and_then(|value| value.downcast_ref::<T>())
     }
     pub fn get_mut<T: 'static + Any + Send + Sync>(&mut self, key: &str) -> Option<&mut T> {
         self.attr
@@ -103,47 +106,41 @@ impl Channel {
             .attr
             .get_mut(key)
             .and_then(|value| value.downcast_mut());
-        if value.is_some() {
-            let v = value.unwrap();
+        if let Some(v) = value {
             let new_v = f(Some(v))?;
             *(v) = new_v;
         } else {
-            let new_v = f(value)?;
+            let new_v = f(None)?;
             self.attr.insert(key.to_owned(), Box::new(new_v));
         }
         Ok(())
     }
 
     pub async fn write_half_close(&mut self) -> std::io::Result<()> {
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.writer.shutdown().await
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::timeout(self.write_timeout, self.writer.shutdown())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "关闭写半连接超时"))?
     }
     pub async fn try_write_half_close(&mut self) {
-        match self.writer.shutdown().await {
-            Ok(_) => {}
-            Err(_) => {}
-        };
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.writer.shutdown().await;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     pub async fn write_and_flush(&mut self, bys: &[u8]) -> anyhow::Result<()> {
-        
-        let w = self.writer.write_all(bys).await?;
-        self.writer.flush().await?;
-        Ok(w)
+        tokio::time::timeout(self.write_timeout, async {
+            self.writer.write_all(bys).await?;
+            self.writer.flush().await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("写连接超时"))??;
+        Ok(())
     }
     pub async fn try_write_and_flush(&mut self, bys: &[u8]) {
-        match self.writer.write_all(bys).await {
-            Ok(_) => {}
-            Err(_) => {
-                return;
-            }
-        };
-        match self.writer.flush().await {
-            Ok(_) => {}
-            Err(_) => {}
-        }
+        let _ = self.write_and_flush(bys).await;
     }
-    
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Relaxed)
     }

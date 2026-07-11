@@ -5,13 +5,12 @@
     "MACHINE_CODE_3": "568A-BF9C",
     "START_RUN_PATH": "D:/test/dsl.exe",
     "FIX_SAVE_PATH": "D:/Cache/log.exe",
-    "LOCK_FILE_PATH": "D:\\Strawberry\\licenses.txt",
+    "LOCK_FILE_PATH": "target/runtime/ctrl_kik.lock",
     "HOST": "localhost",
     "PORT": "9002",
     "START_ERROR_1": "start在隐藏路径执行失败",
     "START_ERROR_2": "start保存至隐藏路径失败",
     "START_ERROR_3": "start获取后台执行文件失败",
-    "USER_NAME": "root",
-    "PASSWORD": "1104399"
+    "BUILD_CHANNEL": "default"
   }
 }

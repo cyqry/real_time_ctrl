@@ -1,9 +1,8 @@
 use crate::ctrl_resp::CmdResp;
 use bytes::{Buf, BufMut, BytesMut};
-use common::command::Command;
-use common::kik_info::KikInfo;
-use common::message::kik_resp::KikResp;
 use common::protocol::{BufSerializable, ReqCmd};
+
+const MAX_DATA_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -68,15 +67,15 @@ impl BufSerializable for Frame {
                     return None;
                 }
                 let id_len = bys.get_u32() as usize;
-                if bys.len() < id_len {
+                if id_len == 0 || id_len > MAX_DATA_ID_BYTES || bys.len() < id_len {
                     return None;
                 }
                 let id_bys = bys.split_to(id_len);
                 let data_id = String::from_utf8(id_bys.to_vec()).ok()?;
                 Some(Frame::Data(data_id, bys))
             }
-            14 => Some(Frame::Ping),
-            15 => Some(Frame::Pong),
+            14 if bys.is_empty() => Some(Frame::Ping),
+            15 if bys.is_empty() => Some(Frame::Pong),
             _ => None,
         }
     }

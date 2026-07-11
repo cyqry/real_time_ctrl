@@ -42,14 +42,35 @@ impl RealCtrlApi {
             );
         }
 
+        if let Err(error) = request.validate() {
+            return ApiResponse::error(request.request_id, error);
+        }
+
         let command = request.command.clone().into_input_command();
+        if let Err(error) = self.ensure_allowed(&command) {
+            return ApiResponse::error(
+                request.request_id,
+                ApiErrorBody::forbidden(error.to_string()),
+            );
+        }
+        log::info!(
+            "开放 API 调用: request_id={:?}, command={}",
+            request.request_id,
+            request.command.kind()
+        );
         match self.execute(command.clone()).await {
             Ok(resp) => match remote_resp_to_api_data(&command, resp) {
                 Ok(data) => ApiResponse::success(&request, data),
                 Err(err) => ApiResponse::error(request.request_id, err),
             },
             Err(err) => {
-                ApiResponse::error(request.request_id, ApiErrorBody::internal(err.to_string()))
+                log::error!(
+                    "开放 API 执行失败: request_id={:?}, command={}, error={}",
+                    request.request_id,
+                    request.command.kind(),
+                    err
+                );
+                ApiResponse::error(request.request_id, ApiErrorBody::internal("命令执行失败"))
             }
         }
     }

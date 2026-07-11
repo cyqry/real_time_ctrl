@@ -13,5 +13,4 @@ pub mod session_auth;
 pub mod time_util;
 
 pub mod generated;
-pub mod async_util;
 pub mod host;

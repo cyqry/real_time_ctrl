@@ -2,21 +2,15 @@ use crate::context::{id, Context};
 use crate::input_command::{InputCtrlCommand, RemoteResp, RemoteSuccessResp};
 use anyhow::{anyhow, Context as AnyhowContext};
 use bytes::{BufMut, BytesMut};
-// use common::async_util::AsyncExecutor;
 use common::command::{Command, CtrlCommand};
 use common::message::dok::{Dok, ErrCode};
 use common::message::kik_cmd_resp_info;
 use common::message::kik_resp::{ClientSuccessResp, KikResp};
 use common::protocol::{BufSerializable, CmdOptions, ReqCmd};
-use common::{async_util, file_util, protocol};
+use common::{file_util, protocol};
 use ctrl_common::ctrl_frame::Frame;
-use ctrl_common::ctrl_resp::{CmdResp, Resp, ServerResp, ServerSuccessResp};
-use futures::future::ok;
-use sha2::digest::DynDigest;
-use sha2::{Digest, Sha256};
-use std::future::Future;
+use ctrl_common::ctrl_resp::{Resp, ServerResp, ServerSuccessResp};
 use std::path::PathBuf;
-use std::pin::Pin;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -28,7 +22,7 @@ pub async fn execute(
     let (cmd, cmd_options) = process_cmd(context, input_ctrl_cmd.clone()).await?;
 
     let req_cmd = ReqCmd::new(id(), cmd_options, Command::Ctrl(cmd.clone()));
-    match context.agent.write().await.req(&req_cmd).await?.get_resp() {
+    match context.request(&req_cmd).await?.get_resp() {
         Resp::Kik(KikResp::Success(ClientSuccessResp::Info(info)))
         | Resp::Server(ServerResp::Success(ServerSuccessResp::Info(info))) => {
             //解析响应的info信息
@@ -38,10 +32,10 @@ pub async fn execute(
             )?))
         }
         Resp::Kik(KikResp::Error(err_code, info)) => {
-            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+            Ok(RemoteResp::Error(*err_code as u32, info.to_string()))
         }
         Resp::Server(ServerResp::Error(err_code, info)) => {
-            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+            Ok(RemoteResp::Error(*err_code as u32, info.to_string()))
         }
         Resp::Kik(KikResp::Success(ClientSuccessResp::DataId(data_id))) => {
             if origin_data {
@@ -80,9 +74,7 @@ fn to_remote_resp(cmd: InputCtrlCommand, info: String) -> anyhow::Result<RemoteS
             serde_json::from_str::<Vec<kik_cmd_resp_info::Ls>>(info.as_str())
                 .context(format!("json解析失败，原info:{}", info))?,
         ),
-        _ => {
-            unreachable!("不应该到达")
-        }
+        _ => return Err(anyhow!("控制命令返回了不支持的文本响应")),
     };
     Ok(res)
 }
@@ -111,12 +103,12 @@ async fn process_cmd(
 async fn process_ctrl_cmd_data_id_resp(
     context: &Context,
     input_ctrl_cmd: InputCtrlCommand,
-    data_id: &String,
+    data_id: &str,
 ) -> anyhow::Result<String> {
     let ok_info = match input_ctrl_cmd {
         InputCtrlCommand::GetFile(_, save_path) => {
             //get data
-            match context.wait_data(data_id.as_str()).await {
+            match context.wait_data(data_id).await {
                 Ok(data) => match file_util::save_file(save_path.as_str(), &data).await {
                     Ok(_) => Ok(format!("保存文件至:{}", save_path)),
                     Err(e) => Err(anyhow!(format!("保存文件至:{}失败,error:{}", save_path, e))),
@@ -124,21 +116,19 @@ async fn process_ctrl_cmd_data_id_resp(
                 Err(e) => Err(anyhow!(format!("接收文件失败,{}", e))),
             }
         }
-        InputCtrlCommand::GetBigFile(_, save_path) => {
-            match context.wait_data(data_id.as_str()).await {
-                Ok(data) => match file_util::save_file(save_path.as_str(), &data).await {
-                    Ok(_) => Ok(format!("保存大文件至:{}", save_path)),
-                    Err(e) => Err(anyhow!(format!(
-                        "保存大文件至:{}失败,error:{}",
-                        save_path, e
-                    ))),
-                },
-                Err(e) => Err(anyhow!(format!("接收大文件失败,{}", e))),
-            }
-        }
+        InputCtrlCommand::GetBigFile(_, save_path) => match context.wait_data(data_id).await {
+            Ok(data) => match file_util::save_file(save_path.as_str(), &data).await {
+                Ok(_) => Ok(format!("保存大文件至:{}", save_path)),
+                Err(e) => Err(anyhow!(format!(
+                    "保存大文件至:{}失败,error:{}",
+                    save_path, e
+                ))),
+            },
+            Err(e) => Err(anyhow!(format!("接收大文件失败,{}", e))),
+        },
         InputCtrlCommand::Screen(save_path) => {
             //get data
-            match context.wait_data(data_id.as_str()).await {
+            match context.wait_data(data_id).await {
                 Ok(data) => {
                     let mut path = PathBuf::from(save_path.as_str());
 
@@ -205,8 +195,6 @@ async fn do_set_big_file(
 
     let data_id = Uuid::new_v4().to_string();
 
-    // let mut executor = async_util::new_unbound();
-
     let data_id_c = data_id.clone();
     let context_c = context.clone();
 
@@ -244,7 +232,7 @@ async fn do_set_big_file(
     let context = context.clone();
     let data_id_c = data_id.clone();
     tokio::spawn(async move {
-        if let Ok(Some((code, e))) = handle.await {
+        if let Ok(Some((code, _error))) = handle.await {
             context
                 .send_data_with_id(data_id_c, Dok::Err(code).to_buf().as_ref())
                 .await

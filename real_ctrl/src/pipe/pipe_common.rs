@@ -3,6 +3,7 @@ use crate::input_command::{deserialize_command, InputCommand, RemoteResp};
 use bytes::BytesMut;
 use common::protocol::BufSerializable;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 // 定义管道名称（Windows 命名管道格式）。
 pub const PIPE_NAME: &str = r"\\.\pipe\real_ctrl_service_pipe";
@@ -10,6 +11,7 @@ pub const PIPE_NAME: &str = r"\\.\pipe\real_ctrl_service_pipe";
 pub const MAX_PIPE_REQUEST_BYTES: usize = 1024 * 1024;
 /// 响应需要兼容截图等二进制数据，先保留 64 MiB 上限。
 pub const MAX_PIPE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub const PIPE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PIPE_API_MAGIC: &[u8] = b"RTCAPI1\0";
 

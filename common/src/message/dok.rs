@@ -1,6 +1,7 @@
-
 use crate::protocol::BufSerializable;
-use bytes::{BytesMut, BufMut, Buf};
+use bytes::{Buf, BufMut, BytesMut};
+
+const MAX_FILE_PART_BYTES: usize = 16 * 1024 * 1024;
 
 //数据交换格式结构体
 pub enum Dok {
@@ -23,7 +24,6 @@ impl ErrCode {
         }
     }
 }
-
 
 impl BufSerializable for Dok {
     fn to_buf(&self) -> BytesMut {
@@ -60,7 +60,6 @@ impl BufSerializable for Dok {
     }
 
     fn from_buf(mut bys: BytesMut) -> Option<Self> {
-
         if bys.remaining() < 1 {
             return None;
         }
@@ -78,8 +77,13 @@ impl BufSerializable for Dok {
                 let end = bys.get_u64();
                 let data_len = bys.get_u32() as usize;
 
-                // 检查是否有足够的数据
-                if bys.remaining() < data_len {
+                // 分片协议固定为小块传输，拒绝超大块、长度不一致和非法范围。
+                if data_len == 0
+                    || data_len > MAX_FILE_PART_BYTES
+                    || bys.remaining() != data_len
+                    || start > end
+                    || end.checked_sub(start)?.checked_add(1)? != data_len as u64
+                {
                     return None;
                 }
 
@@ -89,14 +93,12 @@ impl BufSerializable for Dok {
                 Some(Dok::FilePart(start, end, data))
             }
             1 => {
-
-                if bys.remaining() < 1 {
+                if bys.remaining() != 1 {
                     return None;
                 }
 
                 let err_code_byte = bys.get_u8();
-                ErrCode::from_u8(err_code_byte)
-                    .map(Dok::Err)
+                ErrCode::from_u8(err_code_byte).map(Dok::Err)
             }
             _ => None,
         }
@@ -111,7 +113,7 @@ mod tests {
     #[test]
     fn test_file_part_serialization() {
         let data = vec![1, 2, 3, 4, 5];
-        let dok = Dok::FilePart(100, 200, data.clone());
+        let dok = Dok::FilePart(100, 104, data.clone());
 
         let buf = dok.to_buf();
         let deserialized = Dok::from_buf(buf);
@@ -119,7 +121,7 @@ mod tests {
         assert!(deserialized.is_some());
         if let Dok::FilePart(start, end, data2) = deserialized.unwrap() {
             assert_eq!(start, 100);
-            assert_eq!(end, 200);
+            assert_eq!(end, 104);
             assert_eq!(data2, data);
         } else {
             panic!("Expected FilePart variant");
@@ -135,7 +137,7 @@ mod tests {
 
         assert!(deserialized.is_some());
         match deserialized.unwrap() {
-            Dok::Err(ErrCode::ReadError) => assert!(true),
+            Dok::Err(ErrCode::ReadError) => {}
             _ => panic!("Expected ReadError variant"),
         }
     }

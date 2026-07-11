@@ -1,10 +1,6 @@
-use crate::cmd_runner::fs::rename;
 use crate::context::Context;
 use crate::{cmd_util, screen};
 use anyhow::anyhow;
-use std::error::Error;
-use std::fmt::Alignment::{Left, Right};
-// use   anyhow::Context as AnyContext;
 use common::command::{Command, CtrlCommand};
 use common::file_util;
 use common::message::dok::Dok;
@@ -12,7 +8,7 @@ use common::message::dok::Dok::FilePart;
 use common::message::kik_cmd_resp_info;
 use common::message::kik_resp::{kik_error, kik_success_data_id, kik_success_info, KikResp};
 use common::protocol::BufSerializable;
-use log::debug;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio_util::either::Either;
 use uuid::Uuid;
@@ -37,7 +33,7 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
                     }
                 }
                 CtrlCommand::SetBigFile(data_id, total, hash, save_path) => {
-                    match set_big_file(&context, data_id, total, hash, save_path.clone()).await {
+                    match set_big_file(context, data_id, total, hash, save_path.clone()).await {
                         Ok(_) => kik_success_info(format!("保存大文件至Kik:{}成功", save_path)),
                         Err(e) => kik_success_info(format!(
                             "保存大文件至Kik:{}失败,error:{}",
@@ -111,6 +107,11 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
             resp
         }
         Command::Exec(s) => {
+            if !cfg!(feature = "dangerous-exec") {
+                return kik_error(
+                    "当前 ctrl_kik 构建未启用 dangerous-exec，拒绝任意命令执行".to_string(),
+                );
+            }
             // let v: Vec<String> = s.trim().split_whitespace().map(|x| x.to_string()).collect();
 
             match cmd_util::cmd_exec_line(s.as_str(), false, true).await {
@@ -123,11 +124,11 @@ pub async fn run(context: &Context, cmd: Command) -> KikResp {
 }
 
 async fn do_get_big_file(context: &Context, file_path: String) -> Either<String, String> {
-    let file_size = file_util::get_file_size(file_path.as_str()).await;
-    if let Err(e) = file_size {
-        return Either::Left(format!("获取文件失败,error:{}", e));
-    }
-    if file_size.unwrap() > 1024 * 1024 * 1024 {
+    let file_size = match file_util::get_file_size(file_path.as_str()).await {
+        Ok(size) => size,
+        Err(error) => return Either::Left(format!("获取文件失败,error:{}", error)),
+    };
+    if file_size > 1024 * 1024 * 1024 {
         Either::Left("暂不支持1G以上的文件".to_string())
     } else {
         match file_util::read_file(file_path).await {
@@ -147,41 +148,39 @@ async fn set_big_file(
     hash: Vec<u8>,
     save_path: String,
 ) -> anyhow::Result<()> {
+    const MAX_BIG_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+    if total > MAX_BIG_FILE_BYTES {
+        return Err(anyhow!("暂不支持 1 GiB 以上的大文件"));
+    }
+    if hash.len() != 32 {
+        return Err(anyhow!("SHA-256 长度必须为 32 bytes"));
+    }
     let mut sum = 0;
-
-    let file = file_util::create_file(save_path.as_str())
-        .await
-        .map_err(|e| anyhow!("获取文件句柄失败,error:{}", e))?;
-
-    let original_path = fs::canonicalize(save_path.as_str()).await?;
-
-    let file_name = original_path
+    let destination = PathBuf::from(&save_path);
+    let file_name = destination
         .file_name()
         .ok_or(anyhow!("获取文件名失败"))?
         .to_string_lossy();
-    // 在临时目录创建临时文件路径
-    let temp_file_path = std::env::temp_dir()
-        .join(&format!(
-            "{}-{}.temp",
-            file_name,
-            Uuid::new_v4().to_string()
-        ))
-        .to_string_lossy()
-        .to_string();
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).await?;
+    // 临时文件必须与目标文件位于同一卷，最终才能原子替换且不提前破坏旧文件。
+    let temp_file_path = parent.join(format!(".{}.{}.rtc-part", file_name, Uuid::new_v4()));
+    let temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_file_path)
+        .await?;
+    drop(temp_file);
 
-    loop {
+    while sum < total {
         let data = context.read_data(data_id.clone()).await?;
         let dok = Dok::from_buf(data).ok_or(anyhow!("大文件数据格式错误!"))?;
         if let FilePart(start, end, data) = dok {
             sum += data.len() as u64;
-            file_util::write_range_file(temp_file_path.as_str(), start, end, data).await?;
+            file_util::write_range_file(&temp_file_path, start, end, data).await?;
             if sum == total {
-                file_util::set_file_size(temp_file_path.as_str(), total).await?;
-                if hash.eq(&file_util::compute_hash(temp_file_path.as_str()).await?) {
-                    break;
-                } else {
-                    return Err(anyhow!("hash校验失败，数据错误"));
-                }
+                file_util::set_file_size(&temp_file_path, total).await?;
+                break;
             } else if sum > total {
                 return Err(anyhow!("获取大文件数据错误!!!"));
             }
@@ -189,24 +188,43 @@ async fn set_big_file(
             return Err(anyhow!("大文件保存失败"));
         }
     }
-    drop(file);
-    fs::remove_file(save_path.as_str())
-        .await
-        .or_else(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return Ok(());
-            }
-            Err(e)
-        })
-        .map_err(|e| anyhow!("删除文件失败,error:{}", e))?;
-    match rename(temp_file_path.as_str(), save_path.as_str()).await {
-        Ok(_) => {}
-        Err(_) => {
-            fs::copy(&temp_file_path, &save_path)
-                .await
-                .map_err(|e| anyhow!("移动文件失败,error:{}", e))?;
-        }
+    if !hash.eq(&file_util::compute_hash(temp_file_path.to_string_lossy()).await?) {
+        return Err(anyhow!("hash校验失败，数据错误"));
     }
-    fs::remove_file(temp_file_path.as_str()).await.unwrap_or(());
+    replace_file(&temp_file_path, &destination).await?;
+    Ok(())
+}
+
+async fn replace_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let source_wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination_wide = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source_wide.as_ptr()),
+                PCWSTR(destination_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| anyhow!("原子替换目标文件失败: {error}"))
+    })
+    .await
+    .map_err(|error| anyhow!("文件替换任务失败: {error}"))??;
     Ok(())
 }

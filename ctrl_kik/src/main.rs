@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
-use tokio::{join, time};
+use tokio::time;
 
 mod cmd_runner;
 mod cmd_util;
@@ -45,7 +45,7 @@ async fn test() {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     if "DEBUG".eq(env::var("LOG").unwrap_or("test".to_string()).as_str()) {
         env_logger::Builder::new()
             // 关键：定义自定义格式
@@ -62,7 +62,7 @@ async fn main() {
             .init();
     }
     //此lock在程序结束时会被操作系统回收，所以无需担心是否释放
-    let f = single(LOCK_FILE_PATH()).await; // 须要给一个变量名不能用let _ = xxx，(注意: let _ = xxx 当下与  _ = xxx 行为一致，会在这一行结束就释放变量) ，免得rust这里直接回收了
+    let _single_lock = single(LOCK_FILE_PATH()).await?;
     let context = Context::new();
     let config = Config {
         id: Id {
@@ -82,11 +82,13 @@ async fn main() {
             match kik_conn::kik_conn(context.clone(), &config).await {
                 Ok(h) => {
                     //加入服务器成功后发起数据连接
-                    let (context, config) = (context.clone(), config.clone());
+                    let (data_context, data_config) = (context.clone(), config.clone());
                     tokio::spawn(async move {
                         //校验成功就会返回
                         for _ in 0..3 {
-                            match kik_data_conn::kik_data_conn(context.clone(), &config).await {
+                            match kik_data_conn::kik_data_conn(data_context.clone(), &data_config)
+                                .await
+                            {
                                 Ok(_) => {}
                                 Err(e) => {
                                     debug!("{}", e);
@@ -95,9 +97,12 @@ async fn main() {
                             }
                         }
                     });
-                    let _ = join!(h);
+                    let _ = h.await;
+                    context.clear().await;
+                    context.set_kik(None).await;
                 }
-                Err(e) => {
+                Err(error) => {
+                    debug!("命令连接失败: {}", error);
                     time::sleep(Duration::from_secs(2)).await;
                     //todo
                 }
@@ -108,48 +113,34 @@ async fn main() {
     }
 }
 
-pub async fn single<P: AsRef<Path>>(lock_path: P) -> Option<File> {
+pub async fn single<P: AsRef<Path>>(lock_path: P) -> anyhow::Result<File> {
     use fs4::tokio::AsyncFileExt;
-    if !lock_path.as_ref().parent().unwrap().exists() {
-        match tokio::fs::create_dir_all(lock_path.as_ref().parent().unwrap()).await {
-            Ok(_) => {}
-            Err(_) => {
-                return None;
-            }
-        };
+    if let Some(parent) = lock_path
+        .as_ref()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
     }
-    match OpenOptions::new()
+    let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)
-        .await
-    {
-        Ok(lock_file) => {
-            let mut e_op = None;
-            for _ in 0..3 {
-                // 尝试获得文件锁
-                match lock_file.try_lock_exclusive() {
-                    Ok(_) => {
-                        return Some(lock_file);
-                    }
-                    Err(e) => {
-                        e_op = Some(e);
-                    }
-                }
-                time::sleep(Duration::from_secs(3)).await;
-            }
-            if e_op.is_some() {
-                println!("exist running");
-                std::process::exit(0);
-            } else {
-                //神奇
-                return None;
-            }
+        .await?;
+    let mut last_error = None;
+    for _ in 0..3 {
+        match lock_file.try_lock_exclusive() {
+            Ok(_) => return Ok(lock_file),
+            Err(error) => last_error = Some(error),
         }
-        Err(_) => {
-            //文件创建失败的话放行
-            return None;
-        }
-    };
+        time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(anyhow::anyhow!(
+        "已有 ctrl_kik 实例运行或无法取得运行锁: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "未知错误".to_string())
+    ))
 }

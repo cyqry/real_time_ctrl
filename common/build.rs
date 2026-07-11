@@ -1,12 +1,11 @@
-
 mod decrypted;
 
-use std::fs;
-use std::path::PathBuf;
-use serde::Deserialize;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce}; // Or `Aes128Gcm`
-use hex;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 struct Config {
@@ -14,6 +13,8 @@ struct Config {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=config.json");
+    println!("cargo:rerun-if-changed=decrypted.rs");
     // 读取配置文件
     let config: Config = {
         let config_path = PathBuf::from("config.json");
@@ -25,39 +26,43 @@ fn main() {
     let mut generated_code = String::new();
     generated_code.push_str(include_str!("decrypted.rs"));
 
-    generated_code.push_str("\n");
-    for (name, value) in config.strings {
-        let encrypted = encrypt(&value);
-        generated_code.push_str(
-            &format!(
-                r#"
+    generated_code.push('\n');
+    let mut strings = config.strings.into_iter().collect::<Vec<_>>();
+    strings.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, value) in strings {
+        let (encrypted, nonce) = encrypt(&name, &value);
+        generated_code.push_str(&format!(
+            r#"
 pub fn {name}() -> String {{
-    decrypt("{encrypted}")
+    decrypt("{encrypted}", "{nonce}")
 }}
 "#,
-                name = name.to_uppercase(),
-                encrypted = encrypted
-            ));
+            name = name.to_uppercase(),
+            encrypted = encrypted
+        ));
     }
-    generated_code.push_str("\n");
+    generated_code.push('\n');
 
-    // 指定输出目录为项目根目录下的 src/generated 目录
-    let dest_path = PathBuf::from("src/generated/encrypted_strings.rs");
+    // 生成代码属于构建产物，只写入 Cargo OUT_DIR，避免普通构建修改受版本控制的源码。
+    let dest_path = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR 未设置"))
+        .join("encrypted_strings.rs");
     fs::create_dir_all(dest_path.parent().unwrap()).unwrap();
     fs::write(dest_path, generated_code).unwrap();
 }
 
-
-
-fn encrypt(plain_text: &str) -> String {
+fn encrypt(name: &str, plain_text: &str) -> (String, String) {
     // 明确指定Key的类型为Aes256Gcm
     let key = Key::<Aes256Gcm>::from_slice(decrypted::KEY);
     let cipher = Aes256Gcm::new(key);
 
-    let nonce = Nonce::from_slice(b"unique nonce"); // 96-bits; unique per message
+    // 每个字段使用确定且唯一的 nonce，使构建可复现并避免 GCM 固定 nonce 复用。
+    // KEY 与解密逻辑同在客户端，本机制只提高静态字符串扫描成本，不是秘密存储。
+    let digest = Sha256::digest(format!("real_time_ctrl.build.string.v1\0{name}").as_bytes());
+    let nonce_bytes = &digest[..12];
+    let nonce = Nonce::from_slice(nonce_bytes);
     let cipher_text = cipher
         .encrypt(nonce, plain_text.as_bytes())
         .expect("encryption failure!");
 
-    hex::encode(cipher_text)
+    (hex::encode(cipher_text), hex::encode(nonce_bytes))
 }

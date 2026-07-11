@@ -1,7 +1,9 @@
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::{ClientTransportMode, Config};
-use common::ltc_codec::{LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH};
+use common::ltc_codec::{
+    LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH, INIT_MAX_FRAME_LENGTH,
+};
 use common::message::init_frame::InitFrame;
 use common::protocol;
 use common::protocol::BufSerializable;
@@ -25,6 +27,13 @@ use tokio_util::codec::FramedRead;
 
 const AUTH_OK_PREFIX: &str = "##authtrue:";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthPhase {
+    AwaitingChallenge,
+    AwaitingSession,
+    Authenticated,
+}
+
 pub async fn ctrl_conn(
     config: &Config,
 ) -> anyhow::Result<(Arc<Mutex<Channel>>, Receiver<CmdResp>, Option<String>)> {
@@ -32,7 +41,7 @@ pub async fn ctrl_conn(
     // 控制通道只承载命令和响应，使用较小帧上限避免异常输入占用过多内存。
     let framed_read = FramedRead::new(
         BufReader::new(parts.reader),
-        LengthFieldBasedFrameDecoder::new_with_max_frame_len(CONTROL_MAX_FRAME_LENGTH),
+        LengthFieldBasedFrameDecoder::new_with_max_frame_len(INIT_MAX_FRAME_LENGTH),
     );
     let framed_arc = Arc::new(Mutex::new(framed_read));
     let channel_arc = Arc::new(Mutex::new(Channel::new(
@@ -42,11 +51,20 @@ pub async fn ctrl_conn(
         parts.local_addr,
         parts.peer_addr,
     )));
+    channel_arc
+        .lock()
+        .await
+        .set_write_timeout(config.write_timeout);
 
     let channel = channel_arc.clone();
     let client_nonce = random_nonce_hex();
-    let auth_secret = config.id.encrypt();
+    let auth_secret = config.id.control_plane_secret().to_string();
     let client_mode = config.security.client_mode.clone();
+    let read_timeout = config.read_timeout;
+    let mut auth_phase = match client_mode {
+        ClientTransportMode::Plain => AuthPhase::AwaitingSession,
+        ClientTransportMode::PinnedTls => AuthPhase::AwaitingChallenge,
+    };
     e2e_trace("ctrl_conn: connected transport");
     handle_active(config, &client_nonce, channel.clone()).await?;
     e2e_trace("ctrl_conn: sent auth start");
@@ -64,25 +82,33 @@ pub async fn ctrl_conn(
             // 读锁只包住 next().await，避免后续处理逻辑需要同一 reader 时形成隐式自锁。
             let read_result = {
                 let mut framed = framed_arc.lock().await;
-                timeout(Duration::from_secs(45), framed.next()).await
+                timeout(read_timeout, framed.next()).await
             };
 
             match read_result {
                 Ok(Some(Ok(msg))) => {
                     let channel = channel.clone();
                     if handle_read(
-                        channel,
+                        channel.clone(),
                         msg,
                         &mut tx,
                         &auth_secret,
                         &client_nonce,
                         &client_mode,
+                        &mut auth_phase,
                     )
                     .await
                     .is_none()
                     {
                         debug!("控制连接读取处理失败");
                         break;
+                    }
+                    if channel.lock().await.channel_type == ChannelType::Ctrl {
+                        framed_arc
+                            .lock()
+                            .await
+                            .decoder_mut()
+                            .set_max_frame_len(CONTROL_MAX_FRAME_LENGTH);
                     }
                 }
                 Ok(Some(Err(e))) => {
@@ -106,21 +132,21 @@ pub async fn ctrl_conn(
     });
 
     // 第一次响应只用于控制通道鉴权确认，后续 rx 才承载业务响应。
-    let session_id = match rx.recv().await {
-        None => panic!("服务端未响应"),
-        Some(res) => match res.get_resp() {
-            Server(ServerResp::Success(ServerSuccessResp::Info(auth)))
-                if auth.starts_with(AUTH_OK_PREFIX) =>
-            {
-                auth.strip_prefix(AUTH_OK_PREFIX)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string)
-            }
-            _ => panic!("服务端返回了不支持的控制连接初始化响应"),
-        },
+    let auth_response = timeout(config.read_timeout, rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("等待控制通道鉴权响应超时"))?
+        .ok_or_else(|| anyhow::anyhow!("控制连接在鉴权完成前断开"))?;
+    let session_id = match auth_response.get_resp() {
+        Server(ServerResp::Success(ServerSuccessResp::Info(auth)))
+            if auth.starts_with(AUTH_OK_PREFIX) =>
+        {
+            auth.strip_prefix(AUTH_OK_PREFIX)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        }
+        _ => return Err(anyhow::anyhow!("服务端返回了不支持的控制连接初始化响应")),
     };
 
-    channel_arc.lock().await.channel_type = ChannelType::Ctrl;
     debug!("控制连接校验成功");
     Ok((channel_arc, rx, session_id))
 }
@@ -130,10 +156,10 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
         time::sleep(Duration::from_secs(5)).await;
         let arc = channel.clone();
         let mut guard = arc.lock().await;
-        if guard.channel_type != ChannelType::Unknown {
-            if guard.write_and_flush(&ctrl_pong()).await.is_err() {
-                break;
-            }
+        if guard.channel_type != ChannelType::Unknown
+            && guard.write_and_flush(&ctrl_pong()).await.is_err()
+        {
+            break;
         }
     }
 }
@@ -168,6 +194,7 @@ async fn handle_read(
     auth_secret: &str,
     client_nonce: &str,
     client_mode: &ClientTransportMode,
+    auth_phase: &mut AuthPhase,
 ) -> Option<()> {
     let channel_type = channel.lock().await.channel_type.clone();
     if channel_type == ChannelType::Unknown {
@@ -175,7 +202,9 @@ async fn handle_read(
         match frame {
             InitFrame::CtrlAuthChallenge(server_nonce) => {
                 e2e_trace("ctrl_conn: received auth challenge");
-                if *client_mode != ClientTransportMode::PinnedTls {
+                if *client_mode != ClientTransportMode::PinnedTls
+                    || *auth_phase != AuthPhase::AwaitingChallenge
+                {
                     return None;
                 }
                 let proof = ctrl_auth_proof(auth_secret, client_nonce, &server_nonce);
@@ -188,10 +217,18 @@ async fn handle_read(
                     }))
                     .await
                     .ok()?;
+                *auth_phase = AuthPhase::AwaitingSession;
                 e2e_trace("ctrl_conn: sent auth proof");
             }
             InitFrame::CtrlAuthSession(session_id) => {
+                if *client_mode != ClientTransportMode::PinnedTls
+                    || *auth_phase != AuthPhase::AwaitingSession
+                {
+                    return None;
+                }
                 e2e_trace("ctrl_conn: received auth session");
+                channel.lock().await.channel_type = ChannelType::Ctrl;
+                *auth_phase = AuthPhase::Authenticated;
                 tx.send(CmdResp::new(
                     "##cmdId".to_string(),
                     Server(ServerResp::Success(ServerSuccessResp::Info(format!(
@@ -203,7 +240,14 @@ async fn handle_read(
                 .ok()?;
             }
             InitFrame::CtrlAuthReply(true) => {
+                if *client_mode != ClientTransportMode::Plain
+                    || *auth_phase != AuthPhase::AwaitingSession
+                {
+                    return None;
+                }
                 // 初始化成功消息复用业务响应通道，只作为外层函数继续执行的信号。
+                channel.lock().await.channel_type = ChannelType::Ctrl;
+                *auth_phase = AuthPhase::Authenticated;
                 tx.send(CmdResp::new(
                     "##cmdId".to_string(),
                     Server(ServerResp::Success(ServerSuccessResp::Info(
@@ -215,10 +259,9 @@ async fn handle_read(
             }
             InitFrame::CtrlAuthReply(false) => {
                 debug!("控制连接业务鉴权失败");
-                println!("账号或密码错误");
-                std::process::exit(0);
+                return None;
             }
-            _ => panic!("控制端收到不支持的初始化帧"),
+            _ => return None,
         }
     } else {
         let frame = Frame::from_buf(msg)?;
@@ -229,7 +272,7 @@ async fn handle_read(
             Frame::Ping | Frame::Pong => {}
             f => {
                 debug!("控制连接收到不支持的业务帧,{:?}", f);
-                panic!("控制端不支持该帧")
+                return None;
             }
         };
     }

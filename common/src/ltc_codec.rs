@@ -2,6 +2,8 @@ use bytes::{Buf, BytesMut};
 use std::io::{Error, ErrorKind};
 use tokio_util::codec::Decoder;
 
+/// 握手阶段只允许小型身份/角色帧，认证完成后再按通道类型放宽。
+pub const INIT_MAX_FRAME_LENGTH: usize = 4 * 1024;
 /// 控制通道建议上限。当前先暴露常量，后续按连接类型逐步启用。
 pub const CONTROL_MAX_FRAME_LENGTH: usize = 1024 * 1024;
 /// 数据通道为了兼容历史的大文件一次性传输，默认仍保留较大上限。
@@ -49,6 +51,12 @@ impl LengthFieldBasedFrameDecoder {
         } else {
             Ok(())
         }
+    }
+}
+
+impl Default for LengthFieldBasedFrameDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

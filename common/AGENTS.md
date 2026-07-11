@@ -7,6 +7,8 @@
 - 强安全模式缺少 CA 证书或 SPKI pin 时必须失败，不能自动回退明文。
 - `session_auth` 负责 real_ctrl 会话 proof；不要在业务 crate 中复制 HMAC 拼接逻辑。
 - 新增 `InitFrame` v2 帧时必须保证旧帧编码不变，避免破坏 `ctrl_kik`。
+- v2 HMAC key 直接使用部署注入的高熵控制面秘密；历史 `auth_util` 摘要只允许明文迁移协议使用。
+- 握手阶段使用 4 KiB 上限，角色认证完成后才能切换到控制/数据帧上限。
 
 ## 职责边界
 
@@ -24,6 +26,8 @@
 - `auth_util` 里的静态摘要只能视为历史兼容逻辑，不能作为抗中间人的安全边界。
 - 新传输安全能力应通过 feature 或独立模块引入，避免强行增加 `ctrl_kik` 默认依赖。
 - 任何涉及密钥、pin、token 的实现都要说明存储位置和生命周期。
+- `build.rs` 生成代码只能写入 Cargo `OUT_DIR`。编译期字符串混淆不是秘密存储，不能放入控制凭据或 API token。
+- `Channel` 的写入、flush 和 shutdown 必须受超时控制；业务 crate 不应自行绕过这些方法裸写。
 
 ## 测试要求
 

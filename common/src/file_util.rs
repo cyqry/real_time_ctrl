@@ -1,25 +1,19 @@
-use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::future::Future;
 
-use anyhow::{anyhow, Context, Error};
+use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use chrono_tz::Asia::Shanghai;
-use futures::TryStreamExt;
 use get_chunk::stream::{FileStream, StreamExt};
 use get_chunk::ChunkSize;
 use rayon::iter::{ParallelBridge, ParallelIterator};
-use sha2::digest::{DynDigest, Update};
+use sha2::digest::DynDigest;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::time::SystemTime;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::time::Instant;
 use tokio::{fs, io, join};
-use walkdir::WalkDir;
 
 const DEFAULT_MAX_CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -53,10 +47,7 @@ pub async fn ls<P: AsRef<Path>>(
         let metadata = fs::metadata(&path).await?;
         let file_name = match path.file_name() {
             None => None,
-            Some(name) => match name.to_str() {
-                None => None,
-                Some(n) => Some(n.to_string()),
-            },
+            Some(name) => name.to_str().map(ToString::to_string),
         };
         let size = match metadata.is_dir() {
             true => match r {
@@ -70,14 +61,8 @@ pub async fn ls<P: AsRef<Path>>(
             file_name,
             metadata.is_file(),
             size,
-            metadata
-                .created()
-                .and_then(|time| Ok(convert_system_time(time)))
-                .ok(),
-            metadata
-                .modified()
-                .and_then(|time| Ok(convert_system_time(time)))
-                .ok(),
+            metadata.created().map(convert_system_time).ok(),
+            metadata.modified().map(convert_system_time).ok(),
         ));
     }
     Ok(v)
@@ -91,7 +76,11 @@ pub fn copy_and_rename<P: AsRef<Path>>(original_path: P) -> anyhow::Result<PathB
     }
 
     let mut new_filename = "_".to_owned();
-    new_filename.push_str(original_path.file_stem().unwrap().to_str().unwrap());
+    let file_stem = original_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("文件名不是有效 UTF-8 或缺少文件名"))?;
+    new_filename.push_str(file_stem);
     new_filename.push_str(".exe");
 
     let new_path = original_path.with_file_name(new_filename);
@@ -265,11 +254,8 @@ pub async fn get_dir_size_b(path: PathBuf) -> io::Result<u64> {
         }
     }
     for f in futures {
-        match f.await {
-            Ok(size) => {
-                total_size += size;
-            }
-            Err(_) => {}
+        if let Ok(size) = f.await {
+            total_size += size;
         }
     }
     Ok(total_size)
@@ -354,6 +340,7 @@ pub async fn write_range_file<P: AsRef<std::path::Path>>(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .await
         .context("Failed to open/create file")?;
@@ -433,31 +420,18 @@ pub async fn set_file_size(path: impl AsRef<Path>, size: u64) -> anyhow::Result<
 
 #[tokio::test]
 async fn test() {
-    use crate::time_util::*;
-    use std::time::Duration;
-    // let start = Instant::now();
-    // //8602103819
-    // println!("{}", get_dir_size(r"D:\Myjava").await.unwrap());
-    // println!("{:?}", start.elapsed());
-    // println!("{:?}", ls("E:", false).await);
-    let mut timer = Timer::new();
-    // println!("{}", get_dir_size(r"E:\D\").await.unwrap());
-    let save_path = "D:/MyTest/test".to_string();
-    let mut path = PathBuf::from(save_path.as_str());
+    let test_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("common_file_util_test");
+    let _ = fs::remove_dir_all(&test_dir).await;
+    fs::create_dir_all(&test_dir).await.unwrap();
+    let output = save_file_with_unique_name(&test_dir.join("data.bin"), &[0, 1])
+        .await
+        .unwrap();
 
-    if path.is_dir() {
-        path = path.join("1.png");
-    };
-
-    println!(
-        "{:?}",
-        match save_file_with_unique_name(path.as_path(), &[0, 1]).await {
-            Ok(p) => Ok(format!("保存Kik的截屏至:{:?}", path)),
-            Err(e) => Err(anyhow!(format!("保存Kik的截屏至:{:?}失败,error:{}", path, e))),
-        }
-    );
-
-    println!("Elapsed time: {} ms", timer.elapsed(TimeUnit::Milliseconds));
+    assert!(output.starts_with(&test_dir));
+    assert_eq!(fs::read(output).await.unwrap(), [0, 1]);
 }
 
 pub async fn get_file_size<P: AsRef<Path>>(path: P) -> Result<u64, std::io::Error> {

@@ -1,9 +1,12 @@
 use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetBigFile, SetFile};
-use crate::command::SysCommand::{List, Now, Use};
-use crate::protocol::{BufSerializable, CmdOptions, ReqCmd};
+use crate::command::SysCommand::{List, Use};
+use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 
+const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_KIK_ID_BYTES: usize = 128;
+const MAX_HASH_BYTES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -61,27 +64,27 @@ impl BufSerializable for Command {
                 match c {
                     GetFile(src, dst) => {
                         bytes_mut.put_u8(0);
-                        bytes_mut.put_u32(src.as_bytes().len() as u32);
+                        bytes_mut.put_u32(src.len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
                         bytes_mut.put_slice(dst.as_bytes());
                     }
                     GetBigFile(src, dst) => {
                         bytes_mut.put_u8(1);
-                        bytes_mut.put_u32(src.as_bytes().len() as u32);
+                        bytes_mut.put_u32(src.len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
                         bytes_mut.put_slice(dst.as_bytes());
                     }
                     SetFile(src, dst) => {
                         bytes_mut.put_u8(2);
-                        bytes_mut.put_u32(src.as_bytes().len() as u32);
+                        bytes_mut.put_u32(src.len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
                         bytes_mut.put_slice(dst.as_bytes());
                     }
                     SetBigFile(src, size, hash, dst) => {
                         bytes_mut.put_u8(3);
-                        bytes_mut.put_u32(src.as_bytes().len() as u32);
+                        bytes_mut.put_u32(src.len() as u32);
                         bytes_mut.put_slice(src.as_bytes());
-                        bytes_mut.put_u64(size.clone());
+                        bytes_mut.put_u64(*size);
                         bytes_mut.put_u32(hash.len() as u32);
                         bytes_mut.put_slice(hash);
                         bytes_mut.put_slice(dst.as_bytes());
@@ -108,7 +111,7 @@ impl BufSerializable for Command {
     }
 
     fn from_buf(mut bys: BytesMut) -> Option<Self> {
-        if bys.is_empty() {
+        if bys.is_empty() || bys.len() > MAX_COMMAND_BYTES {
             return None;
         }
         let first_code = bys.get_u8();
@@ -119,9 +122,11 @@ impl BufSerializable for Command {
                 }
                 let second_code = bys.get_u8();
                 match second_code {
-                    0 => Some(Command::Sys(List)),
-                    1 => Some(Command::Sys(Use(String::from_utf8(bys.to_vec()).ok()?))),
-                    2 => Some(Command::Sys(SysCommand::Now)),
+                    0 if bys.is_empty() => Some(Command::Sys(List)),
+                    1 if !bys.is_empty() && bys.len() <= MAX_KIK_ID_BYTES => {
+                        Some(Command::Sys(Use(String::from_utf8(bys.to_vec()).ok()?)))
+                    }
+                    2 if bys.is_empty() => Some(Command::Sys(SysCommand::Now)),
                     _ => None,
                 }
             }
@@ -191,7 +196,10 @@ impl BufSerializable for Command {
                             return None;
                         }
                         let hash_len = bys.get_u32();
-                        if bys.len() < hash_len as usize {
+                        if hash_len == 0
+                            || hash_len as usize > MAX_HASH_BYTES
+                            || bys.len() < hash_len as usize
+                        {
                             return None;
                         }
                         let hash = bys.split_to(hash_len as usize).to_vec();
@@ -208,7 +216,7 @@ impl BufSerializable for Command {
                     _ => None,
                 }
             }
-            2 => Some(Command::Exec(String::from_utf8(bys.to_vec()).ok()?)),
+            2 if !bys.is_empty() => Some(Command::Exec(String::from_utf8(bys.to_vec()).ok()?)),
             _ => None,
         }
     }
@@ -216,14 +224,22 @@ impl BufSerializable for Command {
 
 #[test]
 fn test() {
-    use crate::message::kik_frame::KikFrame;
-    println!("{:?}", ReqCmd::from_buf(
-        ReqCmd::new("sfdid".to_string(), CmdOptions::default().with_timeout(false), Command::Ctrl(CtrlCommand::SetBigFile(
-            "werwrwerw".to_string(),
-            232,
-            vec![12, 3, 4, 5, 3, 6, 66, 12],
-            "".to_string(),
-        ))).to_buf()
-    )
-        .unwrap());
+    use crate::protocol::{CmdOptions, ReqCmd};
+    println!(
+        "{:?}",
+        ReqCmd::from_buf(
+            ReqCmd::new(
+                "sfdid".to_string(),
+                CmdOptions::default().with_timeout(false),
+                Command::Ctrl(CtrlCommand::SetBigFile(
+                    "werwrwerw".to_string(),
+                    232,
+                    vec![12, 3, 4, 5, 3, 6, 66, 12],
+                    "".to_string(),
+                ))
+            )
+            .to_buf()
+        )
+        .unwrap()
+    );
 }

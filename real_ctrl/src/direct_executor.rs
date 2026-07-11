@@ -7,11 +7,7 @@ use ctrl_common::ctrl_resp::{Resp, ServerResp, ServerSuccessResp};
 
 pub async fn execute(context: &Context, cmd: &String) -> anyhow::Result<RemoteResp> {
     match context
-        .agent
-        .clone()
-        .write()
-        .await
-        .req(&ReqCmd::new(
+        .request(&ReqCmd::new(
             id(),
             CmdOptions::default(),
             Command::Exec(cmd.to_string()),
@@ -24,13 +20,11 @@ pub async fn execute(context: &Context, cmd: &String) -> anyhow::Result<RemoteRe
             RemoteResp::Success(RemoteSuccessResp::Info(info.to_string())),
         ),
         Resp::Kik(KikResp::Error(err_code, info)) => {
-            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+            Ok(RemoteResp::Error(*err_code as u32, info.to_string()))
         }
         Resp::Server(ServerResp::Error(err_code, info)) => {
-            Ok(RemoteResp::Error(err_code.clone() as u32, info.to_string()))
+            Ok(RemoteResp::Error(*err_code as u32, info.to_string()))
         }
-        _ => {
-            unreachable!("should not happen")
-        }
+        _ => Err(anyhow::anyhow!("服务端响应类型与 Exec 命令不匹配")),
     }
 }

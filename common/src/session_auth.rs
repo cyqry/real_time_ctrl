@@ -7,6 +7,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub const CTRL_AUTH_V2_LABEL: &str = "real_ctrl.auth.v2";
 pub const CTRL_DATA_V2_LABEL: &str = "real_ctrl.data.v2";
 
+pub fn is_valid_nonce_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub fn random_nonce_hex() -> String {
     let mut nonce = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -14,8 +18,8 @@ pub fn random_nonce_hex() -> String {
 }
 
 pub fn hmac_sha256_hex(secret: &str, parts: &[&str]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 接受任意长度密钥");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 接受任意长度密钥");
     for part in parts {
         mac.update(part.as_bytes());
         mac.update(&[0]);
@@ -27,8 +31,8 @@ pub fn verify_hmac_sha256_hex(secret: &str, parts: &[&str], expected_hex: &str) 
     let Ok(expected) = hex::decode(expected_hex) else {
         return false;
     };
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 接受任意长度密钥");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 接受任意长度密钥");
     for part in parts {
         mac.update(part.as_bytes());
         mac.update(&[0]);
@@ -46,7 +50,11 @@ pub fn verify_ctrl_auth_proof(
     server_nonce: &str,
     proof: &str,
 ) -> bool {
-    verify_hmac_sha256_hex(secret, &[CTRL_AUTH_V2_LABEL, client_nonce, server_nonce], proof)
+    verify_hmac_sha256_hex(
+        secret,
+        &[CTRL_AUTH_V2_LABEL, client_nonce, server_nonce],
+        proof,
+    )
 }
 
 pub fn ctrl_data_proof(secret: &str, session_id: &str, channel_nonce: &str) -> String {
@@ -59,7 +67,11 @@ pub fn verify_ctrl_data_proof(
     channel_nonce: &str,
     proof: &str,
 ) -> bool {
-    verify_hmac_sha256_hex(secret, &[CTRL_DATA_V2_LABEL, session_id, channel_nonce], proof)
+    verify_hmac_sha256_hex(
+        secret,
+        &[CTRL_DATA_V2_LABEL, session_id, channel_nonce],
+        proof,
+    )
 }
 
 #[cfg(test)]
@@ -72,21 +84,26 @@ mod tests {
     #[test]
     fn nonce_has_expected_hex_len() {
         let nonce = random_nonce_hex();
-        assert_eq!(nonce.len(), 64);
-        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(super::is_valid_nonce_hex(&nonce));
     }
 
     #[test]
     fn auth_proof_round_trip() {
         let proof = ctrl_auth_proof("secret", "client", "server");
         assert!(verify_ctrl_auth_proof("secret", "client", "server", &proof));
-        assert!(!verify_ctrl_auth_proof("secret", "client2", "server", &proof));
+        assert!(!verify_ctrl_auth_proof(
+            "secret", "client2", "server", &proof
+        ));
     }
 
     #[test]
     fn data_proof_round_trip() {
         let proof = ctrl_data_proof("secret", "session", "channel");
-        assert!(verify_ctrl_data_proof("secret", "session", "channel", &proof));
-        assert!(!verify_ctrl_data_proof("secret", "session", "other", &proof));
+        assert!(verify_ctrl_data_proof(
+            "secret", "session", "channel", &proof
+        ));
+        assert!(!verify_ctrl_data_proof(
+            "secret", "session", "other", &proof
+        ));
     }
 }

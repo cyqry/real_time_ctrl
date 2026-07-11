@@ -6,26 +6,28 @@ use common::channel::{Channel, ChannelType};
 use common::config::Config;
 use common::ltc_codec::{
     LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH, DATA_MAX_FRAME_LENGTH,
+    INIT_MAX_FRAME_LENGTH,
 };
-use common::protocol;
 use common::protocol::kik_ping;
 use common::secure_transport::{
     accept_tls, build_server_tls_acceptor, split_stream, TransportParts,
 };
 use ctrl_common::ctrl_protocol::ctrl_ping;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 use tokio::{io, time};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 
 pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
+    // 连接许可在握手前获取，避免 TLS/半帧慢连接无限创建任务并占满内存。
+    let connection_limit = Arc::new(Semaphore::new(512));
     if let Some(tls_acceptor) = build_server_tls_acceptor(&config.security)? {
         let tls_listener = TcpListener::bind(format!(
             "{}:{}",
@@ -38,17 +40,30 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
         );
         let tls_context = context.clone();
         let tls_config = config.clone();
+        let tls_connection_limit = connection_limit.clone();
         tokio::spawn(async move {
             loop {
                 match tls_listener.accept().await {
                     Ok((stream, addr)) => {
+                        let Ok(permit) = tls_connection_limit.clone().try_acquire_owned() else {
+                            warn!("活动连接达到上限，拒绝 TLS 连接: {}", addr);
+                            continue;
+                        };
                         let acceptor = tls_acceptor.clone();
                         let context = tls_context.clone();
                         let config = tls_config.clone();
                         tokio::spawn(async move {
-                            match accept_tls(acceptor, stream).await {
+                            let _permit = permit;
+                            match accept_tls(acceptor, stream, config.read_timeout).await {
                                 Ok(parts) => {
-                                    handle_transport_parts(context, config, parts, addr).await;
+                                    handle_transport_parts(
+                                        context,
+                                        config,
+                                        parts,
+                                        addr,
+                                        TransportPolicy::TlsControl,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     error!("TLS 握手失败，远程地址:{}，error:{}", addr, e);
@@ -62,6 +77,8 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
                 }
             }
         });
+    } else {
+        warn!("未配置 TLS 管理端口；明文端口默认只接收 ctrl_kik，real_ctrl 将无法接入");
     }
 
     let listener =
@@ -72,8 +89,24 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     );
     loop {
         let (stream, addr) = listener.accept().await?;
-        tokio::spawn(handle_stream(context.clone(), config.clone(), stream, addr));
+        let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+            warn!("活动连接达到上限，拒绝明文连接: {}", addr);
+            continue;
+        };
+        tokio::spawn(handle_stream(
+            context.clone(),
+            config.clone(),
+            stream,
+            addr,
+            permit,
+        ));
     }
+}
+
+#[derive(Clone, Copy)]
+enum TransportPolicy {
+    Plain,
+    TlsControl,
 }
 
 async fn handle_stream(
@@ -81,9 +114,13 @@ async fn handle_stream(
     config: Config,
     stream: TcpStream,
     local_addr: SocketAddr,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!("设置 TCP_NODELAY 失败: {}", e);
+    }
     let parts = split_stream(stream);
-    handle_transport_parts(context, config, parts, local_addr).await;
+    handle_transport_parts(context, config, parts, local_addr, TransportPolicy::Plain).await;
 }
 
 async fn handle_transport_parts(
@@ -91,11 +128,12 @@ async fn handle_transport_parts(
     config: Config,
     parts: TransportParts,
     _remote_addr: SocketAddr,
+    transport_policy: TransportPolicy,
 ) {
-    // 服务端在 InitFrame 前还不知道连接角色，暂时采用数据通道上限保持兼容。
+    // InitFrame 本身很小；只有角色认证完成后才允许数据通道切换到大帧上限。
     let framed_read = FramedRead::new(
         BufReader::new(parts.reader),
-        LengthFieldBasedFrameDecoder::new_with_max_frame_len(DATA_MAX_FRAME_LENGTH),
+        LengthFieldBasedFrameDecoder::new_with_max_frame_len(INIT_MAX_FRAME_LENGTH),
     );
     let framed_arc = Arc::new(Mutex::new(framed_read));
     let channel_arc = Arc::new(Mutex::new(Channel::new(
@@ -105,10 +143,12 @@ async fn handle_transport_parts(
         parts.local_addr,
         parts.peer_addr,
     )));
+    channel_arc
+        .lock()
+        .await
+        .set_write_timeout(config.write_timeout);
 
-    //active逻辑
     let channel = channel_arc.clone();
-    handle_active(channel.clone()).await;
 
     let chan = channel.clone();
     tokio::spawn(async move {
@@ -126,7 +166,15 @@ async fn handle_transport_parts(
             Ok(res) => match res {
                 Some(Ok(msg)) => {
                     let channel = channel.clone();
-                    match handle_read(config.clone(), context.clone(), channel.clone(), msg).await {
+                    match handle_read(
+                        config.clone(),
+                        context.clone(),
+                        channel.clone(),
+                        msg,
+                        transport_policy,
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             let channel_type = channel.lock().await.channel_type.clone();
                             let max_frame_len = max_frame_len_for_channel_type(&channel_type);
@@ -151,17 +199,14 @@ async fn handle_transport_parts(
                 }
             },
             Err(e) => {
-                match channel.clone().lock().await.write_half_close().await {
-                    Ok(_) => {}
-                    Err(_) => {}
-                };
+                let _ = channel.clone().lock().await.write_half_close().await;
                 break Some(anyhow::Error::new(e));
             }
         };
     };
     let chan = channel.clone();
-    if e.is_some() {
-        handle_error(chan, e.unwrap()).await;
+    if let Some(error) = e {
+        handle_error(chan, error).await;
     }
 
     let chan = channel.clone();
@@ -202,7 +247,7 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
     let channel_type = channel.lock().await.channel_type.clone();
     match channel_type {
         ChannelType::Ctrl => {
-            context.delete_ctrl_conn().await;
+            context.delete_ctrl_conn_if(&channel).await;
         }
         ChannelType::CtrlData => {
             //清理
@@ -219,16 +264,13 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
             }
         }
         ChannelType::KikData => {
-            let kik_id = channel
-                .lock()
-                .await
-                .get::<String>("kik_id")
-                .unwrap()
-                .to_string();
             //清理
             context.delete_kik_data_conn(channel.clone()).await;
-            if let Some(kik) = context.delete_kik_if_not_online(kik_id.as_str()).await {
-                info!("【{}】下线，ip:{}", kik.kik_client_info.kik_info.name, ip);
+            let kik_id = channel.lock().await.get::<String>("kik_id").cloned();
+            if let Some(kik_id) = kik_id {
+                if let Some(kik) = context.delete_kik_if_not_online(&kik_id).await {
+                    info!("【{}】下线，ip:{}", kik.kik_client_info.kik_info.name, ip);
+                }
             }
         }
         ChannelType::Unknown => {
@@ -250,13 +292,11 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
             ChannelType::Kik | ChannelType::KikData => Some(kik_ping()),
             ChannelType::Unknown => None,
         };
-        if ping.is_none() {
-            continue;
-        }
+        let Some(ping) = ping else { continue };
 
         //服务端要保证得到状态之后延迟一点发，因为要等对方接收确认
         time::sleep(Duration::from_secs(5)).await;
-        match channel.lock().await.write_and_flush(&*ping.unwrap()).await {
+        match channel.lock().await.write_and_flush(&ping).await {
             Ok(_) => {}
             Err(_) => {
                 break;
@@ -265,14 +305,11 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     }
 }
 
-async fn handle_active(arc: Arc<Mutex<Channel>>) {}
-
 fn max_frame_len_for_channel_type(channel_type: &ChannelType) -> usize {
     match channel_type {
         ChannelType::Ctrl | ChannelType::Kik => CONTROL_MAX_FRAME_LENGTH,
-        ChannelType::CtrlData | ChannelType::KikData | ChannelType::Unknown => {
-            DATA_MAX_FRAME_LENGTH
-        }
+        ChannelType::CtrlData | ChannelType::KikData => DATA_MAX_FRAME_LENGTH,
+        ChannelType::Unknown => INIT_MAX_FRAME_LENGTH,
     }
 }
 
@@ -282,25 +319,23 @@ async fn handle_read(
     context: Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
+    transport_policy: TransportPolicy,
 ) -> anyhow::Result<()> {
     let channel_type = channel.clone().lock().await.channel_type.clone(); //这里不克隆直接match的话又会出现match的生命周期问题，导致死锁。
-    return match channel_type {
-        ChannelType::Ctrl => read_handle::handle_ctrl(context, channel, msg).await,
+    match channel_type {
+        ChannelType::Ctrl => {
+            read_handle::handle_ctrl(context, channel, msg, config.security.allow_remote_exec).await
+        }
         ChannelType::CtrlData => read_handle::handle_ctrl_data(context, channel, msg).await,
         ChannelType::Kik => read_handle::handle_kik(context, channel, msg).await,
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => {
             //未识别的连接连ping pong 都不让发； unknow到其他消息状态的转换最好是同步的，不然有问题
-            read_handle::handle_init_message(config, context, channel, msg).await
+            let allow_ctrl = matches!(transport_policy, TransportPolicy::TlsControl)
+                || config.security.allow_plain_ctrl;
+            let allow_kik = matches!(transport_policy, TransportPolicy::Plain);
+            read_handle::handle_init_message(config, context, channel, msg, allow_ctrl, allow_kik)
+                .await
         }
-    };
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::TcpStream;
-    use tokio::time::error::Elapsed;
-
-    #[test]
-    fn test() {}
+    }
 }

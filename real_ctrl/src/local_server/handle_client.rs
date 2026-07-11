@@ -3,7 +3,7 @@ use crate::api_service::RealCtrlApi;
 use crate::context::Context;
 use crate::pipe::pipe_common::{
     deserialize_pipe_request, serialize_api_response, PipeRequest, ServerResponse,
-    MAX_PIPE_REQUEST_BYTES, MAX_PIPE_RESPONSE_BYTES,
+    MAX_PIPE_REQUEST_BYTES, MAX_PIPE_RESPONSE_BYTES, PIPE_IO_TIMEOUT,
 };
 use anyhow::{anyhow, Context as AnyhowContext};
 use common::protocol::transfer_b_encode;
@@ -12,6 +12,7 @@ use interprocess::os::windows::named_pipe::tokio::PipeStream;
 use log::debug;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 pub async fn handle_client(
     context: Context,
@@ -21,7 +22,10 @@ pub async fn handle_client(
 
     loop {
         let mut len_buf = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut len_buf).await {
+        let read_len = timeout(PIPE_IO_TIMEOUT, stream.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| anyhow!("读取管道请求长度超时"))?;
+        if let Err(e) = read_len {
             return if e.kind() == io::ErrorKind::UnexpectedEof {
                 Ok(())
             } else {
@@ -42,7 +46,10 @@ pub async fn handle_client(
 
         debug!("msg_len: {}", msg_len);
         let mut data = vec![0u8; msg_len];
-        if let Err(e) = stream.read_exact(&mut data).await {
+        let read_body = timeout(PIPE_IO_TIMEOUT, stream.read_exact(&mut data))
+            .await
+            .map_err(|_| anyhow!("读取管道请求体超时"))?;
+        if let Err(e) = read_body {
             return if e.kind() == io::ErrorKind::UnexpectedEof {
                 Ok(())
             } else {
@@ -95,7 +102,13 @@ async fn write_framed_response(
     }
 
     let bytes_mut = transfer_b_encode(bys, 0, bys.len());
-    if let Err(e) = stream.write_all(&bytes_mut).await {
+    let write_result = timeout(PIPE_IO_TIMEOUT, async {
+        stream.write_all(&bytes_mut).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| anyhow!("写管道响应超时"))?;
+    if let Err(e) = write_result {
         return if e.kind() == io::ErrorKind::UnexpectedEof {
             Ok(())
         } else {

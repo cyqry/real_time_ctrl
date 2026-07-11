@@ -3,15 +3,14 @@ use crate::local_server::handle_client::handle_client;
 use crate::pipe::pipe_common::PIPE_NAME;
 use anyhow::{anyhow, Result};
 use common::config::{Config, Id, SecurityConfig};
-use common::generated::encrypted_strings::{PASSWORD, USER_NAME};
 use common::host::get_host_from_env_or_default;
-use interprocess::os::windows::named_pipe::{pipe_mode, tokio::*, PipeListenerOptions};
+use interprocess::os::windows::named_pipe::{pipe_mode, PipeListenerOptions};
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use log::{debug, error, info};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, io};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use widestring::U16CString;
 
 const PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
@@ -25,10 +24,7 @@ pub async fn create_context() -> anyhow::Result<Context> {
 
     let agent = Arc::new(RwLock::new(
         Agent::create(&Config {
-            id: Id {
-                username: USER_NAME(),
-                password: PASSWORD(),
-            },
+            id: Id::control_plane_from_env("REAL_CTRL_AUTH_SECRET")?,
             server_host: get_host_from_env_or_default("REAL_CTRL_SERVER_HOST"),
             server_port,
             read_timeout: Duration::from_secs(45),
@@ -66,6 +62,7 @@ pub async fn server(context: &Context) -> Result<()> {
     };
 
     info!("real_ctrl 本地管道已启动: {}", PIPE_NAME);
+    let client_limit = Arc::new(Semaphore::new(16));
 
     loop {
         let stream = match listener.accept().await {
@@ -76,8 +73,14 @@ pub async fn server(context: &Context) -> Result<()> {
             }
         };
 
+        let Ok(permit) = client_limit.clone().try_acquire_owned() else {
+            error!("命名管道并发连接达到上限，拒绝新连接");
+            continue;
+        };
+
         let context = context.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_client(context, stream).await {
                 error!("处理管道请求失败: {}", e);
             };

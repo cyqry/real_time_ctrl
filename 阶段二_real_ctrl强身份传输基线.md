@@ -144,3 +144,11 @@ git diff -- screen_stream
 3. `CtrlData` 连接通过 `session_id + channel_nonce + auth_tag` 绑定控制会话。
 4. `ctrl_server` 对 `real_ctrl` 会话、`ctrl_kik` 实例和命令能力做统一授权。
 5. 明确 `Exec` 等高危能力默认禁用或必须经策略显式放行。
+
+## 生产收敛补充（2026-07-11）
+
+- `real_ctrl` / `ctrl_server` 不再读取编译进 common 的用户名密码，改为 `REAL_CTRL_AUTH_SECRET` / `CTRL_SERVER_AUTH_SECRET` 部署注入，至少 32 个 ASCII 字符。
+- v2 HMAC 直接使用高熵部署秘密；历史摘要只保留给显式明文迁移协议。
+- TLS/明文 TCP 连接、TLS 握手、Channel 写入/flush/shutdown 都受配置超时控制。
+- TLS 端口只允许 Ctrl/CtrlData；明文端口默认只允许 Kik/KikData。E2E 已加入错误 pin 和明文控制拒绝用例。
+- 全局活动连接使用容量为 512 的 semaphore，防止 TLS 握手和慢半帧无限创建任务。

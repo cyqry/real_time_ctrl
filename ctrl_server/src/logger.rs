@@ -1,15 +1,19 @@
-use chrono::{DateTime, FixedOffset, Local, Utc};
-use log::{Level, LevelFilter};
-use std::cmp::Ordering;
-use std::{fs, io, path::PathBuf};
-use tracing_appender::non_blocking;
+use chrono::{DateTime, FixedOffset, Utc};
+use log::Level;
+use std::sync::OnceLock;
+use std::{fs, path::PathBuf};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_log::AsLog;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{
     fmt::{self, format::Writer, time::FormatTime},
-    EnvFilter, Layer, Registry,
+    EnvFilter, Layer,
 };
+
+static LOG_GUARDS: OnceLock<(
+    tracing_appender::non_blocking::WorkerGuard,
+    tracing_appender::non_blocking::WorkerGuard,
+)> = OnceLock::new();
 
 // 自定义时间格式
 #[derive(Clone)]
@@ -34,7 +38,6 @@ impl FormatTime for LocalTimer {
 pub struct LogConfig {
     pub dir: PathBuf,
     pub prefix: String,
-    pub file_size_mb: u64,
 }
 
 impl Default for LogConfig {
@@ -42,12 +45,11 @@ impl Default for LogConfig {
         Self {
             dir: PathBuf::from("./logs"),
             prefix: "app".to_string(),
-            file_size_mb: 100, // 每个文件最大100MB
         }
     }
 }
 
-pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn init_logging_with_config(config: LogConfig) -> anyhow::Result<()> {
     // 创建日志目录
     fs::create_dir_all(&config.dir)?;
 
@@ -65,13 +67,13 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
         .rotation(Rotation::DAILY) // 每天轮转
         .filename_prefix(format!("normal-{}", config.prefix)) // 文件名前缀为 my_app
         .filename_suffix("log")
-        .max_log_files(0) // 保留所有日志文件
+        .max_log_files(14)
         .build(&config.dir)?;
 
-    // let (non_blocking_writer, _guard) = non_blocking(default_appender);
+    let (default_writer, default_guard) = tracing_appender::non_blocking(default_appender);
     let default_layer = fmt::layer()
         .event_format(log_format.clone())
-        .with_writer(default_appender)
+        .with_writer(default_writer)
         // 过滤器: 结合 EnvFilter 的规则，并使用 filter_fn 明确排除 ERROR 及以上级别
         .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
             // 排除 ERROR 及以上的事件，避免与 error_layer 重复
@@ -84,12 +86,14 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
         // 文件名前缀为 my_app-error
         .filename_prefix(format!("error-{}", config.prefix))
         .filename_suffix("log")
-        .max_log_files(0) // 保留所有日志文件
+        .max_log_files(14)
         .build(&config.dir)?;
+
+    let (error_writer, error_guard) = tracing_appender::non_blocking(error_appender);
 
     let error_layer = fmt::layer()
         .event_format(log_format.clone())
-        .with_writer(error_appender)
+        .with_writer(error_writer)
         .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
 
     // 创建 EnvFilter 来读取 RUST_LOG 环境变量
@@ -102,6 +106,10 @@ pub fn init_logging_with_config(config: LogConfig) -> Result<(), Box<dyn std::er
         .with(default_layer) // 注册非 ERROR 日志层
         .with(error_layer) // 注册 ERROR 日志层
         .init();
+
+    if LOG_GUARDS.set((default_guard, error_guard)).is_err() {
+        return Err(anyhow::anyhow!("日志系统不能重复初始化"));
+    }
 
     Ok(())
 }

@@ -741,3 +741,14 @@ encrypted but not authenticated
 - 安卓控制端仍按用户要求暂不实现。
 - 进一步的商业级反逆向（壳、虚拟化、完整性自校验、远程证明）不建议在本项目内手写，需要结合发行渠道和威胁模型专项设计。
 - Android 控制端可以复用 `real_ctrl` 管理面安全模型。
+
+## 8. 生产收敛状态（2026-07-11）
+
+本计划的阶段一至五已经完成生产基线收敛，权威运行架构、限制和部署门槛见 `生产架构与安全验收.md`。
+
+需要特别保留的真实边界：
+
+- `real_ctrl -> ctrl_server` 已使用 pinned TLS 1.3 并完成 challenge/session/data binding，可防预期威胁模型内的中间人。
+- `ctrl_kik -> ctrl_server` 按既定最小客户端约束保持明文且不校验服务端身份，不能宣称抗 MITM。
+- `screen_stream` 与 Android 仍不在本轮实施范围。
+- 反逆向仅提高成本；授权与秘密不依赖客户端不可逆。

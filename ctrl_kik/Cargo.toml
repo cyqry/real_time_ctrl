@@ -3,6 +3,10 @@ name = "ctrl_kik"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# 任意命令执行是高危能力，生产默认不编译；启用时服务端仍需单独授权。
+dangerous-exec = []
+
 
 
 [dependencies]
@@ -30,8 +34,9 @@ windows = { version = "=0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
 ] }
 
 [target.'cfg(windows)'.dependencies]
 whoami = "1.4.1"
-winapi = {version="0.3.9",features = ["processthreadsapi", "winbase", "winnt","synchapi","wingdi","windef","winuser"]}
+winapi = {version="0.3.9",features = ["processthreadsapi", "winbase", "winnt","synchapi","wingdi","windef","winuser","handleapi"]}

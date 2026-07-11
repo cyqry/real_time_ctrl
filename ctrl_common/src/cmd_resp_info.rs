@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
-#[derive(Clone, Debug,Serialize,Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KikInfoVo {
     pub id: String,
     pub name: String,

@@ -90,3 +90,10 @@ cargo test -p common -p ctrl_common
 cargo check -p real_ctrl -p ctrl_kik -p ctrl_server
 git diff -- screen_stream
 ```
+
+## 生产收敛补充（2026-07-11）
+
+- 控制会话默认 12 小时过期，单会话最多记录 1024 个数据通道 nonce，CtrlData 上限 8。
+- 替换控制连接时原子安装新连接并关闭旧 CtrlData；旧连接的 inactive 回调通过 `Arc::ptr_eq` 判断所有权，不会清除新会话。
+- 控制命令写出后断线不再自动重放。real_ctrl 只恢复后续请求所需的控制/数据会话，并返回“本次结果未知”。
+- 服务端数据转发移除逐帧 `tokio::spawn`，按下游写入完成形成背压并保持分片顺序。

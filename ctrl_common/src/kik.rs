@@ -1,13 +1,12 @@
+use crate::entity::KikClientInfo;
+use chrono::{DateTime, Local};
 use common::channel::Channel;
 use common::kik_info::KikInfo;
-use chrono::{DateTime, Local};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
-use tokio::io::AsyncReadExt;
+use std::time::SystemTime;
 use tokio::sync::{Mutex, RwLock};
-use crate::entity::KikClientInfo;
 
 //Kik可看做指向一个(conn，data_conns)的指针
 #[derive(Clone)]
@@ -19,8 +18,8 @@ pub struct Kik {
     conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
     //data conn 的getid是 random id,  attr 一个 kik id;这里的key为 data conn的get_id
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
-    next_data_conn: Arc<AtomicU16>,
-    
+    next_data_conn: Arc<AtomicUsize>,
+
     //是否已上线(只在初始化时修改一次)
     initialized: Arc<AtomicBool>,
 }
@@ -35,9 +34,15 @@ pub struct KikLifeTime {
 }
 
 impl Kik {
-    pub fn new(id: &str, name: &str, ip: String, recent_online_time: SystemTime, conn: Arc<Mutex<Channel>>) -> Self {
+    pub fn new(
+        id: &str,
+        name: &str,
+        ip: String,
+        recent_online_time: SystemTime,
+        conn: Arc<Mutex<Channel>>,
+    ) -> Self {
         Kik {
-            kik_client_info:KikClientInfo{
+            kik_client_info: KikClientInfo {
                 kik_info: KikInfo {
                     id: Some(id.to_string()),
                     name: name.to_string(),
@@ -45,7 +50,7 @@ impl Kik {
                 ip: Arc::new(RwLock::new(ip)),
                 recent_online_time: Arc::new(RwLock::new(recent_online_time)),
             },
-            next_data_conn: Arc::new(AtomicU16::new(0)),
+            next_data_conn: Arc::new(AtomicUsize::new(0)),
             conn_op: Arc::new(RwLock::new(Some(conn))),
             data_conns: Arc::new(Mutex::new(HashMap::new())),
             initialized: Arc::new(AtomicBool::new(false)),
@@ -55,24 +60,22 @@ impl Kik {
         let next_arc = self.next_data_conn.clone();
         let data_map_arc = self.data_conns.clone();
         let data_map = data_map_arc.lock().await;
-        if data_map.len() == 0 {
+        if data_map.is_empty() {
             None
         } else {
-            let next = (next_arc.load(Ordering::SeqCst) + 1) % data_map.len() as u16;
-            let c = data_map.values().nth(next as usize).unwrap().clone();
-            next_arc.store(next + 1, Ordering::SeqCst);
-            Some(c)
+            let next = next_arc.fetch_add(1, Ordering::Relaxed) % data_map.len();
+            data_map.values().nth(next).cloned()
         }
     }
 
     pub fn set_kik_initialized(&self, initialized: bool) {
         self.initialized.store(initialized, Ordering::SeqCst);
     }
-    
+
     pub fn initialized(&self) -> bool {
         self.initialized.load(Ordering::SeqCst)
     }
-    
+
     pub async fn exist_kik_conn(&self) -> bool {
         self.conn_op.clone().read().await.is_some()
     }
@@ -100,11 +103,14 @@ impl Kik {
         self.data_conns.lock().await.remove(id.as_str())
     }
 
-    pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) {
-        self.data_conns
-            .lock()
-            .await
-            .insert(conn.clone().lock().await.get_id().to_string(), conn);
+    pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) -> bool {
+        let id = conn.lock().await.get_id().to_string();
+        let mut connections = self.data_conns.lock().await;
+        if connections.len() >= 4 && !connections.contains_key(&id) {
+            return false;
+        }
+        connections.insert(id, conn);
+        true
     }
     pub async fn exist_data_channel(&self) -> bool {
         !self.data_conns.clone().lock().await.is_empty()

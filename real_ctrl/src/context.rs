@@ -9,7 +9,7 @@ use ctrl_common::ctrl_frame::Frame;
 use ctrl_common::ctrl_protocol::ctrl_cmd_req;
 use ctrl_common::ctrl_resp::CmdResp;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -17,16 +17,16 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time;
 use uuid::Uuid;
 
+type DataMessage = (String, BytesMut);
+type SharedDataReceiver = Arc<Mutex<Receiver<DataMessage>>>;
+
 #[derive(Clone)]
 pub struct Context {
     //ctrl 必须由代理独有
     pub agent: Arc<RwLock<Agent>>,
     data_conns: Arc<RwLock<HashMap<String, Arc<Mutex<Channel>>>>>,
-    next_data_conn: Arc<AtomicU16>,
-    data_x: (
-        Sender<(String, BytesMut)>,
-        Arc<Mutex<Receiver<(String, BytesMut)>>>,
-    ),
+    next_data_conn: Arc<AtomicUsize>,
+    data_x: (Sender<DataMessage>, SharedDataReceiver),
 }
 
 //
@@ -43,7 +43,7 @@ impl Context {
         Context {
             agent,
             data_conns: Arc::new(RwLock::new(HashMap::new())),
-            next_data_conn: Arc::new(AtomicU16::new(0)),
+            next_data_conn: Arc::new(AtomicUsize::new(0)),
             data_x: (tx, Arc::new(Mutex::new(rx))),
         }
     }
@@ -88,40 +88,69 @@ impl Context {
     }
 
     pub async fn wait_data(&self, data_id: &str) -> anyhow::Result<Vec<u8>> {
-        for _ in 0..3 {
-            //害怕有大文件，所以不设置超时时间
-            match self.get_data_rx().lock().await.recv().await {
-                None => {
-                    unreachable!("unreachable");
-                }
-                Some((id, data)) => {
-                    if id == data_id {
-                        return Ok(data.to_vec());
-                    } else {
-                        //有过期数据，重试三次
-                        continue;
-                    }
+        let receive = async {
+            for _ in 0..8 {
+                match self.get_data_rx().lock().await.recv().await {
+                    None => return Err(anyhow::Error::msg("数据通道已关闭")),
+                    Some((id, data)) if id == data_id => return Ok(data.to_vec()),
+                    Some(_) => continue,
                 }
             }
-        }
-        Err(anyhow::Error::msg("获取到的文件有错误!"))
+            Err(anyhow::Error::msg("连续收到不匹配的数据帧"))
+        };
+        tokio::time::timeout(Duration::from_secs(6 * 60), receive)
+            .await
+            .map_err(|_| anyhow::anyhow!("等待数据响应超时"))?
     }
 
     pub async fn find_ctrl_data(&self) -> Option<Arc<Mutex<Channel>>> {
         let next_arc = self.next_data_conn.clone();
         let arc = self.data_conns.clone();
         let data_map = arc.read().await;
-        if data_map.len() == 0 {
+        if data_map.is_empty() {
             return None;
         }
-        let next = (next_arc.load(Ordering::SeqCst) + 1) % data_map.len() as u16;
-        let c = data_map.values().nth(next as usize).unwrap().clone();
-        next_arc.store(next + 1, Ordering::SeqCst);
+        let next = next_arc.fetch_add(1, Ordering::Relaxed) % data_map.len();
+        let c = data_map.values().nth(next).cloned()?;
         Some(c)
     }
     pub async fn data_init(&self) -> anyhow::Result<()> {
         let config = self.agent.read().await.config.clone();
         ctrl_data_conn(self.clone(), &config).await
+    }
+
+    pub async fn request(&self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
+        let request_result = self.agent.write().await.req(cmd).await;
+        if let Ok(response) = request_result {
+            return Ok(response);
+        }
+
+        // 控制命令可能已经被服务端执行。自动重放会让写文件或 Exec 等非幂等操作执行两次，
+        // 因此这里只恢复后续请求所需的会话，并明确返回“结果未知”。
+        if self.agent.write().await.re_conn(2).await.is_ok() {
+            self.reset_data_connections().await;
+            self.data_init()
+                .await
+                .map_err(|error| anyhow::anyhow!("控制连接已恢复，但数据通道恢复失败: {error}"))?;
+            return Err(anyhow::anyhow!(
+                "连接已恢复；为避免重复执行，本次命令未自动重放，请先查询状态再决定是否重试"
+            ));
+        }
+
+        Err(anyhow::anyhow!("控制连接中断且自动恢复失败"))
+    }
+
+    async fn reset_data_connections(&self) {
+        let old_connections = {
+            let mut connections = self.data_conns.write().await;
+            connections
+                .drain()
+                .map(|(_, channel)| channel)
+                .collect::<Vec<_>>()
+        };
+        for channel in old_connections {
+            channel.lock().await.try_write_half_close().await;
+        }
     }
 }
 
@@ -136,10 +165,7 @@ impl Agent {
         })
     }
     pub async fn close(&mut self) {
-        match self.conn.clone().lock().await.write_half_close().await {
-            Ok(_) => {}
-            Err(_) => {}
-        }
+        let _ = self.conn.clone().lock().await.write_half_close().await;
     }
     pub async fn re_conn(&mut self, retry_count: u32) -> anyhow::Result<()> {
         let mut re = anyhow::Error::msg("unreachable!");
@@ -162,39 +188,23 @@ impl Agent {
     }
 
     pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
-        let mut re = anyhow::Error::msg("unreachable!");
-        //由于编译器无法确定这个for是否至少有一次循环，所以需要re变量初始化
-        for _ in 0..3 {
-            //write
-            match self
-                .conn
-                .clone()
-                .lock()
-                .await
-                .write_and_flush(&ctrl_cmd_req(cmd.clone()))
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    re = e;
-                    self.re_conn(2).await?;
-                    continue;
-                }
-            };
+        self.conn
+            .lock()
+            .await
+            .write_and_flush(&ctrl_cmd_req(cmd.clone()))
+            .await?;
 
-            //read
-            match self.recv.recv().await {
-                None => {
-                    re = anyhow::Error::msg("无法读");
-                    self.re_conn(2).await?;
-                    continue;
-                }
-                Some(resp) => {
-                    return Ok(resp);
-                }
+        for _ in 0..8 {
+            let response = self
+                .recv
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("控制响应通道已关闭"))?;
+            if response.get_cmd_id() == cmd.get_id() {
+                return Ok(response);
             }
         }
-        Err(re)
+        Err(anyhow::anyhow!("连续收到不匹配的控制响应"))
     }
 }
 

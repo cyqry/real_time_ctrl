@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use bytes::BytesMut;
 use common::command::LocalCommand::LocalExit;
 use common::command::SysCommand::*;
-use common::command::{Command, CtrlCommand, LocalCommand, SysCommand};
+use common::command::{CtrlCommand, LocalCommand, SysCommand};
 use common::message::kik_cmd_resp_info;
 use common::protocol::BufSerializable;
 use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
@@ -52,20 +52,18 @@ impl BufSerializable for RemoteResp {
     where
         Self: Sized,
     {
-        let resp = postcard::from_bytes::<RemoteResp>(bys.to_vec().as_slice())
-            .expect("failed to serialize RemoteResp");
-        Some(resp)
+        postcard::from_bytes::<RemoteResp>(bys.as_ref()).ok()
     }
 }
 
 #[cfg(target_os = "windows")]
-static DEFAULT_SCREEN_PATH: &str = "D:\\MyTest\\1.png";
+static DEFAULT_SCREEN_PATH: &str = "target\\screen\\1.png";
 
 impl From<InputCtrlCommand> for CtrlCommand {
     fn from(value: InputCtrlCommand) -> Self {
         match value {
-            InputCtrlCommand::GetFile(a, b) => CtrlCommand::GetFile(a, "".to_string()),
-            InputCtrlCommand::GetBigFile(a, b) => CtrlCommand::GetFile(a, "".to_string()),
+            InputCtrlCommand::GetFile(a, _) => CtrlCommand::GetFile(a, "".to_string()),
+            InputCtrlCommand::GetBigFile(a, _) => CtrlCommand::GetBigFile(a, "".to_string()),
             InputCtrlCommand::Ls(s) => CtrlCommand::Ls(s),
             InputCtrlCommand::Screen(s) => CtrlCommand::Screen(s),
             InputCtrlCommand::SetFile(_, _) => {
@@ -84,10 +82,10 @@ impl FromStr for InputCommand {
     fn from_str(mut s: &str) -> Result<Self, Self::Err> {
         s = s.trim();
         if s.is_empty() {
-            panic!("parse empty");
+            return Err(anyhow!("命令不能为空"));
         }
-        if s.starts_with("$") {
-            let parts: Vec<&str> = s[1..].split_whitespace().collect();
+        if let Some(command_body) = s.strip_prefix('$') {
+            let parts: Vec<&str> = command_body.split_whitespace().collect();
 
             match parts.as_slice() {
                 ["sys_now"] => Ok(InputCommand::Sys(Now)),
@@ -160,20 +158,12 @@ pub fn deserialize_command(bytes: &[u8]) -> anyhow::Result<InputCommand> {
 }
 
 #[test]
-fn test() {
-    println!("{}", (0 as *mut String).is_null()); //true
-                                                  // let x = 0x10 as *mut String;
-                                                  // unsafe { println!("{}", *x); }
-    let parts: Vec<&str> = "etst est".split_ascii_whitespace().collect();
-    let c: InputCommand = "$ls sdfsdf -r".parse().unwrap();
-    println!("{:?}", c);
-    match parts.as_slice() {
-        //  _ @ ..  是一种 匹配模式,匹配剩余的元素
-        ["etst", s, others @ ..] => {
-            println!("{}", others.len()); // 0
-        }
-        _ => {}
-    }
+fn parses_recursive_ls_command() {
+    let command: InputCommand = "$ls sdfsdf -r".parse().unwrap();
+    assert!(matches!(
+        command,
+        InputCommand::Ctrl(InputCtrlCommand::Ls(path)) if path == "sdfsdf -r"
+    ));
 }
 
 #[test]

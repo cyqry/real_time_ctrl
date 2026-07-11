@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$PlainPort = 9002,
     [int]$TlsPort = 19443,
     [int]$HttpPort = 9000
@@ -14,6 +14,7 @@ $CertDir = Join-Path $E2eDir "certs"
 $LogDir = Join-Path $E2eDir "logs"
 $ReportPath = Join-Path $E2eDir "e2e_report.json"
 $ApiToken = "e2e-local-token"
+$ControlAuthSecret = "e2e-control-auth-secret-0123456789abcdef"
 
 New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir | Out-Null
 Set-Content -LiteralPath (Join-Path $E2eDir "ctrl_ls_marker.txt") -Encoding UTF8 -Value "real_time_ctrl e2e marker"
@@ -189,11 +190,18 @@ function Start-E2eProcess {
         throw "Failed to start $Name"
     }
 
+    # 重定向管道必须立刻异步排空；否则认证失败时的 backtrace 可能填满 stderr，
+    # 让被测进程阻塞在退出路径，进而把安全拒绝误判为超时。
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+
     $entry = [pscustomobject]@{
-        Name   = $Name
-        Proc   = $process
-        StdOut = Join-Path $LogDir "$Name.stdout.log"
-        StdErr = Join-Path $LogDir "$Name.stderr.log"
+        Name          = $Name
+        Proc          = $process
+        StdOut        = Join-Path $LogDir "$Name.stdout.log"
+        StdErr        = Join-Path $LogDir "$Name.stderr.log"
+        StdOutTask    = $stdoutTask
+        StdErrTask    = $stderrTask
     }
     $script:Processes += $entry
     $entry
@@ -215,12 +223,29 @@ function Stop-E2eProcesses {
             }
         } finally {
             if ($proc) {
-                $stdout = $proc.StandardOutput.ReadToEnd()
-                $stderr = $proc.StandardError.ReadToEnd()
+                $stdout = $entry.StdOutTask.Result
+                $stderr = $entry.StdErrTask.Result
                 Set-Content -LiteralPath $entry.StdOut -Encoding UTF8 -Value $stdout
                 Set-Content -LiteralPath $entry.StdErr -Encoding UTF8 -Value $stderr
             }
         }
+    }
+}
+
+function Assert-RealCtrlRejected {
+    param(
+        [string]$Name,
+        [hashtable]$EnvMap
+    )
+    $entry = Start-E2eProcess `
+        -Name $Name `
+        -ExePath (Join-Path $Root "target\debug\real_ctrl.exe") `
+        -EnvMap $EnvMap
+    if (-not $entry.Proc.WaitForExit(10000)) {
+        throw "$Name did not reject the unsafe connection within 10 seconds"
+    }
+    if ($entry.Proc.ExitCode -eq 0) {
+        throw "$Name unexpectedly exited successfully"
     }
 }
 
@@ -266,6 +291,7 @@ try {
         "CTRL_SERVER_TLS_CERT" = $cert.Cert
         "CTRL_SERVER_TLS_KEY" = $cert.Key
         "CTRL_SERVER_E2E_TRACE_PATH" = (Join-Path $E2eDir "ctrl_server_trace.log")
+        "CTRL_SERVER_AUTH_SECRET" = $ControlAuthSecret
         "RUST_BACKTRACE" = "1"
     }
     $kikEnv = @{}
@@ -279,6 +305,7 @@ try {
         "REAL_CTRL_HTTP_LOCK_PATH" = (Join-Path $E2eDir "real_ctrl_http.lock")
         "REAL_CTRL_E2E_TRACE_PATH" = (Join-Path $E2eDir "real_ctrl_trace.log")
         "REAL_CTRL_API_TOKEN" = $ApiToken
+        "REAL_CTRL_AUTH_SECRET" = $ControlAuthSecret
         "RUST_BACKTRACE" = "1"
     }
 
@@ -287,6 +314,18 @@ try {
     Wait-TcpPort -HostName "127.0.0.1" -Port $PlainPort -TimeoutSeconds 20
     Wait-TlsEndpoint -HostName "127.0.0.1" -Port $TlsPort -ServerName "real-ctrl-server" -CaCert $cert.Cert -TimeoutSeconds 20
     $result.assertions += "ctrl_server plain/tls ports listening"
+
+    $wrongPinEnv = $realCtrlEnv.Clone()
+    $wrongPinEnv["REAL_CTRL_TLS_SERVER_SPKI_SHA256"] = "0" * 64
+    $wrongPinEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "wrong_pin_trace.log")
+    Assert-RealCtrlRejected -Name "real_ctrl_wrong_pin_probe" -EnvMap $wrongPinEnv
+    $result.assertions += "pinned TLS rejects wrong server SPKI pin"
+
+    $plainCtrlEnv = $realCtrlEnv.Clone()
+    $plainCtrlEnv["REAL_CTRL_ALLOW_PLAIN"] = "1"
+    $plainCtrlEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "plain_ctrl_trace.log")
+    Assert-RealCtrlRejected -Name "real_ctrl_plain_probe" -EnvMap $plainCtrlEnv
+    $result.assertions += "ctrl_server plain port rejects real_ctrl role by default"
 
     $kik = Start-E2eProcess -Name "ctrl_kik" -ExePath (Join-Path $Root "target\debug\ctrl_kik.exe") -EnvMap $kikEnv
     $result.started += @{ name = "ctrl_kik"; pid = $kik.Proc.Id }

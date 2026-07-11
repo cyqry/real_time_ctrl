@@ -6,6 +6,7 @@
 - 强安全模式缺少 CA 证书或 SPKI pin 时必须失败，不能自动降级到明文。
 - `server_host` 是连接地址，服务端身份由证书和 SPKI pin 校验，不绑定 IP。
 - TLS 模式下控制通道必须走 challenge/session，数据通道必须绑定 session；不要恢复静态摘要过线。
+- `REAL_CTRL_AUTH_SECRET` 至少 32 个 ASCII 字符，缺失或过短时必须启动失败；不得提供编译期默认值。
 
 ## 职责边界
 
@@ -13,7 +14,7 @@
 
 ## 安全约束
 
-- `real_ctrl -> ctrl_server` 必须逐步升级为服务端身份可验证的安全连接。
+- `real_ctrl -> ctrl_server` 生产链路必须使用服务端身份可验证的 pinned TLS 连接。
 - 服务端身份校验不绑定 IP，优先使用服务端公钥 pin 或私有 CA pin。
 - 本地 HTTP 默认只监听 `127.0.0.1`，不能默认暴露到公网地址。
 - 本地命名管道需要限制访问主体，不能让任意本机低权限进程直接调用高危控制能力。
@@ -31,7 +32,12 @@
 - `Exec` 对开放 API 默认禁用，只能通过 `REAL_CTRL_API_ALLOW_EXEC=1` 显式开启。
 - `config/app.toml` 默认必须绑定 `127.0.0.1`；如果改成非 loopback，必须同步配置 `REAL_CTRL_API_TOKEN` 并记录原因。
 - 本地管道创建时必须保留 SDDL DACL 和 `accept_remote(false)` / `inheritable(false)`。
-- 生产发布优先使用 `cargo build -p real_ctrl --profile hardened`。
+- 生产发布优先使用根目录 `scripts/build_hardened.ps1`，由脚本统一启用 hardened profile、锁定依赖和 Windows CFG。
+- 三个进程形态统一依赖 `real_ctrl/src/lib.rs` 的 library 组合根；禁止在各 bin 中重新 `mod` 同一批业务模块。
+- HTTP 路由必须由启动组合根通过 `routes::router()` 显式安装；不能只依赖 library 内的 inventory 注册，否则链接器可能丢弃未直接引用的注册对象并形成空路由表。
+- 已成功写出的控制命令不得在断线后自动重放；连接恢复后应返回“结果未知”，由调用者查询状态后决定是否重试。
+- HTTP 非 loopback 绑定必须在启动时验证至少 32 字符的 `REAL_CTRL_API_TOKEN`；配置文件缺失时不能回退到框架的 `0.0.0.0` 默认值。
+- 命名管道每次读写必须有超时，服务端并发连接上限为 16；HTTP 请求体默认上限 1 MiB。
 
 ## 测试要求
 

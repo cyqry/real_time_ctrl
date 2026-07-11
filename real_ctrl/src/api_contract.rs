@@ -4,6 +4,11 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: u16 = 1;
+pub const MAX_REQUEST_ID_BYTES: usize = 128;
+pub const MAX_KIK_ID_BYTES: usize = 128;
+pub const MAX_PATH_BYTES: usize = 32 * 1024;
+pub const MAX_EXEC_COMMAND_BYTES: usize = 32 * 1024;
+pub const MAX_API_BINARY_BYTES: usize = 48 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRequest {
@@ -100,6 +105,19 @@ impl ApiRequest {
             command,
         }
     }
+
+    pub fn validate(&self) -> Result<(), ApiErrorBody> {
+        if self
+            .request_id
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_REQUEST_ID_BYTES)
+        {
+            return Err(ApiErrorBody::bad_request(format!(
+                "request_id 必须为 1..={MAX_REQUEST_ID_BYTES} bytes"
+            )));
+        }
+        self.command.validate()
+    }
 }
 
 impl ApiResponse {
@@ -149,6 +167,10 @@ impl ApiErrorBody {
         Self::new("internal", message)
     }
 
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new("payload_too_large", message)
+    }
+
     pub fn unsupported_version(version: u16) -> Self {
         Self::new(
             "unsupported_version",
@@ -165,6 +187,63 @@ impl ApiErrorBody {
 }
 
 impl ApiCommand {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ApiCommand::SysList => "sys_list",
+            ApiCommand::SysNow => "sys_now",
+            ApiCommand::SysUse { .. } => "sys_use",
+            ApiCommand::CtrlLs { .. } => "ctrl_ls",
+            ApiCommand::CtrlScreen { .. } => "ctrl_screen",
+            ApiCommand::CtrlGetFile { .. } => "ctrl_get_file",
+            ApiCommand::CtrlGetBigFile { .. } => "ctrl_get_big_file",
+            ApiCommand::CtrlSetFile { .. } => "ctrl_set_file",
+            ApiCommand::CtrlSetBigFile { .. } => "ctrl_set_big_file",
+            ApiCommand::Exec { .. } => "exec",
+        }
+    }
+
+    fn validate(&self) -> Result<(), ApiErrorBody> {
+        match self {
+            ApiCommand::SysList | ApiCommand::SysNow => Ok(()),
+            ApiCommand::SysUse { kik_id } => validate_text(kik_id, "kik_id", MAX_KIK_ID_BYTES),
+            ApiCommand::CtrlLs { path } => validate_path(path, "path", false),
+            ApiCommand::CtrlScreen { save_path } => {
+                if let Some(path) = save_path {
+                    validate_path(path, "save_path", false)?;
+                }
+                Ok(())
+            }
+            ApiCommand::CtrlGetFile {
+                remote_path,
+                local_path,
+            }
+            | ApiCommand::CtrlGetBigFile {
+                remote_path,
+                local_path,
+            } => {
+                validate_path(remote_path, "remote_path", false)?;
+                if let Some(path) = local_path {
+                    validate_path(path, "local_path", true)?;
+                }
+                Ok(())
+            }
+            ApiCommand::CtrlSetFile {
+                local_path,
+                remote_path,
+            }
+            | ApiCommand::CtrlSetBigFile {
+                local_path,
+                remote_path,
+            } => {
+                validate_path(local_path, "local_path", false)?;
+                validate_path(remote_path, "remote_path", false)
+            }
+            ApiCommand::Exec { command } => {
+                validate_text(command, "command", MAX_EXEC_COMMAND_BYTES)
+            }
+        }
+    }
+
     pub fn into_input_command(self) -> InputCommand {
         match self {
             ApiCommand::SysList => InputCommand::Sys(common::command::SysCommand::List),
@@ -203,6 +282,22 @@ impl ApiCommand {
     }
 }
 
+fn validate_path(value: &str, field: &str, allow_empty: bool) -> Result<(), ApiErrorBody> {
+    if allow_empty && value.is_empty() {
+        return Ok(());
+    }
+    validate_text(value, field, MAX_PATH_BYTES)
+}
+
+fn validate_text(value: &str, field: &str, max_bytes: usize) -> Result<(), ApiErrorBody> {
+    if value.is_empty() || value.len() > max_bytes || value.contains('\0') {
+        return Err(ApiErrorBody::bad_request(format!(
+            "{field} 必须为 1..={max_bytes} bytes 且不能包含 NUL"
+        )));
+    }
+    Ok(())
+}
+
 pub fn remote_resp_to_api_data(
     command: &InputCommand,
     response: RemoteResp,
@@ -217,6 +312,12 @@ pub fn remote_resp_to_api_data(
         }
         RemoteResp::Success(RemoteSuccessResp::Now(value)) => Ok(ApiResponseData::SysNow { value }),
         RemoteResp::SuccessData(bytes) => {
+            if bytes.len() > MAX_API_BINARY_BYTES {
+                return Err(ApiErrorBody::payload_too_large(format!(
+                    "二进制响应超过开放 API 上限 {} bytes，请改用受控文件传输流程",
+                    MAX_API_BINARY_BYTES
+                )));
+            }
             let (content_type, filename) = binary_meta(command);
             Ok(ApiResponseData::Binary {
                 content_type,
@@ -270,5 +371,18 @@ mod tests {
             }
             _ => panic!("响应类型错误"),
         }
+    }
+
+    #[test]
+    fn api_request_rejects_oversized_or_nul_fields() {
+        let oversized = ApiRequest::new(ApiCommand::SysUse {
+            kik_id: "x".repeat(MAX_KIK_ID_BYTES + 1),
+        });
+        assert!(oversized.validate().is_err());
+
+        let nul_path = ApiRequest::new(ApiCommand::CtrlLs {
+            path: "C:\\Temp\0hidden".to_string(),
+        });
+        assert!(nul_path.validate().is_err());
     }
 }

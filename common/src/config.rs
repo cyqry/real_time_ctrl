@@ -1,4 +1,5 @@
 use crate::auth_util;
+use anyhow::{anyhow, Context};
 use std::env;
 use std::string::ToString;
 use std::time::Duration;
@@ -20,6 +21,32 @@ pub struct Id {
 }
 
 impl Id {
+    /// 从进程级秘密注入控制面凭据，避免把可复用控制秘密编译进客户端或服务端二进制。
+    pub fn control_plane_from_env(name: &str) -> anyhow::Result<Self> {
+        let secret =
+            env::var(name).with_context(|| format!("缺少控制面认证秘密环境变量 {name}"))?;
+        let secret = secret.trim().to_string();
+        if secret.len() < 32 {
+            return Err(anyhow!("{name} 至少需要 32 个 ASCII 字符"));
+        }
+        if !secret.is_ascii() {
+            return Err(anyhow!(
+                "{name} 当前只接受 ASCII，避免跨平台编码产生不同 HMAC"
+            ));
+        }
+
+        Ok(Self {
+            username: "real_ctrl_v2".to_string(),
+            password: secret,
+        })
+    }
+
+    /// v2 challenge/session 直接使用高熵部署秘密作为 HMAC key，不再套用历史摘要算法。
+    pub fn control_plane_secret(&self) -> &str {
+        &self.password
+    }
+
+    /// 仅供显式明文迁移模式兼容旧协议，不能作为抗中间人安全边界。
     pub fn encrypt(&self) -> String {
         auth_util::encrypt(self.username.as_str(), self.password.as_str())
     }
@@ -40,6 +67,10 @@ pub struct SecurityConfig {
     pub ca_cert_path: Option<String>,
     pub server_cert_path: Option<String>,
     pub server_key_path: Option<String>,
+    /// 仅迁移期允许服务端明文端口接收 real_ctrl；生产默认必须关闭。
+    pub allow_plain_ctrl: bool,
+    /// 服务端最终授权开关；开放 API 和 ctrl_kik 构建能力不能绕过它。
+    pub allow_remote_exec: bool,
 }
 
 impl SecurityConfig {
@@ -52,6 +83,8 @@ impl SecurityConfig {
             ca_cert_path: None,
             server_cert_path: None,
             server_key_path: None,
+            allow_plain_ctrl: false,
+            allow_remote_exec: false,
         }
     }
 
@@ -76,6 +109,8 @@ impl SecurityConfig {
         config.tls_port = env::var("CTRL_SERVER_TLS_PORT").unwrap_or(config.tls_port);
         config.server_cert_path = env::var("CTRL_SERVER_TLS_CERT").ok();
         config.server_key_path = env::var("CTRL_SERVER_TLS_KEY").ok();
+        config.allow_plain_ctrl = env_flag("CTRL_SERVER_ALLOW_PLAIN_CTRL");
+        config.allow_remote_exec = env_flag("CTRL_SERVER_ALLOW_EXEC");
         config
     }
 
@@ -91,5 +126,15 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-pub static DEFAULT_USER_NAME: &str = "user";
-pub static DEFAULT_PASS_WARD: &str = "123456";
+#[cfg(test)]
+mod tests {
+    use super::Id;
+
+    #[test]
+    fn control_plane_secret_requires_minimum_length() {
+        std::env::set_var("RTC_TEST_SHORT_SECRET", "too-short");
+        let result = Id::control_plane_from_env("RTC_TEST_SHORT_SECRET");
+        std::env::remove_var("RTC_TEST_SHORT_SECRET");
+        assert!(result.is_err());
+    }
+}
