@@ -13,6 +13,7 @@
       <sourceFolder url="file://$MODULE_DIR$/ctrl_common/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/screen_stream/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/screen_stream/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/string_obfuscation_macros/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/real_ctrl/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>

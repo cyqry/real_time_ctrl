@@ -3,6 +3,8 @@
 *.lock
 .idea
 rust-toolchain.toml
+!ctrl_kik/rust-toolchain.toml
 Cargo.lock
 **/Cargo.lock
+!/Cargo.lock
 **/encrypted_strings.rs

@@ -9,6 +9,9 @@ pub async fn distribution(context: &Context, command: InputCommand) -> anyhow::R
         InputCommand::Sys(sys) => match server_executor::execute(context, sys).await? {
             RemoteResp::Success(RemoteSuccessResp::Info(info)) => Ok(info),
             RemoteResp::Success(RemoteSuccessResp::SysList(vec)) => Ok(format_sys_list(vec)),
+            RemoteResp::Success(RemoteSuccessResp::History(records)) => {
+                Ok(format_kik_history(records))
+            }
             RemoteResp::Success(RemoteSuccessResp::Now(now)) => Ok(format_now(now)),
             RemoteResp::Error(_code, info) => Err(anyhow::anyhow!(info)),
             _ => Err(anyhow::anyhow!("系统命令响应类型不匹配")),
@@ -165,4 +168,27 @@ fn format_sys_list(kiks: Vec<KikInfoVo>) -> String {
         info += format!("{}--->{}\n", kik.id, kik.name).as_str();
     }
     info
+}
+
+fn format_kik_history(records: Vec<ctrl_common::cmd_resp_info::KikPresenceVo>) -> String {
+    use chrono::{Local, TimeZone};
+
+    let mut output = String::new();
+    for record in records {
+        let online_time = Local
+            .timestamp_millis_opt(record.recent_online_unix_ms as i64)
+            .single()
+            .map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let offline_time = record
+            .recent_offline_unix_ms
+            .and_then(|time| Local.timestamp_millis_opt(time as i64).single())
+            .map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        output.push_str(&format!(
+            "{} | {} | {} | online={} | recent_online={} | recent_offline={}\n",
+            record.id, record.name, record.ip, record.online, online_time, offline_time
+        ));
+    }
+    output
 }

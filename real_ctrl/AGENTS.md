@@ -2,11 +2,12 @@
 
 ## 阶段二安全传输补充
 
-- `real_ctrl` 默认必须使用 pinned TLS 连接 `ctrl_server`。只有本地开发或迁移兼容可显式设置 `REAL_CTRL_ALLOW_PLAIN=1`。
+- `real_ctrl` 必须使用 pinned TLS 连接 `ctrl_server`，旧明文路径已经删除。
 - 强安全模式缺少 CA 证书或 SPKI pin 时必须失败，不能自动降级到明文。
 - `server_host` 是连接地址，服务端身份由证书和 SPKI pin 校验，不绑定 IP。
 - TLS 模式下控制通道必须走 challenge/session，数据通道必须绑定 session；不要恢复静态摘要过线。
-- `REAL_CTRL_AUTH_SECRET` 至少 32 个 ASCII 字符，缺失或过短时必须启动失败；不得提供编译期默认值。
+- `REAL_CTRL_AUTH_SECRET` 至少 32 个 ASCII 字符。发布构建必须提供经 `hidden!(env!(...))` 加密的
+  默认值以支持 EXE 直启；同名运行环境变量优先且仍需通过长度校验。
 
 ## 职责边界
 
@@ -16,10 +17,12 @@
 
 - `real_ctrl -> ctrl_server` 生产链路必须使用服务端身份可验证的 pinned TLS 连接。
 - 服务端身份校验不绑定 IP，优先使用服务端公钥 pin 或私有 CA pin。
+- pinned TLS 连接在 ClientHello 前发送固定 `RTCT v3` 前导以穿越公网中间设备；不得把此前导当作身份凭据、把它做成明文降级开关，或绕过后续 TLS 和 pin 校验。
 - 本地 HTTP 默认只监听 `127.0.0.1`，不能默认暴露到公网地址。
 - 本地命名管道需要限制访问主体，不能让任意本机低权限进程直接调用高危控制能力。
 - `Exec(String)` 属于高危能力，开放 API 默认不应无条件暴露。
-- 运行时服务端地址和端口只使用 `REAL_CTRL_SERVER_HOST`、`REAL_CTRL_SERVER_PORT`；不要复用 `ctrl_kik` 的编译期配置覆盖规则。
+- 三个进程形态统一使用 `runtime_config::connection_config`。`real_ctrl/build.rs` 提供公开生产
+  默认值，`REAL_CTRL_*` 运行环境变量优先；不要复用 `ctrl_kik` 的编译期配置覆盖规则。
 
 ## API 约束
 
@@ -28,8 +31,9 @@
 - API 响应应使用稳定错误码和结构化 body，不要把内部 `anyhow` 字符串直接当长期契约。
 - HTTP 开放 API 使用 `POST /api/v1/commands`，请求/响应契约在 `api_contract.rs` 中维护。
 - 新版命名管道 API 使用 `RTCAPI1\0` magic + JSON `ApiRequest` / `ApiResponse`；不要改回 postcard，postcard 不支持当前 serde 内部标签枚举。
-- 旧命名管道 postcard `InputCommand` 只作为兼容协议保留，新能力优先走新版 API 契约。
-- `Exec` 对开放 API 默认禁用，只能通过 `REAL_CTRL_API_ALLOW_EXEC=1` 显式开启。
+- 旧命名管道 postcard 协议已经删除；无 `RTCAPI1\0` magic 的请求必须拒绝。
+- `Exec` 与其他命令使用同一 API 分派路径；发布构建默认允许，运行时可用
+  `REAL_CTRL_API_ALLOW_EXEC` 覆盖。服务端仍保留独立的第二层授权。
 - `config/app.toml` 默认必须绑定 `127.0.0.1`；如果改成非 loopback，必须同步配置 `REAL_CTRL_API_TOKEN` 并记录原因。
 - 本地管道创建时必须保留 SDDL DACL 和 `accept_remote(false)` / `inheritable(false)`。
 - 生产发布优先使用根目录 `scripts/build_hardened.ps1`，由脚本统一启用 hardened profile、锁定依赖和 Windows CFG。
@@ -39,6 +43,12 @@
 - HTTP 非 loopback 绑定必须在启动时验证至少 32 字符的 `REAL_CTRL_API_TOKEN`；配置文件缺失时不能回退到框架的 `0.0.0.0` 默认值。
 - 命名管道每次读写必须有超时，服务端并发连接上限为 16；HTTP 请求体默认上限 1 MiB。
 - 所有 `RealCtrlApi` 实例必须共享 `Context` 内的单命令门禁；permit 要持有到控制响应及关联数据处理全部结束。
+- 开放 API 的 `ctrl_get_big_file` 必须提供 `local_path` 并流式写入系统临时目录的随机 `.temp` 文件；禁止把大文件聚合为 HTTP/管道内存响应。
+- `$sys_history [kik_id]`、HTTP 与命名管道的 `sys_history` 必须共用服务层；返回服务端本进程观察到的最近上下线时间，不得伪装成跨重启持久历史。
+- 大文件上传后台任务必须由当前命令持有 `JoinHandle`；服务端提前拒绝或连接失败时要 abort，不能污染下一条命令。
+- 上传数据任务必须等待 `Agent` 成功写出控制帧后才启动；该本地 oneshot 门禁不能提前触发，也不能改成额外网络往返。
+- 每个控制会话目标建立 3 条 CtrlData 连接；至少一条成功时允许降级运行。大文件使用最多 3 个在途分片逐帧轮询连接，接收端必须按地址范围支持乱序和完全重复帧。
+- `GetBigFile` 的 `data_id`、总长度和 SHA-256 必须从控制响应取得，数据队列只消费 `FilePart`/`Err`；不得等待数据面元数据首帧。
 - API token 先做 SHA-256 固定长度摘要，再使用 `subtle` 常量时间原语比较；不要恢复手写比较循环。
 - `RUST_LOG` 已配置时必须尊重运维值；未配置时才使用编译 profile 的默认级别，hardened 默认 INFO。
 

@@ -1,5 +1,5 @@
 ﻿param(
-    [int]$PlainPort = 9002,
+    [int]$KikNoisePort = 9002,
     [int]$TlsPort = 19443,
     [int]$HttpPort = 9000
 )
@@ -19,8 +19,8 @@ $ControlAuthSecret = "e2e-control-auth-secret-0123456789abcdef"
 New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir | Out-Null
 Set-Content -LiteralPath (Join-Path $E2eDir "ctrl_ls_marker.txt") -Encoding UTF8 -Value "real_time_ctrl e2e marker"
 
-if ($PlainPort -ne 9002) {
-    throw "ctrl_kik 已恢复为只使用编译期 PORT()；除非修改 common/config.json 并重新构建，否则 E2E PlainPort 必须保持 9002。"
+if ($KikNoisePort -ne 9002) {
+    throw "ctrl_kik 只使用编译期 PORT()；除非通过构建变量重新编译，否则 E2E KikNoisePort 必须保持 9002。"
 }
 
 function Assert-CommandOk {
@@ -162,6 +162,48 @@ IP.1 = 127.0.0.1
     }
 }
 
+function New-E2eNoiseIdentity {
+    $privatePem = Join-Path $CertDir "kik-noise-private.pem"
+    $privateDer = Join-Path $CertDir "kik-noise-private.der"
+    $publicDer = Join-Path $CertDir "kik-noise-public.der"
+
+    & openssl genpkey -algorithm X25519 -out $privatePem 2>$null
+    Assert-CommandOk $LASTEXITCODE "Failed to generate E2E Noise private key"
+    & openssl pkey -in $privatePem -outform DER -out $privateDer 2>$null
+    Assert-CommandOk $LASTEXITCODE "Failed to export E2E Noise private key"
+    & openssl pkey -in $privatePem -pubout -outform DER -out $publicDer 2>$null
+    Assert-CommandOk $LASTEXITCODE "Failed to export E2E Noise public key"
+
+    $privateBytes = [IO.File]::ReadAllBytes($privateDer)
+    $publicBytes = [IO.File]::ReadAllBytes($publicDer)
+    if ($privateBytes.Count -lt 32 -or $publicBytes.Count -lt 32) {
+        throw "OpenSSL X25519 DER output is unexpectedly short"
+    }
+    [pscustomobject]@{
+        Private = [Convert]::ToBase64String([byte[]]$privateBytes[($privateBytes.Count - 32)..($privateBytes.Count - 1)])
+        Public = [Convert]::ToBase64String([byte[]]$publicBytes[($publicBytes.Count - 32)..($publicBytes.Count - 1)])
+    }
+}
+
+function Build-E2eBinaries {
+    param([string]$NoisePublicKey)
+    $previousKey = $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY
+    $previousHost = $env:RTC_CTRL_KIK_BUILD_HOST
+    $previousPort = $env:RTC_CTRL_KIK_BUILD_PORT
+    try {
+        # 公钥只在构建期进入 ctrl_kik；运行时不读取环境变量，也不接收服务端机器信息。
+        $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $NoisePublicKey
+        $env:RTC_CTRL_KIK_BUILD_HOST = "127.0.0.1"
+        $env:RTC_CTRL_KIK_BUILD_PORT = "$KikNoisePort"
+        & cargo build --locked -p ctrl_server -p ctrl_kik -p real_ctrl --bins
+        Assert-CommandOk $LASTEXITCODE "Failed to build E2E binaries"
+    } finally {
+        $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $previousKey
+        $env:RTC_CTRL_KIK_BUILD_HOST = $previousHost
+        $env:RTC_CTRL_KIK_BUILD_PORT = $previousPort
+    }
+}
+
 function Start-E2eProcess {
     param(
         [string]$Name,
@@ -268,7 +310,7 @@ function Invoke-ApiCommand {
 $result = [ordered]@{
     root        = $Root
     e2e_dir     = $E2eDir
-    plain_port  = $PlainPort
+    kik_noise_port = $KikNoisePort
     tls_port    = $TlsPort
     http_port   = $HttpPort
     started     = @()
@@ -277,27 +319,29 @@ $result = [ordered]@{
 }
 
 try {
-    Test-PortFree -Port $PlainPort
+    Test-PortFree -Port $KikNoisePort
     Test-PortFree -Port $TlsPort
     Test-PortFree -Port $HttpPort
 
     $cert = New-E2eCertificate
+    $noise = New-E2eNoiseIdentity
+    Build-E2eBinaries -NoisePublicKey $noise.Public
     $result.tls_pin = $cert.Pin
 
     $serverEnv = @{
         "CTRL_SERVER_BIND_HOST" = "127.0.0.1"
-        "CTRL_SERVER_PORT" = "$PlainPort"
+        "CTRL_SERVER_PORT" = "$KikNoisePort"
         "CTRL_SERVER_TLS_PORT" = "$TlsPort"
         "CTRL_SERVER_TLS_CERT" = $cert.Cert
         "CTRL_SERVER_TLS_KEY" = $cert.Key
+        "CTRL_SERVER_KIK_NOISE_PRIVATE_KEY" = $noise.Private
         "CTRL_SERVER_E2E_TRACE_PATH" = (Join-Path $E2eDir "ctrl_server_trace.log")
         "CTRL_SERVER_AUTH_SECRET" = $ControlAuthSecret
         "RUST_BACKTRACE" = "1"
     }
-    $kikEnv = @{}
+    $kikEnv = @{ "LOG" = "DEBUG" }
     $realCtrlEnv = @{
         "REAL_CTRL_SERVER_HOST" = "127.0.0.1"
-        "REAL_CTRL_SERVER_PORT" = "$PlainPort"
         "REAL_CTRL_TLS_PORT" = "$TlsPort"
         "REAL_CTRL_TLS_SERVER_NAME" = "real-ctrl-server"
         "REAL_CTRL_TLS_CA_CERT" = $cert.Cert
@@ -311,9 +355,9 @@ try {
 
     $server = Start-E2eProcess -Name "ctrl_server" -ExePath (Join-Path $Root "target\debug\ctrl_server.exe") -EnvMap $serverEnv
     $result.started += @{ name = "ctrl_server"; pid = $server.Proc.Id }
-    Wait-TcpPort -HostName "127.0.0.1" -Port $PlainPort -TimeoutSeconds 20
+    Wait-TcpPort -HostName "127.0.0.1" -Port $KikNoisePort -TimeoutSeconds 20
     Wait-TlsEndpoint -HostName "127.0.0.1" -Port $TlsPort -ServerName "real-ctrl-server" -CaCert $cert.Cert -TimeoutSeconds 20
-    $result.assertions += "ctrl_server plain/tls ports listening"
+    $result.assertions += "ctrl_server Kik Noise/TLS dedicated ports listening"
 
     $wrongPinEnv = $realCtrlEnv.Clone()
     $wrongPinEnv["REAL_CTRL_TLS_SERVER_SPKI_SHA256"] = "0" * 64
@@ -321,11 +365,11 @@ try {
     Assert-RealCtrlRejected -Name "real_ctrl_wrong_pin_probe" -EnvMap $wrongPinEnv
     $result.assertions += "pinned TLS rejects wrong server SPKI pin"
 
-    $plainCtrlEnv = $realCtrlEnv.Clone()
-    $plainCtrlEnv["REAL_CTRL_ALLOW_PLAIN"] = "1"
-    $plainCtrlEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "plain_ctrl_trace.log")
-    Assert-RealCtrlRejected -Name "real_ctrl_plain_probe" -EnvMap $plainCtrlEnv
-    $result.assertions += "ctrl_server plain port rejects real_ctrl role by default"
+    $wrongRoleEnv = $realCtrlEnv.Clone()
+    $wrongRoleEnv["REAL_CTRL_TLS_PORT"] = "$KikNoisePort"
+    $wrongRoleEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "wrong_role_trace.log")
+    Assert-RealCtrlRejected -Name "real_ctrl_wrong_role_probe" -EnvMap $wrongRoleEnv
+    $result.assertions += "Kik Noise port rejects real_ctrl TLS role"
 
     $kik = Start-E2eProcess -Name "ctrl_kik" -ExePath (Join-Path $Root "target\debug\ctrl_kik.exe") -EnvMap $kikEnv
     $result.started += @{ name = "ctrl_kik"; pid = $kik.Proc.Id }
@@ -371,6 +415,12 @@ try {
     $result.kik_id = $kikId
     $result.assertions += "sys_list sees ctrl_kik"
 
+    $history = Invoke-ApiCommand -Command @{ kind = "sys_history"; kik_id = $kikId } -RequestId "sys-history"
+    if (-not ($history.ok -and $history.data.kind -eq "sys_history" -and $history.data.items.Count -eq 1 -and $history.data.items[0].online)) {
+        throw "sys_history did not return the online Kik: $($history | ConvertTo-Json -Depth 12 -Compress)"
+    }
+    $result.assertions += "sys_history returns recent Kik online state"
+
     $sysUse = Invoke-ApiCommand -Command @{ kind = "sys_use"; kik_id = $kikId } -RequestId "sys-use"
     if (-not ($sysUse.ok)) {
         throw "sys_use failed: $($sysUse | ConvertTo-Json -Depth 12 -Compress)"
@@ -389,6 +439,80 @@ try {
     }
     $result.ls_entry_count = $ls.data.entries.Count
     $result.assertions += "ctrl_ls through ctrl_server and ctrl_kik ok"
+
+    # 12 MiB 覆盖多个 4 MiB 分片，同时保持 CI 运行时间可控。上传和下载都必须经过
+    # real_ctrl -> ctrl_server -> ctrl_kik 数据通道，不能用同机文件存在替代协议验收。
+    $bigSourcePath = Join-Path $E2eDir "big_source.bin"
+    $bigRemotePath = Join-Path $E2eDir "big_remote.bin"
+    $bigDownloadedPath = Join-Path $E2eDir "big_downloaded.bin"
+    $buffer = New-Object byte[] (1024 * 1024)
+    $random = [System.Random]::new(20260712)
+    $random.NextBytes($buffer)
+    $file = [System.IO.File]::Open($bigSourcePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+    try {
+        for ($i = 0; $i -lt 12; $i++) {
+            $file.Write($buffer, 0, $buffer.Length)
+        }
+        $file.Flush($true)
+    } finally {
+        $file.Dispose()
+    }
+
+    $uploadWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $setBig = Invoke-ApiCommand -Command @{
+        kind = "ctrl_set_big_file"
+        local_path = $bigSourcePath
+        remote_path = $bigRemotePath
+    } -RequestId "ctrl-set-big-file"
+    $uploadWatch.Stop()
+    if (-not $setBig.ok) {
+        throw "ctrl_set_big_file failed: $($setBig | ConvertTo-Json -Depth 12 -Compress)"
+    }
+
+    $downloadWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $getBig = Invoke-ApiCommand -Command @{
+        kind = "ctrl_get_big_file"
+        remote_path = $bigRemotePath
+        local_path = $bigDownloadedPath
+    } -RequestId "ctrl-get-big-file"
+    $downloadWatch.Stop()
+    if (-not $getBig.ok) {
+        throw "ctrl_get_big_file failed: $($getBig | ConvertTo-Json -Depth 12 -Compress)"
+    }
+    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $bigSourcePath).Hash
+    $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $bigRemotePath).Hash
+    $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $bigDownloadedPath).Hash
+    if ($sourceHash -ne $remoteHash -or $sourceHash -ne $downloadedHash) {
+        throw "Big file SHA-256 mismatch after upload/download"
+    }
+    $result.big_file_bytes = (Get-Item -LiteralPath $bigSourcePath).Length
+    $result.big_file_upload_ms = $uploadWatch.ElapsedMilliseconds
+    $result.big_file_download_ms = $downloadWatch.ElapsedMilliseconds
+    $result.assertions += "12 MiB chunked upload/download preserves SHA-256"
+
+    # 主连接和数据连接都退出后才应记为下线；轮询验证真实清理链路而非直接调用状态方法。
+    try { $kik.Proc.Kill($true) } catch { $kik.Proc.Kill() }
+    $kik.Proc.WaitForExit(5000) | Out-Null
+    $offlineHistory = $null
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        $offlineHistory = Invoke-ApiCommand `
+            -Command @{ kind = "sys_history"; kik_id = $kikId } `
+            -RequestId "sys-history-offline-$i"
+        if ($offlineHistory.ok -and
+            $offlineHistory.data.items.Count -eq 1 -and
+            -not $offlineHistory.data.items[0].online -and
+            $null -ne $offlineHistory.data.items[0].recent_offline_unix_ms) {
+            break
+        }
+    }
+    if (-not ($offlineHistory.ok -and
+        $offlineHistory.data.items.Count -eq 1 -and
+        -not $offlineHistory.data.items[0].online -and
+        $null -ne $offlineHistory.data.items[0].recent_offline_unix_ms)) {
+        throw "sys_history did not observe Kik offline transition: $($offlineHistory | ConvertTo-Json -Depth 12 -Compress)"
+    }
+    $result.assertions += "sys_history records the real Kik offline transition"
 
     $result.success = $true
     $result.completed_at = (Get-Date).ToString("o")

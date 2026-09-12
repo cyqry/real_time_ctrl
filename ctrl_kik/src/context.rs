@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context as AnyhowContext};
-use bytes::{BufMut, BytesMut};
+use anyhow::Context as AnyhowContext;
+use bytes::BytesMut;
 use common::channel::{Channel, ChannelAttributeKey};
 use common::command::Command;
-use common::message::kik_frame::KikFrame;
-use common::protocol;
+use common::hidden;
+use common::message::kik_frame::encode_data_frame;
 use common::protocol::CmdOptions;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,13 +14,13 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-const DATA_QUEUE_CAPACITY: usize = 8;
+const DATA_QUEUE_CAPACITY: usize = 2;
 const DATA_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const DATA_READ_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 
 pub(crate) type CommandMessage = (String, CmdOptions, Command);
 pub(crate) const COMMAND_SENDER: ChannelAttributeKey<Sender<CommandMessage>> =
-    ChannelAttributeKey::new("command_sender");
+    ChannelAttributeKey::new(0x6b69_6b5f_636d_6473);
 
 #[derive(Clone)]
 pub struct Context {
@@ -63,12 +63,23 @@ impl Kik {
     }
 
     pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {
+        self.data_connections_for_send().await.into_iter().next()
+    }
+
+    async fn data_connections_for_send(&self) -> Vec<Arc<Mutex<Channel>>> {
         let data_map = self.data_conns.lock().await;
-        if data_map.is_empty() {
-            return None;
+        let count = data_map.len();
+        if count == 0 {
+            return Vec::new();
         }
-        let next = self.next_data_conn.fetch_add(1, Ordering::Relaxed) % data_map.len();
-        data_map.values().nth(next).cloned()
+        let start = self.next_data_conn.fetch_add(1, Ordering::Relaxed) % count;
+        data_map
+            .values()
+            .cycle()
+            .skip(start)
+            .take(count)
+            .cloned()
+            .collect()
     }
 
     pub async fn delete_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
@@ -118,12 +129,12 @@ impl Context {
     pub async fn send_data(&self, op: (String, BytesMut)) -> anyhow::Result<()> {
         timeout(DATA_QUEUE_SEND_TIMEOUT, self.data_x.tx.send(op))
             .await
-            .map_err(|_| anyhow!("数据接收队列持续拥塞"))?
-            .context("数据接收者已关闭")?;
+            .map_err(|_| anyhow::Error::msg(hidden!("数据接收队列持续拥塞")))?
+            .context(hidden!("数据接收者已关闭"))?;
         Ok(())
     }
 
-    pub async fn read_data(&self, key: String) -> anyhow::Result<BytesMut> {
+    pub async fn read_data(&self, key: &str) -> anyhow::Result<BytesMut> {
         timeout(DATA_READ_TIMEOUT, async {
             loop {
                 let (id, data) = self
@@ -133,7 +144,7 @@ impl Context {
                     .await
                     .recv()
                     .await
-                    .ok_or_else(|| anyhow!("数据接收通道已关闭"))?;
+                    .ok_or_else(|| anyhow::Error::msg(hidden!("数据接收通道已关闭")))?;
                 if id == key {
                     return Ok(data);
                 }
@@ -141,7 +152,7 @@ impl Context {
             }
         })
         .await
-        .map_err(|_| anyhow!("数据读取超时"))?
+        .map_err(|_| anyhow::Error::msg(hidden!("数据读取超时")))?
     }
 
     pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
@@ -150,7 +161,7 @@ impl Context {
             .lock()
             .await
             .clone()
-            .ok_or_else(|| anyhow!("命令通道尚未初始化"))?;
+            .ok_or_else(|| anyhow::Error::msg(hidden!("命令通道尚未初始化")))?;
         kik.insert_data_conn(conn).await?;
         Ok(())
     }
@@ -170,22 +181,31 @@ impl Context {
     }
 
     pub async fn find_and_send_data(&self, data: &[u8]) -> anyhow::Result<String> {
-        let connection = self
-            .find_data_conn()
-            .await
-            .ok_or_else(|| anyhow!("Kik数据连接未初始化完成"))?;
         let data_id = Uuid::new_v4().to_string();
-        let mut bytes = BytesMut::with_capacity(data.len());
-        bytes.put_slice(data);
-        connection
+        self.send_data_with_id(&data_id, data).await?;
+        Ok(data_id)
+    }
+
+    pub async fn send_data_with_id(&self, data_id: &str, data: &[u8]) -> anyhow::Result<()> {
+        let encoded = encode_data_frame(data_id, data)?;
+        let kik = self
+            .kik_op
             .lock()
             .await
-            .write_and_flush(&protocol::transfer_encode_frame(KikFrame::Data(
-                data_id.clone(),
-                bytes,
-            )))
-            .await?;
-        Ok(data_id)
+            .clone()
+            .ok_or_else(|| anyhow::Error::msg(hidden!("命令通道尚未初始化")))?;
+        let mut last_error = None;
+        for connection in kik.data_connections_for_send().await {
+            let mut connection = connection.lock().await;
+            if connection.is_closed() {
+                continue;
+            }
+            match connection.write_and_flush(&encoded).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::Error::msg(hidden!("Kik数据连接未初始化完成"))))
     }
 
     pub async fn clear(&self) {
@@ -208,8 +228,5 @@ async fn data_channel_safely_skips_stale_frame() {
         .await
         .unwrap();
 
-    assert_eq!(
-        context.read_data("wanted".to_string()).await.unwrap(),
-        b"new"[..]
-    );
+    assert_eq!(context.read_data("wanted").await.unwrap(), b"new"[..]);
 }

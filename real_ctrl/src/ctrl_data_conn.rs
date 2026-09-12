@@ -2,7 +2,7 @@ use crate::context::Context;
 use anyhow::Error;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
-use common::config::{ClientTransportMode, Config};
+use common::config::Config;
 use common::ltc_codec::{
     LengthFieldBasedFrameDecoder, DATA_MAX_FRAME_LENGTH, INIT_MAX_FRAME_LENGTH,
 };
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result<()> {
     let parts = connect_real_ctrl(config).await?;
-    // 数据通道当前兼容历史文件/截图传输，暂时使用较大的帧上限。
+    // 数据通道承载文件和截图，鉴权完成后切换到数据帧上限。
     let framed_read = FramedRead::new(
         BufReader::new(parts.reader),
         LengthFieldBasedFrameDecoder::new_with_max_frame_len(INIT_MAX_FRAME_LENGTH),
@@ -52,7 +52,6 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
 
     let (mut tx, mut rx) = mpsc::channel::<CmdResp>(5);
     let context_clone = context.clone();
-    let client_mode = config.security.client_mode.clone();
     let read_timeout = config.read_timeout;
     tokio::spawn(async move {
         let context = context_clone;
@@ -72,9 +71,7 @@ pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result
             match read_result {
                 Ok(Some(Ok(msg))) => {
                     let channel = channel.clone();
-                    if let Err(e) =
-                        handle_read(&context, channel.clone(), msg, &mut tx, &client_mode).await
-                    {
+                    if let Err(e) = handle_read(&context, channel.clone(), msg, &mut tx).await {
                         debug!("数据连接读取处理失败");
                         break Some(e);
                     }
@@ -142,16 +139,12 @@ async fn handle_read(
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
     tx: &mut Sender<CmdResp>,
-    client_mode: &ClientTransportMode,
 ) -> anyhow::Result<()> {
     if channel.lock().await.channel_type == ChannelType::Unknown {
         let init_frame = InitFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
         match init_frame {
             InitFrame::CtrlDataSessionReply(true) => {
-                if *client_mode != ClientTransportMode::PinnedTls {
-                    return Err(anyhow::anyhow!("明文兼容模式收到 v2 数据会话响应"));
-                }
-                // v2 数据通道绑定成功，复用业务响应通道通知外层完成初始化。
+                // 数据通道绑定成功，复用业务响应通道通知外层完成初始化。
                 channel.lock().await.channel_type = ChannelType::CtrlData;
                 tx.send(CmdResp::new(
                     "##cmd_id".to_owned(),
@@ -160,24 +153,8 @@ async fn handle_read(
                 .await?;
             }
             InitFrame::CtrlDataSessionReply(false) => {
-                debug!("数据控制连接 v2 会话绑定失败");
+                debug!("数据控制连接会话绑定失败");
                 return Err(anyhow::anyhow!("数据通道会话校验失败"));
-            }
-            InitFrame::CtrlDataConnAuthReply(true) => {
-                if *client_mode != ClientTransportMode::Plain {
-                    return Err(anyhow::anyhow!("TLS 模式拒绝旧版数据通道鉴权响应"));
-                }
-                // 初始化成功消息复用业务响应通道，只作为外层函数继续执行的信号。
-                channel.lock().await.channel_type = ChannelType::CtrlData;
-                tx.send(CmdResp::new(
-                    "##cmd_id".to_owned(),
-                    Server(Success(ServerSuccessResp::Info("##authtrue".to_string()))),
-                ))
-                .await?;
-            }
-            InitFrame::CtrlDataConnAuthReply(false) => {
-                debug!("数据控制连接业务鉴权失败");
-                return Err(anyhow::anyhow!("数据控制连接业务鉴权失败"));
             }
             f => {
                 debug!("数据控制连接收到错误的初始化帧,{:?}", f);
@@ -189,7 +166,8 @@ async fn handle_read(
         match frame {
             Frame::Data(id, data) => {
                 debug!("收到长度为{}的数据", data.len());
-                context.get_data_tx().send((id, data)).await?;
+                // 有界队列等待超时后主动断开数据连接，避免消费者异常时永久占住读循环。
+                context.enqueue_data((id, data)).await?;
             }
             Frame::Ping | Frame::Pong => {}
             f => {
@@ -223,28 +201,23 @@ async fn handle_active(
     config: &Config,
     channel: Arc<Mutex<Channel>>,
 ) -> anyhow::Result<()> {
-    let frame = match config.security.client_mode {
-        ClientTransportMode::Plain => InitFrame::CtrlDataConnReq(config.id.encrypt()),
-        ClientTransportMode::PinnedTls => {
-            let session_id = context
-                .agent
-                .read()
-                .await
-                .session_id
-                .clone()
-                .ok_or(anyhow::Error::msg("控制会话尚未建立，无法创建数据通道"))?;
-            let channel_nonce = random_nonce_hex();
-            let proof = ctrl_data_proof(
-                config.id.control_plane_secret(),
-                &session_id,
-                &channel_nonce,
-            );
-            InitFrame::CtrlDataSessionReq {
-                session_id,
-                channel_nonce,
-                proof,
-            }
-        }
+    let session_id = context
+        .agent
+        .read()
+        .await
+        .session_id
+        .clone()
+        .ok_or(anyhow::Error::msg("控制会话尚未建立，无法创建数据通道"))?;
+    let channel_nonce = random_nonce_hex();
+    let proof = ctrl_data_proof(
+        config.id.control_plane_secret(),
+        &session_id,
+        &channel_nonce,
+    );
+    let frame = InitFrame::CtrlDataSessionReq {
+        session_id,
+        channel_nonce,
+        proof,
     };
     channel
         .lock()

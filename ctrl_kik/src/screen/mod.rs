@@ -4,6 +4,8 @@ mod dxgi_backend;
 mod gdi_backend;
 mod legacy_gdi;
 
+use common::hidden;
+
 #[cfg(test)]
 mod tests;
 
@@ -22,7 +24,7 @@ fn default_capture_service() -> &'static ScreenCaptureService {
             .backend(DxgiDesktopDuplicationBackend)
             .backend(LegacyGdiCaptureBackend)
             .build()
-            .expect("默认截屏服务必须至少注册一个后端")
+            .expect(&hidden!("默认截屏服务必须至少注册一个后端"))
     })
 }
 

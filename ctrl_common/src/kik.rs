@@ -1,10 +1,9 @@
 use crate::entity::KikClientInfo;
-use chrono::{DateTime, Local};
 use common::channel::Channel;
 use common::kik_info::KikInfo;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
 use tokio::sync::{Mutex, RwLock};
 
@@ -13,7 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 /// 克隆 `Kik` 只克隆共享状态句柄，不会复制底层连接。
 #[derive(Clone)]
 pub struct Kik {
-    // Kik 创建完成后 id 一定存在；协议层仍保留 Option 以兼容首次注册请求。
+    // Kik 创建完成后 id 一定存在；None 仅用于首次注册请求。
     pub kik_client_info: KikClientInfo,
     conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
     //data conn 的getid是 random id,  attr 一个 kik id;这里的key为 data conn的get_id
@@ -22,15 +21,6 @@ pub struct Kik {
 
     //是否已上线(只在初始化时修改一次)
     initialized: Arc<AtomicBool>,
-}
-
-#[derive(Clone)]
-pub struct KikLifeTime {
-    //Kik中的kik_info的id一定是Some的
-    pub kik_info: KikInfo,
-
-    pub online_time: DateTime<Local>,
-    pub offline_time: DateTime<Local>,
 }
 
 impl Kik {
@@ -62,13 +52,24 @@ impl Kik {
     }
 
     pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {
+        self.data_connections_for_send().await.into_iter().next()
+    }
+
+    /// 返回以轮询游标开头的连接快照，供单帧失败后尝试其他连接。
+    pub async fn data_connections_for_send(&self) -> Vec<Arc<Mutex<Channel>>> {
         let data_map = self.data_conns.lock().await;
-        if data_map.is_empty() {
-            None
-        } else {
-            let next = self.next_data_conn.fetch_add(1, Ordering::Relaxed) % data_map.len();
-            data_map.values().nth(next).cloned()
+        let count = data_map.len();
+        if count == 0 {
+            return Vec::new();
         }
+        let start = self.next_data_conn.fetch_add(1, Ordering::Relaxed) % count;
+        data_map
+            .values()
+            .cycle()
+            .skip(start)
+            .take(count)
+            .cloned()
+            .collect()
     }
 
     pub fn set_kik_initialized(&self, initialized: bool) {
@@ -88,6 +89,19 @@ impl Kik {
     }
     pub async fn delete_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
         self.conn_op.write().await.take()
+    }
+    /// 只清理由该回调持有的连接，防止旧连接迟到的 inactive 事件删除刚完成的重连。
+    pub async fn delete_kik_conn_if(&self, channel: &Arc<Mutex<Channel>>) -> bool {
+        let mut current = self.conn_op.write().await;
+        if current
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, channel))
+        {
+            current.take();
+            true
+        } else {
+            false
+        }
     }
     pub async fn set_kik_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
         self.conn_op.write().await.replace(conn)

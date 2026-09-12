@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use common::hidden;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ImageBuffer, ImageEncoder, Rgb, RgbImage};
 use winapi::ctypes::c_int;
@@ -16,7 +17,7 @@ pub async fn cut_screen() -> anyhow::Result<Vec<u8>> {
         let hdc = GetWindowDC(desktop);
 
         if hdc.is_null() {
-            return Err(anyhow!("Failed to get desktop HDC."));
+            return Err(anyhow!(hidden!("Failed to get desktop HDC.")));
         }
 
         // winapi 获取屏幕的宽度和高度,但不知为什么总不能获取全
@@ -127,7 +128,7 @@ fn get_pixels_from_hbitmap(
             DIB_RGB_COLORS,
         );
         if pixels.is_empty() {
-            return Err(anyhow!("读取位图失败"));
+            return Err(anyhow!(hidden!("读取位图失败")));
         }
         Ok(pixels)
     }

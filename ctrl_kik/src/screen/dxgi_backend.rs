@@ -1,6 +1,7 @@
 use super::backend::{CaptureArtifact, CaptureFuture, CaptureRequest, ScreenCaptureBackend};
 use super::{CaptureError, PngProfile, PrimaryScreenCapturer};
 use anyhow::anyhow;
+use common::hidden;
 use std::time::Duration;
 
 struct DxgiCaptureRequest {
@@ -26,8 +27,8 @@ const DXGI_STEADY_ACQUIRE_TIMEOUT_MS: u32 = 100;
 pub struct DxgiDesktopDuplicationBackend;
 
 impl ScreenCaptureBackend for DxgiDesktopDuplicationBackend {
-    fn name(&self) -> &'static str {
-        "dxgi-desktop-duplication"
+    fn name(&self) -> String {
+        hidden!("dxgi-desktop-duplication")
     }
 
     fn capture(&self, request: CaptureRequest) -> CaptureFuture<'_> {
@@ -50,13 +51,13 @@ async fn capture_dxgi(profile: PngProfile) -> anyhow::Result<(Vec<u8>, bool)> {
         worker.send(DxgiCaptureRequest { profile, reply }),
     )
     .await
-    .map_err(|_| anyhow!("DXGI 截屏请求排队超时"))?
-    .map_err(|_| anyhow!("DXGI 截屏工作线程已停止"))?;
+    .map_err(|_| anyhow!(hidden!("DXGI 截屏请求排队超时")))?
+    .map_err(|_| anyhow!(hidden!("DXGI 截屏工作线程已停止")))?;
 
     tokio::time::timeout(DXGI_RESULT_TIMEOUT, response)
         .await
-        .map_err(|_| anyhow!("DXGI 截屏处理超时"))?
-        .map_err(|_| anyhow!("DXGI 截屏工作线程未返回结果"))?
+        .map_err(|_| anyhow!(hidden!("DXGI 截屏处理超时")))?
+        .map_err(|_| anyhow!(hidden!("DXGI 截屏工作线程未返回结果")))?
 }
 
 fn dxgi_capture_worker() -> anyhow::Result<tokio::sync::mpsc::Sender<DxgiCaptureRequest>> {
@@ -69,7 +70,7 @@ fn dxgi_capture_worker() -> anyhow::Result<tokio::sync::mpsc::Sender<DxgiCapture
             .map_err(|error| error.to_string())?;
 
         std::thread::Builder::new()
-            .name("ctrl-kik-dxgi-capture".to_string())
+            .name(hidden!("ctrl-kik-dxgi-capture"))
             .spawn(move || {
                 runtime.block_on(run_dxgi_worker(receiver, DXGI_SESSION_IDLE_TIMEOUT));
             })
@@ -77,7 +78,7 @@ fn dxgi_capture_worker() -> anyhow::Result<tokio::sync::mpsc::Sender<DxgiCapture
         Ok(sender)
     }) {
         Ok(sender) => Ok(sender.clone()),
-        Err(error) => Err(anyhow!("无法启动 DXGI 截屏工作线程: {error}")),
+        Err(error) => Err(anyhow!(hidden!("无法启动 DXGI 截屏工作线程: ", error))),
     }
 }
 
@@ -139,7 +140,7 @@ fn capture_dxgi_on_worker(
 
         let active = capturer
             .as_mut()
-            .ok_or_else(|| anyhow!("DXGI 截屏会话未创建"))?;
+            .ok_or_else(|| anyhow!(hidden!("DXGI 截屏会话未创建")))?;
         let mut png = Vec::new();
         match active.capture_png_into(profile, &mut png) {
             Ok(()) => {
@@ -159,7 +160,7 @@ fn capture_dxgi_on_worker(
 
     Err(last_error
         .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow!("DXGI 截屏失败且没有错误详情")))
+        .unwrap_or_else(|| anyhow!(hidden!("DXGI 截屏失败且没有错误详情"))))
 }
 
 #[cfg(test)]

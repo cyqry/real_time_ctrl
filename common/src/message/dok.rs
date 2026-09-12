@@ -1,12 +1,37 @@
+use crate::hidden;
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 
-const MAX_FILE_PART_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FILE_PART_BYTES: usize = 16 * 1024 * 1024;
 
 //数据交换格式结构体
 pub enum Dok {
-    FilePart(u64, u64, Vec<u8>),
+    FilePart(u64, u64, BytesMut),
     Err(ErrCode),
+}
+
+impl Dok {
+    /// 文件分片保持连续编码，便于审计、测试和跨连接重发。
+    pub fn encode_file_part(start: u64, end: u64, data: &[u8]) -> std::io::Result<BytesMut> {
+        if data.is_empty()
+            || data.len() > MAX_FILE_PART_BYTES
+            || data.len() > u32::MAX as usize
+            || start > end
+            || end.checked_sub(start).and_then(|v| v.checked_add(1)) != Some(data.len() as u64)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                hidden!("文件分片范围或长度非法"),
+            ));
+        }
+        let mut buf = BytesMut::with_capacity(1 + 8 + 8 + 4 + data.len());
+        buf.put_u8(0);
+        buf.put_u64(start);
+        buf.put_u64(end);
+        buf.put_u32(data.len() as u32);
+        buf.put_slice(data);
+        Ok(buf)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,8 +112,7 @@ impl BufSerializable for Dok {
                     return None;
                 }
 
-                let data = bys[..data_len].to_vec();
-                bys.advance(data_len);
+                let data = bys.split_to(data_len);
 
                 Some(Dok::FilePart(start, end, data))
             }
@@ -113,7 +137,7 @@ mod tests {
     #[test]
     fn test_file_part_serialization() {
         let data = vec![1, 2, 3, 4, 5];
-        let dok = Dok::FilePart(100, 104, data.clone());
+        let dok = Dok::FilePart(100, 104, BytesMut::from(data.as_slice()));
 
         let buf = dok.to_buf();
         let deserialized = Dok::from_buf(buf);
@@ -122,10 +146,25 @@ mod tests {
         if let Dok::FilePart(start, end, data2) = deserialized.unwrap() {
             assert_eq!(start, 100);
             assert_eq!(end, 104);
-            assert_eq!(data2, data);
+            assert_eq!(data2.as_ref(), data);
         } else {
             panic!("Expected FilePart variant");
         }
+    }
+
+    #[test]
+    fn direct_file_part_encoder_matches_trait_encoder() {
+        let data = [9_u8, 8, 7, 6];
+        let encoded = Dok::encode_file_part(20, 23, &data).unwrap();
+
+        assert_eq!(
+            encoded,
+            Dok::FilePart(20, 23, BytesMut::from(data.as_slice())).to_buf()
+        );
+        assert!(matches!(
+            Dok::from_buf(encoded),
+            Some(Dok::FilePart(20, 23, decoded)) if decoded.as_ref() == data
+        ));
     }
 
     #[test]

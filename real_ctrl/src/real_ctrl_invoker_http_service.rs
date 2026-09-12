@@ -37,7 +37,8 @@ async fn main() -> Result<()> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_HTTP_LOCK_PATH.to_string());
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(DEFAULT_HTTP_LOCK_PATH));
     let _single_lock = single(lock_path).await?;
     let mut logger = env_logger::Builder::new();
     logger.format(|buf, record| {
@@ -63,6 +64,9 @@ async fn main() -> Result<()> {
     });
 
     let mut app = App::new();
+    // HTTP 默认配置随 EXE 编译，直接双击时不再依赖当前工作目录下的 config/app.toml。
+    // Spring 的显式字符串配置仍保持 127.0.0.1、1 MiB 请求上限和统一 /api 前缀。
+    app.use_config_str(include_str!("../../config/app.toml"));
     validate_http_exposure(&app)?;
     app.add_component(api)
         .add_router(routes::router())
@@ -74,9 +78,8 @@ async fn main() -> Result<()> {
 
 fn validate_http_exposure(app: &impl ConfigRegistry) -> anyhow::Result<()> {
     let exposure = app.get_config::<HttpExposureConfig>()?;
-    let token_len = env::var("REAL_CTRL_API_TOKEN")
-        .ok()
-        .map(|token| token.trim().len())
+    let token_len = real_ctrl::runtime_config::api_token()
+        .map(|token| token.len())
         .unwrap_or_default();
     validate_http_binding(exposure.binding, token_len)
 }

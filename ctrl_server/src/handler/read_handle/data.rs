@@ -1,9 +1,9 @@
 use crate::core::context::Context;
 use bytes::BytesMut;
 use common::channel::Channel;
-use common::message::kik_frame::KikFrame;
-use common::protocol::{self, BufSerializable};
-use ctrl_common::ctrl_frame::Frame;
+use common::message::kik_frame::{encode_data_frame as encode_kik_data_frame, KikFrame};
+use common::protocol::BufSerializable;
+use ctrl_common::ctrl_frame::{encode_data_frame as encode_ctrl_data_frame, Frame};
 use log::info;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -16,30 +16,22 @@ pub async fn handle_ctrl_data(
     _: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
-    let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
-    match frame {
-        Frame::Data(id, data) => {
-            // 在当前读循环中等待下游写入，利用 TCP 与有界连接队列形成背压；
-            // 逐帧 spawn 会在慢客户端场景积累大块 BytesMut 并破坏文件分片顺序。
+    match Frame::from_buf(msg).ok_or_else(default_error)? {
+        Frame::Data(data_id, data) => {
+            let encoded = encode_kik_data_frame(&data_id, &data)?;
             if let Some(kik) = context.get_kik().await {
-                if let Some(data_c) = kik.find_data_conn().await {
-                    data_c
-                        .lock()
-                        .await
-                        .write_and_flush(&protocol::transfer_encode_frame(KikFrame::Data(id, data)))
-                        .await?;
-                } else {
+                let connections = kik.data_connections_for_send().await;
+                if connections.is_empty() {
                     info!("当前kik没有数据连接")
+                } else {
+                    write_to_available_connection(connections, &encoded).await?;
                 }
             } else {
                 info!("数据发送失败当前没有在线kik")
             }
         }
-        Frame::Ping => {}
-        Frame::Pong => {}
-        _ => {
-            return Err(default_error());
-        }
+        Frame::Ping | Frame::Pong => {}
+        _ => return Err(default_error()),
     }
     Ok(())
 }
@@ -49,27 +41,38 @@ pub async fn handle_kik_data(
     _channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
-    let frame = KikFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
-    match frame {
-        KikFrame::Data(id, data) => {
-            match context.find_ctrl_data().await {
-                None => {
-                    //未找到ctrl的data_conn或者根本没有ctrl,不管，
-                }
-                Some(c) => {
-                    c.lock()
-                        .await
-                        .write_and_flush(&protocol::transfer_encode_frame(Frame::Data(id, data)))
-                        .await?;
-                }
+    match KikFrame::from_buf(msg).ok_or_else(default_error)? {
+        KikFrame::Data(data_id, data) => {
+            let connections = context.ctrl_data_connections_for_send().await;
+            if !connections.is_empty() {
+                let encoded = encode_ctrl_data_frame(&data_id, &data)?;
+                write_to_available_connection(connections, &encoded).await?;
             }
         }
-
-        KikFrame::Ping => {}
-        KikFrame::Pong => {}
-        _ => {
-            return Err(default_error());
-        }
+        KikFrame::Ping | KikFrame::Pong => {}
+        _ => return Err(default_error()),
     }
     Ok(())
+}
+
+/// 单个完整帧在首选连接失败后尝试其余连接。
+///
+/// 写失败可能发生在对端已收到完整帧之后，因此文件接收端必须把完全相同的
+/// 区间视为幂等重试；部分重叠仍按协议错误拒绝。
+async fn write_to_available_connection(
+    connections: Vec<Arc<Mutex<Channel>>>,
+    encoded: &[u8],
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for connection in connections {
+        let mut connection = connection.lock().await;
+        if connection.is_closed() {
+            continue;
+        }
+        match connection.write_and_flush(encoded).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用的数据转发连接")))
 }

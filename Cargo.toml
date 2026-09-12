@@ -8,6 +8,7 @@ members = [
     "start",
     "ctrl_common",
     "screen_stream",
+    "string_obfuscation_macros",
 ]
 resolver = "2"
 
@@ -21,7 +22,7 @@ opt-level = "z"
 # 生产发布建议使用：
 # cargo build -p real_ctrl --profile hardened
 # cargo build -p ctrl_server --profile hardened
-# cargo build -p ctrl_kik --profile hardened
+# ctrl_kik 必须使用 scripts/build_ctrl_kik_protected.ps1，不能与管理端共用发布入口。
 inherits = "release"
 debug = 0
 strip = "symbols"
@@ -31,3 +32,10 @@ panic = "abort"
 incremental = false
 opt-level = 3
 overflow-checks = true
+
+[profile.production]
+# 管理端与服务端保留 DWARF/PDB 和符号用于崩溃定位、火焰图与线上性能分析，
+# 其余优化、LTO、单 codegen unit 与 panic 策略继承 hardened。
+inherits = "hardened"
+debug = 1
+strip = "none"

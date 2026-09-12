@@ -38,19 +38,18 @@ pub async fn handle_init_message(
         InitFrame::CtrlAuthStart(_)
             | InitFrame::CtrlAuthProof { .. }
             | InitFrame::CtrlDataSessionReq { .. }
-            | InitFrame::CtrlAuthReq(_)
-            | InitFrame::CtrlDataConnReq(_)
     );
     let is_kik_frame = matches!(&frame, InitFrame::KikReq(_) | InitFrame::KikDataConnReq(_));
     if (is_ctrl_frame && !allow_ctrl) || (is_kik_frame && !allow_kik) {
         warn!("连接在不允许的传输端口声明角色，已拒绝");
         return Err(anyhow::Error::msg("当前传输端口不允许该连接角色"));
     }
-    channel
-        .clone()
-        .lock()
-        .await
-        .set_id(Uuid::new_v4().to_string());
+    // challenge/proof 会分两帧进入这里，连接 ID 只在第一帧生成一次，避免握手中途身份漂移。
+    let mut channel_guard = channel.lock().await;
+    if channel_guard.id().is_none() {
+        channel_guard.set_id(Uuid::new_v4().to_string());
+    }
+    drop(channel_guard);
     //初始化id
     debug!("init frame:{:?}", frame);
     match frame {
@@ -98,20 +97,13 @@ pub async fn handle_init_message(
             {
                 e2e_trace("server: ctrl auth proof verified");
                 let session_id = random_nonce_hex();
-                let auth = ctrl_auth_v2_success(&context, &channel, session_id).await;
+                let auth = complete_ctrl_auth(&context, &channel, session_id).await;
                 channel.lock().await.channel_type = ChannelType::Ctrl;
                 auth?;
                 e2e_trace("server: sent ctrl auth session");
             } else {
                 e2e_trace("server: ctrl auth proof rejected");
-                channel
-                    .lock()
-                    .await
-                    .write_and_flush(&protocol::transfer_encode_frame(InitFrame::CtrlAuthReply(
-                        false,
-                    )))
-                    .await?;
-                return Err(anyhow::Error::msg("控制连接 v2 校验失败"));
+                return Err(anyhow::Error::msg("控制连接校验失败"));
             }
         }
         InitFrame::CtrlDataSessionReq {
@@ -134,7 +126,7 @@ pub async fn handle_init_message(
             };
             if session_ok {
                 e2e_trace("server: ctrl data session verified");
-                let auth = ctrl_data_auth_v2_success(&context, &channel).await;
+                let auth = complete_ctrl_data_auth(&context, &channel).await;
                 channel.lock().await.channel_type = ChannelType::CtrlData;
                 auth?;
                 e2e_trace("server: sent ctrl data session reply");
@@ -147,50 +139,9 @@ pub async fn handle_init_message(
                         InitFrame::CtrlDataSessionReply(false),
                     ))
                     .await?;
-                return Err(anyhow::Error::msg("数据连接 v2 会话绑定失败"));
+                return Err(anyhow::Error::msg("数据连接会话绑定失败"));
             }
         }
-        InitFrame::CtrlAuthReq(s) => {
-            if s == config.id.encrypt() {
-                let auth = ctrl_auth_success(&context, &channel).await;
-                //最后再允许发ping,这里之后要有一定延时才能发ping
-                // 一定要保证这里无论如何会设置状态， 因为如果?返回了错误 需要依赖状态去清理
-                channel.lock().await.channel_type = ChannelType::Ctrl; //代表 可向这个连接发ping了 且 后续发到此连接的消息都会被当做业务消息处理
-                auth?;
-            } else {
-                channel
-                    .lock()
-                    .await
-                    .write_and_flush(&protocol::transfer_encode_frame(InitFrame::CtrlAuthReply(
-                        false,
-                    )))
-                    .await?;
-                // time::sleep(Duration::from_secs(2)).await;
-                return Err(anyhow::Error::msg("校验失败"));
-            }
-        }
-        InitFrame::CtrlDataConnReq(s) => {
-            // 仅保留显式开启的明文迁移协议；该静态摘要不具备抗重放或抗中间人能力。
-            if s == config.id.encrypt() {
-                if !context.exist_ctrl().await {
-                    return Err(anyhow::Error::msg("没有此控制者，或者该控制连接已断开"));
-                }
-                let auth = ctrl_data_auth_success(&context, &channel).await;
-                channel.lock().await.channel_type = ChannelType::CtrlData;
-                auth?;
-            } else {
-                channel
-                    .lock()
-                    .await
-                    .write_and_flush(&protocol::transfer_encode_frame(
-                        InitFrame::CtrlDataConnAuthReply(false),
-                    ))
-                    .await?;
-                // time::sleep(Duration::from_secs(2)).await;
-                return Err(anyhow::Error::msg("数据连接校验失败"));
-            }
-        }
-
         InitFrame::KikReq(kik_info) => {
             let ok = kik_req(&context, &channel, kik_info).await;
             channel.lock().await.channel_type = ChannelType::Kik;
@@ -264,6 +215,9 @@ async fn kik_req(
         }
         //重连
         Some(id) => {
+            // Kik ID 只能来自服务端首次分配的 UUID。它不是认证凭据，但限制格式可避免
+            // 匿名输入污染索引、日志和管理面 JSON，并让历史响应大小保持可计算。
+            Uuid::parse_str(&id).map_err(|_| anyhow::anyhow!("Kik 重连 ID 格式无效"))?;
             {
                 let arc = channel.clone();
                 let mut guard = arc.lock().await;
@@ -298,6 +252,7 @@ async fn kik_req(
     tokio::time::sleep(Duration::from_secs(5)).await;
     //初始化完成，即kik上线
     kik.set_kik_initialized(true);
+    context.record_kik_online(&kik).await;
     //没有当前被控者，默认设置一个
     let current = match context.get_kik().await {
         None => false,
@@ -380,25 +335,7 @@ async fn new_kik_login_line(
     kik
 }
 
-async fn ctrl_data_auth_success(
-    context: &Context,
-    channel: &Arc<Mutex<Channel>>,
-) -> anyhow::Result<()> {
-    if !context.insert_ctrl_data_conn(channel.clone()).await {
-        return Err(anyhow::Error::msg("控制数据通道达到上限或控制会话已离线"));
-    }
-    //写回一个ctrl data 连接校验的确认帧
-    channel
-        .lock()
-        .await
-        .write_and_flush(&protocol::transfer_encode_frame(
-            InitFrame::CtrlDataConnAuthReply(true),
-        ))
-        .await?;
-    Ok(())
-}
-
-async fn ctrl_data_auth_v2_success(
+async fn complete_ctrl_data_auth(
     context: &Context,
     channel: &Arc<Mutex<Channel>>,
 ) -> anyhow::Result<()> {
@@ -415,20 +352,7 @@ async fn ctrl_data_auth_v2_success(
     Ok(())
 }
 
-async fn ctrl_auth_success(context: &Context, channel: &Arc<Mutex<Channel>>) -> anyhow::Result<()> {
-    context.set_ctrl_conn(channel.clone()).await;
-    //写回一个ctrl连接校验确认帧
-    channel
-        .lock()
-        .await
-        .write_and_flush(&protocol::transfer_encode_frame(InitFrame::CtrlAuthReply(
-            true,
-        )))
-        .await?;
-    Ok(())
-}
-
-async fn ctrl_auth_v2_success(
+async fn complete_ctrl_auth(
     context: &Context,
     channel: &Arc<Mutex<Channel>>,
     session_id: String,

@@ -3,6 +3,12 @@ name = "ctrl_kik"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# 开发构建默认保留日志能力；受保护发布脚本会使用 --no-default-features，
+# 移除 env_logger 以及 ctrl_kik 自身对 chrono/log 的直接引用和全部运行时日志代码。
+default = ["development-logging"]
+development-logging = ["dep:chrono", "dep:env_logger", "dep:log"]
+
 [dependencies]
 common = { path = "../common" }
 tokio = { version = "1.26.0", features = ["full"] }
@@ -10,15 +16,14 @@ bytes = { version = "1.4.0", features = ["serde"] }
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.8", features = ["full"] }
 anyhow = "1.0.71"
-log = "0.4.20"
-env_logger = "0.10.0"
+log = { version = "0.4.20", optional = true }
+env_logger = { version = "0.10.0", optional = true }
 encoding_rs = "0.8.33"
-chrono = "0.4.29"
+chrono = { version = "0.4.29", optional = true }
 image = "0.24.7"
 scrap = "0.5"
 fs4 = { version = "0.6", features = ["tokio-async"] }
 uuid = { version = "1.4.1", features = ["v4", ] }
-serde = "1.0.228"
 serde_json = "1.0.149"
 png = "=0.18.1"
 windows = { version = "=0.62.2", features = [

@@ -1,5 +1,5 @@
 use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetBigFile, SetFile};
-use crate::command::SysCommand::{List, Use};
+use crate::command::SysCommand::{History, List, Use};
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,8 @@ pub enum SysCommand {
     List,
     Use(String),
     Now,
+    /// 查询当前服务进程记录的最近上下线状态；`None` 返回全部有界历史。
+    History(Option<String>),
 }
 
 impl BufSerializable for Command {
@@ -53,6 +55,16 @@ impl BufSerializable for Command {
                     }
                     SysCommand::Now => {
                         bytes_mut.put_u8(2);
+                    }
+                    History(kik_id) => {
+                        bytes_mut.put_u8(3);
+                        match kik_id {
+                            Some(kik_id) => {
+                                bytes_mut.put_u8(1);
+                                bytes_mut.put_slice(kik_id.as_bytes());
+                            }
+                            None => bytes_mut.put_u8(0),
+                        }
                     }
                 }
             }
@@ -121,6 +133,18 @@ impl BufSerializable for Command {
                         Some(Command::Sys(Use(String::from_utf8(bys.to_vec()).ok()?)))
                     }
                     2 if bys.is_empty() => Some(Command::Sys(SysCommand::Now)),
+                    3 => {
+                        if bys.is_empty() {
+                            return None;
+                        }
+                        match bys.get_u8() {
+                            0 if bys.is_empty() => Some(Command::Sys(History(None))),
+                            1 if !bys.is_empty() && bys.len() <= MAX_KIK_ID_BYTES => Some(
+                                Command::Sys(History(Some(String::from_utf8(bys.to_vec()).ok()?))),
+                            ),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -236,4 +260,19 @@ fn test() {
         )
         .unwrap()
     );
+}
+
+#[test]
+fn sys_history_round_trip_and_rejects_invalid_presence_flag() {
+    for expected in [None, Some("kik-1".to_string())] {
+        let encoded = Command::Sys(SysCommand::History(expected.clone())).to_buf();
+        let decoded = Command::from_buf(encoded).unwrap();
+        match decoded {
+            Command::Sys(SysCommand::History(actual)) => assert_eq!(actual, expected),
+            _ => panic!("系统历史命令往返类型错误"),
+        }
+    }
+
+    let mut invalid = BytesMut::from(&[0_u8, 3, 2][..]);
+    assert!(Command::from_buf(invalid.split()).is_none());
 }

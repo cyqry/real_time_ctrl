@@ -1,10 +1,11 @@
 use crate::command::Command;
 use crate::message::kik_frame::KikFrame::*;
 use crate::message::kik_resp::KikResp;
-use crate::protocol::{BufSerializable, ReqCmd};
+use crate::protocol::{self, BufSerializable, ReqCmd};
 use bytes::{Buf, BufMut, BytesMut};
 
-const MAX_DATA_ID_BYTES: usize = 128;
+pub const DATA_FRAME_CODE: u8 = 12;
+const MAX_DATA_ID_BYTES: usize = protocol::MAX_CORRELATION_ID_BYTES;
 
 #[derive(Debug, Clone)]
 pub enum KikFrame {
@@ -17,6 +18,11 @@ pub enum KikFrame {
 
     Ping,
     Pong,
+}
+
+/// Kik 数据通道热路径编码，直接生成带长度前缀的完整网络帧。
+pub fn encode_data_frame(data_id: &str, data: &[u8]) -> std::io::Result<BytesMut> {
+    protocol::transfer_encode_data_frame(DATA_FRAME_CODE, data_id, data, MAX_DATA_ID_BYTES)
 }
 
 impl BufSerializable for KikFrame {
@@ -138,6 +144,20 @@ fn test() {
     )
     .to_buf();
     println!("{:?}", KikFrame::from_buf(bytes_mut).unwrap());
+}
+
+#[test]
+fn direct_data_encoder_includes_length_prefix() {
+    let mut encoded = encode_data_frame("data-id", b"hello").unwrap();
+    let frame_len = encoded.get_u32() as usize;
+    assert_eq!(frame_len, encoded.len());
+    match KikFrame::from_buf(encoded) {
+        Some(KikFrame::Data(id, data)) => {
+            assert_eq!(id, "data-id");
+            assert_eq!(data.as_ref(), b"hello");
+        }
+        _ => panic!("unexpected frame"),
+    }
 }
 
 #[test]

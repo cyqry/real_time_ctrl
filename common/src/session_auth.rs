@@ -1,11 +1,9 @@
+use crate::hidden;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
-
-pub const CTRL_AUTH_V2_LABEL: &str = "real_ctrl.auth.v2";
-pub const CTRL_DATA_V2_LABEL: &str = "real_ctrl.data.v2";
 
 pub fn is_valid_nonce_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -18,8 +16,8 @@ pub fn random_nonce_hex() -> String {
 }
 
 pub fn hmac_sha256_hex(secret: &str, parts: &[&str]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 接受任意长度密钥");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect(&hidden!("HMAC-SHA256 接受任意长度密钥"));
     for part in parts {
         mac.update(part.as_bytes());
         mac.update(&[0]);
@@ -31,8 +29,8 @@ pub fn verify_hmac_sha256_hex(secret: &str, parts: &[&str], expected_hex: &str) 
     let Ok(expected) = hex::decode(expected_hex) else {
         return false;
     };
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 接受任意长度密钥");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect(&hidden!("HMAC-SHA256 接受任意长度密钥"));
     for part in parts {
         mac.update(part.as_bytes());
         mac.update(&[0]);
@@ -41,7 +39,8 @@ pub fn verify_hmac_sha256_hex(secret: &str, parts: &[&str], expected_hex: &str) 
 }
 
 pub fn ctrl_auth_proof(secret: &str, client_nonce: &str, server_nonce: &str) -> String {
-    hmac_sha256_hex(secret, &[CTRL_AUTH_V2_LABEL, client_nonce, server_nonce])
+    let label = hidden!("real_ctrl.auth.v3");
+    hmac_sha256_hex(secret, &[label.as_str(), client_nonce, server_nonce])
 }
 
 pub fn verify_ctrl_auth_proof(
@@ -50,15 +49,13 @@ pub fn verify_ctrl_auth_proof(
     server_nonce: &str,
     proof: &str,
 ) -> bool {
-    verify_hmac_sha256_hex(
-        secret,
-        &[CTRL_AUTH_V2_LABEL, client_nonce, server_nonce],
-        proof,
-    )
+    let label = hidden!("real_ctrl.auth.v3");
+    verify_hmac_sha256_hex(secret, &[label.as_str(), client_nonce, server_nonce], proof)
 }
 
 pub fn ctrl_data_proof(secret: &str, session_id: &str, channel_nonce: &str) -> String {
-    hmac_sha256_hex(secret, &[CTRL_DATA_V2_LABEL, session_id, channel_nonce])
+    let label = hidden!("real_ctrl.data.v3");
+    hmac_sha256_hex(secret, &[label.as_str(), session_id, channel_nonce])
 }
 
 pub fn verify_ctrl_data_proof(
@@ -67,11 +64,8 @@ pub fn verify_ctrl_data_proof(
     channel_nonce: &str,
     proof: &str,
 ) -> bool {
-    verify_hmac_sha256_hex(
-        secret,
-        &[CTRL_DATA_V2_LABEL, session_id, channel_nonce],
-        proof,
-    )
+    let label = hidden!("real_ctrl.data.v3");
+    verify_hmac_sha256_hex(secret, &[label.as_str(), session_id, channel_nonce], proof)
 }
 
 #[cfg(test)]

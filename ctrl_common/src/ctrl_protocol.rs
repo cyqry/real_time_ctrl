@@ -15,15 +15,21 @@ pub fn ctrl_pong() -> BytesMut {
 }
 
 pub fn ctrl_server_resp(id: String, resp: ServerResp) -> BytesMut {
-    protocol::transfer_encode_frame( Frame::Resp(CmdResp::new(id, Server(resp))))
+    protocol::transfer_encode_frame(Frame::Resp(CmdResp::new(id, Server(resp))))
 }
 
 pub fn ctrl_server_resp_error(id: String, info: String) -> BytesMut {
-    protocol::transfer_encode_frame(Frame::Resp(CmdResp::new(id, Server(ServerResp::Error(protocol::ErrCode::EXCEPTION as u8, info)))))
+    protocol::transfer_encode_frame(Frame::Resp(CmdResp::new(
+        id,
+        Server(ServerResp::Error(protocol::ErrCode::EXCEPTION as u8, info)),
+    )))
 }
 
 pub fn ctrl_server_resp_success(id: String, info: String) -> BytesMut {
-    protocol::transfer_encode_frame(Frame::Resp(CmdResp::new(id, Server(ServerResp::Success(ServerSuccessResp::Info(info))))))
+    protocol::transfer_encode_frame(Frame::Resp(CmdResp::new(
+        id,
+        Server(ServerResp::Success(ServerSuccessResp::Info(info))),
+    )))
 }
 
 pub fn ctrl_cmd_req(req: ReqCmd) -> BytesMut {

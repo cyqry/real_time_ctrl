@@ -1,5 +1,6 @@
 use super::PngProfile;
 use anyhow::{anyhow, Result};
+use common::hidden;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,7 +67,7 @@ pub type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<CaptureArtifact>
 
 /// 所有截屏实现只依赖该接口；后端不得直接调用另一个具体后端。
 pub trait ScreenCaptureBackend: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> String;
     fn capture(&self, request: CaptureRequest) -> CaptureFuture<'_>;
 }
 
@@ -87,24 +88,24 @@ impl ScreenCaptureService {
             let name = backend.name();
             match backend.capture(request).await {
                 Ok(artifact) if artifact.png().is_empty() => {
-                    failures.push(format!("{name}: 返回了空 PNG"));
+                    failures.push(hidden!(&name, ": 返回了空 PNG"));
                 }
                 Ok(artifact) if artifact.disposition() == CaptureDisposition::Accept => {
                     return Ok(artifact.into_png());
                 }
                 Ok(_) => {
-                    failures.push(format!("{name}: 当前帧需要后端复核"));
+                    failures.push(hidden!(&name, ": 当前帧需要后端复核"));
                 }
                 Err(error) => {
-                    failures.push(format!("{name}: {error}"));
+                    failures.push(hidden!(&name, ": ", error));
                 }
             }
         }
 
-        Err(anyhow!(
-            "所有截屏后端均未返回可接受结果: {}",
-            failures.join(" | ")
-        ))
+        Err(anyhow!(hidden!(
+            "所有截屏后端均未返回可接受结果: ",
+            failures.join(&hidden!(" | "))
+        )))
     }
 }
 
@@ -124,7 +125,7 @@ impl ScreenCaptureServiceBuilder {
 
     pub fn build(self) -> Result<ScreenCaptureService> {
         if self.backends.is_empty() {
-            return Err(anyhow!("截屏服务至少需要一个后端"));
+            return Err(anyhow!(hidden!("截屏服务至少需要一个后端")));
         }
         Ok(ScreenCaptureService {
             backends: self.backends,
@@ -161,8 +162,8 @@ mod tests {
     }
 
     impl ScreenCaptureBackend for StubBackend {
-        fn name(&self) -> &'static str {
-            self.name
+        fn name(&self) -> String {
+            self.name.to_string()
         }
 
         fn capture(&self, _request: CaptureRequest) -> CaptureFuture<'_> {

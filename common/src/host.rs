@@ -43,20 +43,17 @@ pub fn get_host() -> String {
     resolve_configured_host(HOST())
 }
 
-pub fn get_host_from_env_or_default(env_name: &str) -> String {
+pub fn get_host_from_env_or(env_name: &str, default: &str) -> String {
     // 仅 real_ctrl 这类控制端允许通过环境变量切换服务端地址，ctrl_kik 必须继续使用编译期配置。
     let host = env::var(env_name)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(HOST);
+        .unwrap_or_else(|| default.to_string());
     resolve_configured_host(host)
 }
 
 fn resolve_configured_host(host: String) -> String {
-    if host == "localhost" || host == "127.0.0.1" {
-        return host;
-    }
     resolve_domain(host.as_str())
         .unwrap_or_default()
         .first()

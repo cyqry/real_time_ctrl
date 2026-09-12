@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
-use common::config::{ClientTransportMode, Config};
+use common::config::Config;
 use common::ltc_codec::{
     LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH, INIT_MAX_FRAME_LENGTH,
 };
@@ -59,14 +59,10 @@ pub async fn ctrl_conn(
     let channel = channel_arc.clone();
     let client_nonce = random_nonce_hex();
     let auth_secret = config.id.control_plane_secret().to_string();
-    let client_mode = config.security.client_mode.clone();
     let read_timeout = config.read_timeout;
-    let mut auth_phase = match client_mode {
-        ClientTransportMode::Plain => AuthPhase::AwaitingSession,
-        ClientTransportMode::PinnedTls => AuthPhase::AwaitingChallenge,
-    };
+    let mut auth_phase = AuthPhase::AwaitingChallenge;
     e2e_trace("ctrl_conn: connected transport");
-    handle_active(config, &client_nonce, channel.clone()).await?;
+    handle_active(&client_nonce, channel.clone()).await?;
     e2e_trace("ctrl_conn: sent auth start");
 
     let (mut tx, mut rx) = mpsc::channel::<CmdResp>(5);
@@ -94,7 +90,6 @@ pub async fn ctrl_conn(
                         &mut tx,
                         &auth_secret,
                         &client_nonce,
-                        &client_mode,
                         &mut auth_phase,
                     )
                     .await
@@ -164,15 +159,8 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     }
 }
 
-async fn handle_active(
-    config: &Config,
-    client_nonce: &str,
-    channel: Arc<Mutex<Channel>>,
-) -> anyhow::Result<()> {
-    let frame = match config.security.client_mode {
-        ClientTransportMode::Plain => InitFrame::CtrlAuthReq(config.id.encrypt()),
-        ClientTransportMode::PinnedTls => InitFrame::CtrlAuthStart(client_nonce.to_string()),
-    };
+async fn handle_active(client_nonce: &str, channel: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
+    let frame = InitFrame::CtrlAuthStart(client_nonce.to_string());
     channel
         .lock()
         .await
@@ -193,7 +181,6 @@ async fn handle_read(
     tx: &mut Sender<CmdResp>,
     auth_secret: &str,
     client_nonce: &str,
-    client_mode: &ClientTransportMode,
     auth_phase: &mut AuthPhase,
 ) -> Option<()> {
     let channel_type = channel.lock().await.channel_type;
@@ -202,9 +189,7 @@ async fn handle_read(
         match frame {
             InitFrame::CtrlAuthChallenge(server_nonce) => {
                 e2e_trace("ctrl_conn: received auth challenge");
-                if *client_mode != ClientTransportMode::PinnedTls
-                    || *auth_phase != AuthPhase::AwaitingChallenge
-                {
+                if *auth_phase != AuthPhase::AwaitingChallenge {
                     return None;
                 }
                 let proof = ctrl_auth_proof(auth_secret, client_nonce, &server_nonce);
@@ -221,9 +206,7 @@ async fn handle_read(
                 e2e_trace("ctrl_conn: sent auth proof");
             }
             InitFrame::CtrlAuthSession(session_id) => {
-                if *client_mode != ClientTransportMode::PinnedTls
-                    || *auth_phase != AuthPhase::AwaitingSession
-                {
+                if *auth_phase != AuthPhase::AwaitingSession {
                     return None;
                 }
                 e2e_trace("ctrl_conn: received auth session");
@@ -238,28 +221,6 @@ async fn handle_read(
                 ))
                 .await
                 .ok()?;
-            }
-            InitFrame::CtrlAuthReply(true) => {
-                if *client_mode != ClientTransportMode::Plain
-                    || *auth_phase != AuthPhase::AwaitingSession
-                {
-                    return None;
-                }
-                // 初始化成功消息复用业务响应通道，只作为外层函数继续执行的信号。
-                channel.lock().await.channel_type = ChannelType::Ctrl;
-                *auth_phase = AuthPhase::Authenticated;
-                tx.send(CmdResp::new(
-                    "##cmdId".to_string(),
-                    Server(ServerResp::Success(ServerSuccessResp::Info(
-                        AUTH_OK_PREFIX.to_string(),
-                    ))),
-                ))
-                .await
-                .ok()?;
-            }
-            InitFrame::CtrlAuthReply(false) => {
-                debug!("控制连接业务鉴权失败");
-                return None;
             }
             _ => return None,
         }

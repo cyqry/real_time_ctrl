@@ -9,12 +9,14 @@ use common::ltc_codec::{
     LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH, DATA_MAX_FRAME_LENGTH,
     INIT_MAX_FRAME_LENGTH,
 };
+use common::noise_transport::{accept_kik_noise, build_kik_noise_acceptor};
 use common::protocol::kik_ping;
 use common::secure_transport::{
-    accept_tls, build_server_tls_acceptor, split_stream, TransportParts,
+    accept_prefixed_tls, accept_tls, build_server_tls_acceptor, ServerTlsAcceptor, TransportParts,
+    CTRL_TLS_PREFIX,
 };
 use ctrl_common::ctrl_protocol::ctrl_ping;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,99 +31,121 @@ use tokio_util::codec::FramedRead;
 pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     // 连接许可在握手前获取，避免 TLS/半帧慢连接无限创建任务并占满内存。
     let connection_limit = Arc::new(Semaphore::new(512));
-    if let Some(tls_acceptor) = build_server_tls_acceptor(&config.security)? {
-        let tls_listener = TcpListener::bind(format!(
-            "{}:{}",
-            config.server_host, config.security.tls_port
-        ))
-        .await?;
-        info!(
-            "开启 real_ctrl TLS 管理端口,监听{}的{}端口",
-            config.server_host, config.security.tls_port
-        );
-        let tls_context = context.clone();
-        let tls_config = config.clone();
-        let tls_connection_limit = connection_limit.clone();
-        tokio::spawn(async move {
-            loop {
-                match tls_listener.accept().await {
-                    Ok((stream, addr)) => {
-                        let Ok(permit) = tls_connection_limit.clone().try_acquire_owned() else {
-                            warn!("活动连接达到上限，拒绝 TLS 连接: {}", addr);
-                            continue;
-                        };
-                        let acceptor = tls_acceptor.clone();
-                        let context = tls_context.clone();
-                        let config = tls_config.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            match accept_tls(acceptor, stream, config.read_timeout).await {
-                                Ok(parts) => {
-                                    handle_transport_parts(
-                                        context,
-                                        config,
-                                        parts,
-                                        addr,
-                                        TransportPolicy::TlsControl,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    error!("TLS 握手失败，远程地址:{}，error:{}", addr, e);
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        error!("TLS 管理端口 accept 失败:{}", e);
-                    }
-                }
-            }
-        });
-    } else {
-        warn!("未配置 TLS 管理端口；明文端口默认只接收 ctrl_kik，real_ctrl 将无法接入");
+    let tls_acceptor = build_server_tls_acceptor(&config.security)?;
+    let kik_noise_acceptor =
+        build_kik_noise_acceptor(config.security.kik_noise_private_key.as_deref())?;
+    if config.security.tls_port == config.server_port {
+        return Err(anyhow::anyhow!(
+            "Kik Noise 与 real_ctrl TLS 必须使用不同端口"
+        ));
     }
 
-    let listener =
+    let tls_listener = TcpListener::bind(format!(
+        "{}:{}",
+        config.server_host, config.security.tls_port
+    ))
+    .await?;
+    info!(
+        "开启 real_ctrl TLS 管理端口,监听{}的{}端口",
+        config.server_host, config.security.tls_port
+    );
+    let tls_context = context.clone();
+    let tls_config = config.clone();
+    let tls_connection_limit = connection_limit.clone();
+    tokio::spawn(async move {
+        loop {
+            match tls_listener.accept().await {
+                Ok((stream, addr)) => {
+                    let Ok(permit) = tls_connection_limit.clone().try_acquire_owned() else {
+                        warn!("活动连接达到上限，拒绝 TLS 连接: {}", addr);
+                        continue;
+                    };
+                    let acceptor = tls_acceptor.clone();
+                    let context = tls_context.clone();
+                    let config = tls_config.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match accept_control_tls(acceptor, stream, config.read_timeout).await {
+                            Ok(parts) => {
+                                handle_transport_parts(
+                                    context,
+                                    config,
+                                    parts,
+                                    addr,
+                                    TransportPolicy::TlsControl,
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                error!("TLS 握手失败，远程地址:{}，error:{}", addr, error);
+                            }
+                        }
+                    });
+                }
+                Err(error) => error!("TLS 管理端口 accept 失败:{}", error),
+            }
+        }
+    });
+
+    let kik_listener =
         TcpListener::bind(format!("{}:{}", config.server_host, config.server_port)).await?;
     info!(
-        "开启服务,监听{}的{}端口",
+        "开启 Kik Noise 端口,监听{}的{}端口",
         config.server_host, config.server_port
     );
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = kik_listener.accept().await?;
         let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
-            warn!("活动连接达到上限，拒绝明文连接: {}", addr);
+            warn!("活动连接达到上限，拒绝 Kik Noise 连接: {}", addr);
             continue;
         };
-        tokio::spawn(handle_stream(
-            context.clone(),
-            config.clone(),
-            stream,
-            addr,
-            permit,
-        ));
+        let acceptor = kik_noise_acceptor.clone();
+        let context = context.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match accept_kik_noise(acceptor, stream, config.read_timeout).await {
+                Ok(parts) => {
+                    handle_transport_parts(context, config, parts, addr, TransportPolicy::NoiseKik)
+                        .await;
+                }
+                Err(error) => error!("Kik Noise 握手失败，远程地址:{}，error:{}", addr, error),
+            }
+        });
     }
 }
 
 #[derive(Clone, Copy)]
 enum TransportPolicy {
-    Plain,
     TlsControl,
+    NoiseKik,
 }
 
-async fn handle_stream(
-    context: Context,
-    config: Config,
+/// 标准 TLS record 与 RTCT 前导首字节不冲突，可在同一 TLS 专用端口接受运维探测。
+fn is_tls_record_prefix(first_byte: u8) -> bool {
+    first_byte == 0x16
+}
+
+/// 独立管理端口只允许 TLS，同时接受标准 ClientHello 与项目固定前导。
+/// 前导不决定认证结果；两条路径最终都进入同一个 rustls TLS 1.3 acceptor。
+async fn accept_control_tls(
+    acceptor: ServerTlsAcceptor,
     stream: TcpStream,
-    local_addr: SocketAddr,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    if let Err(e) = stream.set_nodelay(true) {
-        debug!("设置 TCP_NODELAY 失败: {}", e);
+    handshake_timeout: Duration,
+) -> anyhow::Result<TransportParts> {
+    let mut first_byte = [0_u8; 1];
+    let length = timeout(handshake_timeout, stream.peek(&mut first_byte))
+        .await
+        .map_err(|_| anyhow::anyhow!("TLS 协议识别超时"))??;
+    match first_byte.first().copied().filter(|_| length != 0) {
+        Some(first) if is_tls_record_prefix(first) => {
+            accept_tls(acceptor, stream, handshake_timeout).await
+        }
+        Some(first) if first == CTRL_TLS_PREFIX[0] => {
+            accept_prefixed_tls(acceptor, stream, handshake_timeout).await
+        }
+        _ => Err(anyhow::anyhow!("TLS 管理端口收到未知协议")),
     }
-    let parts = split_stream(stream);
-    handle_transport_parts(context, config, parts, local_addr, TransportPolicy::Plain).await;
 }
 
 async fn handle_transport_parts(
@@ -262,7 +286,7 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
             };
             // context.set_kik_state();
             // 因为Kik连接断开了，所以万一在被控制，需要清理
-            let _ = context.delete_kik_conn_if_id(id.as_str()).await;
+            let _ = context.delete_kik_conn_if(id.as_str(), &channel).await;
             if let Some(kik) = context.delete_kik_if_not_online(id.as_str()).await {
                 info!("【{}】下线，ip:{}", kik.kik_client_info.kik_info.name, ip);
             }
@@ -336,11 +360,22 @@ async fn handle_read(
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => {
             //未识别的连接连ping pong 都不让发； unknow到其他消息状态的转换最好是同步的，不然有问题
-            let allow_ctrl = matches!(transport_policy, TransportPolicy::TlsControl)
-                || config.security.allow_plain_ctrl;
-            let allow_kik = matches!(transport_policy, TransportPolicy::Plain);
+            let allow_ctrl = matches!(transport_policy, TransportPolicy::TlsControl);
+            let allow_kik = matches!(transport_policy, TransportPolicy::NoiseKik);
             read_handle::handle_init_message(config, context, channel, msg, allow_ctrl, allow_kik)
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_tls_record_prefix;
+
+    #[test]
+    fn dedicated_tls_port_recognizes_client_hello() {
+        assert!(is_tls_record_prefix(0x16));
+        assert!(!is_tls_record_prefix(0));
+        assert!(!is_tls_record_prefix(1));
     }
 }

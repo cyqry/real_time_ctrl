@@ -23,6 +23,10 @@ pub struct ApiRequest {
 pub enum ApiCommand {
     SysList,
     SysNow,
+    SysHistory {
+        #[serde(default)]
+        kik_id: Option<String>,
+    },
     SysUse {
         kik_id: String,
     },
@@ -82,6 +86,9 @@ pub enum ApiResponseData {
     },
     SysNow {
         value: ctrl_common::cmd_resp_info::SysNow,
+    },
+    SysHistory {
+        items: Vec<ctrl_common::cmd_resp_info::KikPresenceVo>,
     },
     Binary {
         content_type: String,
@@ -195,6 +202,7 @@ impl ApiCommand {
         match self {
             ApiCommand::SysList => "sys_list",
             ApiCommand::SysNow => "sys_now",
+            ApiCommand::SysHistory { .. } => "sys_history",
             ApiCommand::SysUse { .. } => "sys_use",
             ApiCommand::CtrlLs { .. } => "ctrl_ls",
             ApiCommand::CtrlScreen { .. } => "ctrl_screen",
@@ -209,6 +217,12 @@ impl ApiCommand {
     fn validate(&self) -> Result<(), ApiErrorBody> {
         match self {
             ApiCommand::SysList | ApiCommand::SysNow => Ok(()),
+            ApiCommand::SysHistory { kik_id } => {
+                if let Some(kik_id) = kik_id {
+                    validate_text(kik_id, "kik_id", MAX_KIK_ID_BYTES)?;
+                }
+                Ok(())
+            }
             ApiCommand::SysUse { kik_id } => validate_text(kik_id, "kik_id", MAX_KIK_ID_BYTES),
             ApiCommand::CtrlLs { path } => validate_path(path, "path", false),
             ApiCommand::CtrlScreen { save_path } => {
@@ -220,16 +234,24 @@ impl ApiCommand {
             ApiCommand::CtrlGetFile {
                 remote_path,
                 local_path,
-            }
-            | ApiCommand::CtrlGetBigFile {
-                remote_path,
-                local_path,
             } => {
                 validate_path(remote_path, "remote_path", false)?;
                 if let Some(path) = local_path {
                     validate_path(path, "local_path", true)?;
                 }
                 Ok(())
+            }
+            ApiCommand::CtrlGetBigFile {
+                remote_path,
+                local_path,
+            } => {
+                validate_path(remote_path, "remote_path", false)?;
+                let path = local_path.as_deref().ok_or_else(|| {
+                    ApiErrorBody::bad_request(
+                        "ctrl_get_big_file 必须提供 local_path，禁止把大文件聚合进 API 响应内存",
+                    )
+                })?;
+                validate_path(path, "local_path", false)
             }
             ApiCommand::CtrlSetFile {
                 local_path,
@@ -252,6 +274,9 @@ impl ApiCommand {
         match self {
             ApiCommand::SysList => InputCommand::Sys(common::command::SysCommand::List),
             ApiCommand::SysNow => InputCommand::Sys(common::command::SysCommand::Now),
+            ApiCommand::SysHistory { kik_id } => {
+                InputCommand::Sys(common::command::SysCommand::History(kik_id))
+            }
             ApiCommand::SysUse { kik_id } => {
                 InputCommand::Sys(common::command::SysCommand::Use(kik_id))
             }
@@ -315,6 +340,9 @@ pub fn remote_resp_to_api_data(
             Ok(ApiResponseData::SysList { items })
         }
         RemoteResp::Success(RemoteSuccessResp::Now(value)) => Ok(ApiResponseData::SysNow { value }),
+        RemoteResp::Success(RemoteSuccessResp::History(items)) => {
+            Ok(ApiResponseData::SysHistory { items })
+        }
         RemoteResp::SuccessData(bytes) => {
             if bytes.len() > MAX_API_BINARY_BYTES {
                 return Err(ApiErrorBody::payload_too_large(format!(
@@ -388,5 +416,24 @@ mod tests {
             path: "C:\\Temp\0hidden".to_string(),
         });
         assert!(nul_path.validate().is_err());
+    }
+
+    #[test]
+    fn sys_history_api_maps_optional_kik_id() {
+        let all = ApiRequest::new(ApiCommand::SysHistory { kik_id: None });
+        assert!(all.validate().is_ok());
+        assert!(matches!(
+            all.command.into_input_command(),
+            InputCommand::Sys(common::command::SysCommand::History(None))
+        ));
+
+        let one = ApiRequest::new(ApiCommand::SysHistory {
+            kik_id: Some("kik-1".to_string()),
+        });
+        assert!(one.validate().is_ok());
+        assert!(matches!(
+            one.command.into_input_command(),
+            InputCommand::Sys(common::command::SysCommand::History(Some(id))) if id == "kik-1"
+        ));
     }
 }

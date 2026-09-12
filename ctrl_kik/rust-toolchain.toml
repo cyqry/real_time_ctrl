@@ -1,0 +1,7 @@
+[toolchain]
+# ctrl_kik 的受保护发布依赖 Nightly build-std/location-detail 能力。
+# 固定日期避免 nightly 漂移；real_ctrl 与 ctrl_server 不读取此文件，仍可独立选择稳定版或其他版本。
+channel = "nightly-2025-12-14"
+profile = "minimal"
+components = ["rust-src", "llvm-tools"]
+targets = ["x86_64-pc-windows-msvc"]

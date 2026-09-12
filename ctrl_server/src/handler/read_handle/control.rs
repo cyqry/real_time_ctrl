@@ -3,6 +3,7 @@ use crate::core::context::Context;
 use bytes::BytesMut;
 use common::channel::Channel;
 use common::command::{Command, SysCommand};
+use common::file_util::LONG_COMMAND_TIMEOUT;
 use common::message::kik_frame::KikFrame;
 use common::protocol::{self, BufSerializable, ReqCmd};
 use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
@@ -13,7 +14,7 @@ use log::{debug, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 use tokio_stream::StreamExt;
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的帧类型")
@@ -28,7 +29,7 @@ pub async fn handle_ctrl(
     // 当前协议明确只允许一个活动命令，因此业务处理在控制连接读循环内串行等待；
     // 客户端命令门禁和服务端 active_command_id 共同阻止无界命令排队。
     let frame = Frame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
-    match frame.clone() {
+    match frame {
         Frame::Cmd(req) => {
             let (cmd_id, cmd_options, cmd) = req.split();
             if matches!(&cmd, Command::Exec(_)) && !allow_remote_exec {
@@ -37,7 +38,7 @@ pub async fn handle_ctrl(
                     .await
                     .write_and_flush(&ctrl_server_resp_error(
                         cmd_id,
-                        "服务端策略默认禁用 Exec；需显式设置 CTRL_SERVER_ALLOW_EXEC=1".to_string(),
+                        "服务端当前策略禁止 Exec，可通过 CTRL_SERVER_ALLOW_EXEC=1 覆盖".to_string(),
                     ))
                     .await?;
                 return Ok(());
@@ -161,6 +162,21 @@ pub async fn handle_ctrl(
                                     ))
                                     .await?;
                             }
+                            SysCommand::History(kik_id) => {
+                                let records = context.kik_presence(kik_id.as_deref()).await;
+                                let response = if kik_id.is_some() && records.is_empty() {
+                                    ctrl_server_resp_error(
+                                        cmd_id,
+                                        "找不到该 Kik 的上下线记录".into(),
+                                    )
+                                } else {
+                                    ctrl_server_resp_success(
+                                        cmd_id,
+                                        serde_json::to_string(&records)?,
+                                    )
+                                };
+                                channel.lock().await.write_and_flush(&response).await?;
+                            }
                         },
                         //除了以上 类型，下面的需要kik执行并响应
                         cmd => {
@@ -188,20 +204,28 @@ pub async fn handle_ctrl(
                                                 .await?;
                                         }
                                         Some(kik_conn) => {
-                                            kik_conn
-                                                .clone()
+                                            let command_timeout = cmd_options.timeout();
+                                            let request =
+                                                protocol::transfer_encode_frame(KikFrame::Cmd(
+                                                    ReqCmd::new(cmd_id.clone(), cmd_options, cmd),
+                                                ));
+                                            if let Err(error) = kik_conn
                                                 .lock()
                                                 .await
-                                                .try_write_and_flush(
-                                                    &protocol::transfer_encode_frame(
-                                                        KikFrame::Cmd(ReqCmd::new(
-                                                            cmd_id.clone(),
-                                                            cmd_options.clone(),
-                                                            cmd.clone(),
-                                                        )),
-                                                    ),
-                                                )
-                                                .await;
+                                                .write_and_flush(&request)
+                                                .await
+                                            {
+                                                warn!("向被控端写入控制命令失败: {error}");
+                                                channel
+                                                    .lock()
+                                                    .await
+                                                    .write_and_flush(&ctrl_server_resp_error(
+                                                        cmd_id,
+                                                        "向被控端发送命令失败".to_string(),
+                                                    ))
+                                                    .await?;
+                                                return Ok(());
+                                            }
 
                                             let rx_arc = kik_conn
                                                 .lock()
@@ -214,19 +238,17 @@ pub async fn handle_ctrl(
 
                                             let mut resp_op = None;
 
-                                            //正常数据超时等待时间为5分钟
-
-                                            let mut duration = Duration::from_secs(60 * 5);
+                                            let response_timeout = if command_timeout {
+                                                Duration::from_secs(60 * 5)
+                                            } else {
+                                                LONG_COMMAND_TIMEOUT
+                                            };
+                                            let deadline = Instant::now() + response_timeout;
                                             for _ in 0..3 {
-                                                let res = if cmd_options.timeout() {
-                                                    timeout(
-                                                        duration,
-                                                        rx_arc.clone().lock().await.recv(),
-                                                    )
-                                                    .await
-                                                } else {
-                                                    Ok(rx_arc.clone().lock().await.recv().await)
-                                                };
+                                                let res = timeout_at(deadline, async {
+                                                    rx_arc.lock().await.recv().await
+                                                })
+                                                .await;
 
                                                 match res {
                                                     Ok(Some((resp, resp_cmd_id))) => {
@@ -235,7 +257,6 @@ pub async fn handle_ctrl(
                                                             //只有这里continue,因为只有这里重试读,并且这次读等的时间短一点
                                                             //极其偶然需要记录日志
                                                             warn!("得到过期响应或异常响应");
-                                                            duration /= 2;
                                                             continue;
                                                         } else {
                                                             resp_op = Some(ctrl_kik_resp(

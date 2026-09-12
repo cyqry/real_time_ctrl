@@ -29,6 +29,7 @@ fn to_remote_resp(cmd: SysCommand, info: &String) -> anyhow::Result<RemoteSucces
         SysCommand::List => RemoteSuccessResp::SysList(serde_json::from_str(info)?),
         SysCommand::Use(_) => RemoteSuccessResp::Info(info.to_owned()),
         SysCommand::Now => RemoteSuccessResp::Now(serde_json::from_str(info)?),
+        SysCommand::History(_) => RemoteSuccessResp::History(serde_json::from_str(info)?),
     };
     Ok(res)
 }

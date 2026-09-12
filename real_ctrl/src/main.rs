@@ -1,18 +1,11 @@
 use chrono::Local;
-use common::config::{Config, Id, SecurityConfig};
-use common::host::get_host_from_env_or_default;
-use real_ctrl::context::{Agent, Context};
 use real_ctrl::dispatch;
 use real_ctrl::input_command::InputCommand;
+use real_ctrl::local_server::server::create_context;
 use real_ctrl::run_util::apply_log_filter;
-use std::env;
 use std::io::Write;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
 
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
-const DEFAULT_SERVER_PORT: &str = env!("REAL_CTRL_DEFAULT_SERVER_PORT");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,27 +22,7 @@ async fn main() -> anyhow::Result<()> {
     apply_log_filter(&mut logger, LOG_LEVEL);
     logger.init();
 
-    let server_port = env::var("REAL_CTRL_SERVER_PORT")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVER_PORT.to_string());
-
-    let agent = Arc::new(RwLock::new(
-        Agent::create(&Config {
-            id: Id::control_plane_from_env("REAL_CTRL_AUTH_SECRET")?,
-            server_host: get_host_from_env_or_default("REAL_CTRL_SERVER_HOST"),
-            server_port,
-            read_timeout: Duration::from_secs(45),
-            write_timeout: Duration::from_secs(45),
-            security: SecurityConfig::real_ctrl_from_env(),
-        })
-        .await?,
-    ));
-
-    let context = Context::new(agent);
-
-    context.data_init().await?;
+    let context = create_context().await?;
     println!("连接成功");
     loop {
         let mut s = String::new();

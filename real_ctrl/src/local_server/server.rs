@@ -2,37 +2,19 @@ use crate::context::{Agent, Context};
 use crate::local_server::handle_client::handle_client;
 use crate::pipe::pipe_common::PIPE_NAME;
 use anyhow::{anyhow, Result};
-use common::config::{Config, Id, SecurityConfig};
-use common::host::get_host_from_env_or_default;
 use interprocess::os::windows::named_pipe::{pipe_mode, PipeListenerOptions};
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use log::{debug, error, info};
+use std::io;
 use std::sync::Arc;
-use std::time::Duration;
-use std::{env, io};
 use tokio::sync::{RwLock, Semaphore};
 use widestring::U16CString;
 
 const PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
-const DEFAULT_SERVER_PORT: &str = env!("REAL_CTRL_DEFAULT_SERVER_PORT");
 
 pub async fn create_context() -> anyhow::Result<Context> {
-    let server_port = env::var("REAL_CTRL_SERVER_PORT")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVER_PORT.to_string());
-
     let agent = Arc::new(RwLock::new(
-        Agent::create(&Config {
-            id: Id::control_plane_from_env("REAL_CTRL_AUTH_SECRET")?,
-            server_host: get_host_from_env_or_default("REAL_CTRL_SERVER_HOST"),
-            server_port,
-            read_timeout: Duration::from_secs(45),
-            write_timeout: Duration::from_secs(45),
-            security: SecurityConfig::real_ctrl_from_env(),
-        })
-        .await?,
+        Agent::create(&crate::runtime_config::connection_config()?).await?,
     ));
 
     let context = Context::new(agent);

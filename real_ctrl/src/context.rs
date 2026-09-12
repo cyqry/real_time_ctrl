@@ -1,11 +1,10 @@
 use crate::ctrl_conn::ctrl_conn;
 use crate::ctrl_data_conn::ctrl_data_conn;
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use common::channel::Channel;
 use common::config::Config;
-use common::protocol;
 use common::protocol::ReqCmd;
-use ctrl_common::ctrl_frame::Frame;
+use ctrl_common::ctrl_frame::encode_data_frame;
 use ctrl_common::ctrl_protocol::ctrl_cmd_req;
 use ctrl_common::ctrl_resp::CmdResp;
 use std::collections::HashMap;
@@ -13,12 +12,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
+use tokio::task::JoinSet;
 use tokio::time;
 use uuid::Uuid;
 
 type DataMessage = (String, BytesMut);
 type SharedDataReceiver = Arc<Mutex<Receiver<DataMessage>>>;
+const DATA_QUEUE_CAPACITY: usize = 2;
+const DATA_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+const LONG_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60 + 10 * 60);
+const DESIRED_DATA_CONNECTIONS: usize = 3;
 
 #[derive(Clone)]
 struct CommandGate(Arc<Semaphore>);
@@ -53,7 +58,7 @@ pub struct Agent {
 
 impl Context {
     pub fn new(agent: Arc<RwLock<Agent>>) -> Self {
-        let (tx, rx) = channel(5);
+        let (tx, rx) = channel(DATA_QUEUE_CAPACITY);
         Context {
             agent,
             data_conns: Arc::new(RwLock::new(HashMap::new())),
@@ -82,48 +87,48 @@ impl Context {
             self.data_conns.write().await.remove(&id);
         }
     }
-    pub fn get_data_tx(&self) -> Sender<(String, BytesMut)> {
-        self.data_x.0.clone()
-    }
-
     pub fn get_data_rx(&self) -> Arc<Mutex<Receiver<(String, BytesMut)>>> {
         self.data_x.1.clone()
     }
 
+    pub async fn enqueue_data(&self, message: DataMessage) -> anyhow::Result<()> {
+        tokio::time::timeout(DATA_QUEUE_SEND_TIMEOUT, self.data_x.0.send(message))
+            .await
+            .map_err(|_| anyhow::anyhow!("控制端数据队列持续拥塞"))?
+            .map_err(|_| anyhow::anyhow!("控制端数据接收任务已关闭"))
+    }
+
     pub async fn send_data(&self, v: &[u8]) -> anyhow::Result<String> {
         let id = Uuid::new_v4().to_string();
-        self.send_data_with_id(id.clone(), v).await?;
+        self.send_data_with_id(&id, v).await?;
         Ok(id)
     }
 
-    pub async fn send_data_with_id(&self, data_id: String, v: &[u8]) -> anyhow::Result<()> {
-        match self.find_ctrl_data().await {
-            None => Err(anyhow::Error::msg("应用数据传输通道未初始化!")),
-            Some(data_conn) => {
-                let mut bytes_mut = BytesMut::with_capacity(v.len());
-                bytes_mut.put_slice(v);
-
-                let mut guard = data_conn.lock().await;
-                guard
-                    .write_and_flush(&protocol::transfer_encode_frame(Frame::Data(
-                        data_id, bytes_mut,
-                    )))
-                    .await?;
-                Ok(())
+    pub async fn send_data_with_id(&self, data_id: &str, data: &[u8]) -> anyhow::Result<()> {
+        let encoded = encode_data_frame(data_id, data)?;
+        let mut last_error = None;
+        for connection in self.data_connections_for_send().await {
+            let mut connection = connection.lock().await;
+            if connection.is_closed() {
+                continue;
+            }
+            match connection.write_and_flush(&encoded).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
             }
         }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("应用数据传输通道未初始化")))
     }
 
-    pub async fn wait_data(&self, data_id: &str) -> anyhow::Result<Vec<u8>> {
+    pub async fn wait_data(&self, data_id: &str) -> anyhow::Result<BytesMut> {
         let receive = async {
-            for _ in 0..8 {
+            loop {
                 match self.get_data_rx().lock().await.recv().await {
                     None => return Err(anyhow::Error::msg("数据通道已关闭")),
-                    Some((id, data)) if id == data_id => return Ok(data.to_vec()),
+                    Some((id, data)) if id == data_id => return Ok(data),
                     Some(_) => continue,
                 }
             }
-            Err(anyhow::Error::msg("连续收到不匹配的数据帧"))
         };
         tokio::time::timeout(Duration::from_secs(6 * 60), receive)
             .await
@@ -131,23 +136,66 @@ impl Context {
     }
 
     pub async fn find_ctrl_data(&self) -> Option<Arc<Mutex<Channel>>> {
-        let next_arc = self.next_data_conn.clone();
-        let arc = self.data_conns.clone();
-        let data_map = arc.read().await;
-        if data_map.is_empty() {
-            return None;
+        self.data_connections_for_send().await.into_iter().next()
+    }
+
+    async fn data_connections_for_send(&self) -> Vec<Arc<Mutex<Channel>>> {
+        let data_map = self.data_conns.read().await;
+        let count = data_map.len();
+        if count == 0 {
+            return Vec::new();
         }
-        let next = next_arc.fetch_add(1, Ordering::Relaxed) % data_map.len();
-        let c = data_map.values().nth(next).cloned()?;
-        Some(c)
+        let start = self.next_data_conn.fetch_add(1, Ordering::Relaxed) % count;
+        data_map
+            .values()
+            .cycle()
+            .skip(start)
+            .take(count)
+            .cloned()
+            .collect()
     }
     pub async fn data_init(&self) -> anyhow::Result<()> {
         let config = self.agent.read().await.config.clone();
-        ctrl_data_conn(self.clone(), &config).await
+        let mut attempts = JoinSet::new();
+        for _ in 0..DESIRED_DATA_CONNECTIONS {
+            let (context, config) = (self.clone(), config.clone());
+            attempts.spawn(async move { ctrl_data_conn(context, &config).await });
+        }
+
+        let mut connected = 0;
+        let mut last_error = None;
+        while let Some(result) = attempts.join_next().await {
+            match result {
+                Ok(Ok(())) => connected += 1,
+                Ok(Err(error)) => last_error = Some(error),
+                Err(error) => last_error = Some(error.into()),
+            }
+        }
+        if connected == 0 {
+            return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("数据通道初始化失败")));
+        }
+        if connected < DESIRED_DATA_CONNECTIONS {
+            log::warn!(
+                "仅建立 {connected}/{DESIRED_DATA_CONNECTIONS} 条数据连接，文件传输将降级运行"
+            );
+        }
+        Ok(())
     }
 
     pub async fn request(&self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
-        let request_result = self.agent.write().await.req(cmd).await;
+        self.request_after_send(cmd, None).await
+    }
+
+    /// 控制帧成功写入后再放行关联数据任务。
+    ///
+    /// 这不是额外的网络握手，只是本进程内的时序门禁：控制连接写失败时，
+    /// 上传任务不会提前把孤立分片塞入远端有界队列。
+    pub async fn request_after_send(
+        &self,
+        cmd: &ReqCmd,
+        transfer_start: Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<CmdResp> {
+        let request_result = self.agent.write().await.req(cmd, transfer_start).await;
         if let Ok(response) = request_result {
             return Ok(response);
         }
@@ -214,24 +262,42 @@ impl Agent {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("控制连接重试次数必须大于 0")))
     }
 
-    pub async fn req(&mut self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
+    pub async fn req(
+        &mut self,
+        cmd: &ReqCmd,
+        transfer_start: Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<CmdResp> {
         self.conn
             .lock()
             .await
             .write_and_flush(&ctrl_cmd_req(cmd.clone()))
             .await?;
-
-        for _ in 0..8 {
-            let response = self
-                .recv
-                .recv()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("控制响应通道已关闭"))?;
-            if response.get_cmd_id() == cmd.get_id() {
-                return Ok(response);
-            }
+        if transfer_start.is_some_and(|sender| sender.send(()).is_err()) {
+            return Err(anyhow::Error::msg(
+                "控制命令已写出，但关联数据发送任务已提前退出",
+            ));
         }
-        Err(anyhow::anyhow!("连续收到不匹配的控制响应"))
+
+        let response_timeout = if cmd.get_cmd_options().timeout() {
+            CONTROL_RESPONSE_TIMEOUT
+        } else {
+            LONG_CONTROL_RESPONSE_TIMEOUT
+        };
+        tokio::time::timeout(response_timeout, async {
+            for _ in 0..8 {
+                let response = self
+                    .recv
+                    .recv()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("控制响应通道已关闭"))?;
+                if response.get_cmd_id() == cmd.get_id() {
+                    return Ok(response);
+                }
+            }
+            Err(anyhow::anyhow!("连续收到不匹配的控制响应"))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("等待控制响应超过命令总时限"))?
     }
 }
 

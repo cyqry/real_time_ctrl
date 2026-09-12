@@ -1,8 +1,9 @@
 use crate::ctrl_resp::CmdResp;
 use bytes::{Buf, BufMut, BytesMut};
-use common::protocol::{BufSerializable, ReqCmd};
+use common::protocol::{self, BufSerializable, ReqCmd};
 
-const MAX_DATA_ID_BYTES: usize = 128;
+pub const DATA_FRAME_CODE: u8 = 13;
+const MAX_DATA_ID_BYTES: usize = protocol::MAX_CORRELATION_ID_BYTES;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -13,6 +14,11 @@ pub enum Frame {
 
     Ping,
     Pong,
+}
+
+/// 控制端数据通道热路径编码，避免大 payload 在两层封帧间重复复制。
+pub fn encode_data_frame(data_id: &str, data: &[u8]) -> std::io::Result<BytesMut> {
+    protocol::transfer_encode_data_frame(DATA_FRAME_CODE, data_id, data, MAX_DATA_ID_BYTES)
 }
 
 impl BufSerializable for Frame {
@@ -105,6 +111,20 @@ mod tests {
 
         match decoded {
             Frame::Data(id, data) => {
+                assert_eq!(id, "data-id");
+                assert_eq!(data.as_ref(), b"hello");
+            }
+            _ => panic!("unexpected frame"),
+        }
+    }
+
+    #[test]
+    fn direct_data_encoder_includes_length_prefix() {
+        let mut encoded = encode_data_frame("data-id", b"hello").unwrap();
+        let frame_len = encoded.get_u32() as usize;
+        assert_eq!(frame_len, encoded.len());
+        match Frame::from_buf(encoded) {
+            Some(Frame::Data(id, data)) => {
                 assert_eq!(id, "data-id");
                 assert_eq!(data.as_ref(), b"hello");
             }

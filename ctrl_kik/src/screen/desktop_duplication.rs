@@ -10,6 +10,7 @@ compile_error!("windows-primary-screen-png only supports Windows 8 or newer");
 
 use std::{error::Error as StdError, fmt, marker::PhantomData, mem::size_of, rc::Rc};
 
+use common::hidden;
 use png::{BitDepth, ColorType, Compression, Encoder, Filter};
 use windows::{
     core::{Error as WindowsError, Interface},
@@ -68,29 +69,35 @@ pub enum CaptureError {
     Png(png::EncodingError),
     NoPrimaryOutput,
     Timeout,
-    MissingObject(&'static str),
+    MissingObject(String),
     UnsupportedPixelFormat(i32),
     UnsupportedRotation(i32),
-    InvalidFrame(&'static str),
+    InvalidFrame(String),
     ImageTooLarge,
 }
 
 impl fmt::Display for CaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Windows(error) => write!(f, "Windows API failed: {error}"),
-            Self::Png(error) => write!(f, "PNG encoding failed: {error}"),
-            Self::NoPrimaryOutput => write!(f, "the Windows primary display could not be found"),
-            Self::Timeout => write!(f, "timed out waiting for a desktop frame"),
-            Self::MissingObject(name) => write!(f, "Windows returned no {name}"),
+            Self::Windows(error) => f.write_str(&hidden!("Windows API failed: ", error)),
+            Self::Png(error) => f.write_str(&hidden!("PNG encoding failed: ", error)),
+            Self::NoPrimaryOutput => {
+                f.write_str(&hidden!("the Windows primary display could not be found"))
+            }
+            Self::Timeout => f.write_str(&hidden!("timed out waiting for a desktop frame")),
+            Self::MissingObject(name) => f.write_str(&hidden!("Windows returned no ", name)),
             Self::UnsupportedPixelFormat(format) => {
-                write!(f, "unsupported DXGI desktop pixel format: {format}")
+                f.write_str(&hidden!("unsupported DXGI desktop pixel format: ", format))
             }
             Self::UnsupportedRotation(rotation) => {
-                write!(f, "unsupported DXGI display rotation: {rotation}")
+                f.write_str(&hidden!("unsupported DXGI display rotation: ", rotation))
             }
-            Self::InvalidFrame(message) => write!(f, "invalid desktop frame: {message}"),
-            Self::ImageTooLarge => write!(f, "desktop dimensions exceed addressable memory"),
+            Self::InvalidFrame(message) => {
+                f.write_str(&hidden!("invalid desktop frame: ", message))
+            }
+            Self::ImageTooLarge => {
+                f.write_str(&hidden!("desktop dimensions exceed addressable memory"))
+            }
         }
     }
 }
@@ -226,7 +233,7 @@ impl PrimaryScreenCapturer {
     pub fn encode_cached_png_into(&self, profile: PngProfile, output: &mut Vec<u8>) -> Result<()> {
         let (width, height) = self
             .cached_dimensions
-            .ok_or(CaptureError::MissingObject("cached desktop frame"))?;
+            .ok_or_else(|| CaptureError::MissingObject(hidden!("cached desktop frame")))?;
         encode_png_into(&self.rgb, width, height, profile, output)
     }
 
@@ -259,7 +266,7 @@ impl PrimaryScreenCapturer {
         let session = self
             .session
             .as_mut()
-            .ok_or(CaptureError::MissingObject("capture session"))?;
+            .ok_or_else(|| CaptureError::MissingObject(hidden!("capture session")))?;
         let frame = match AcquiredFrame::acquire(&session.duplication, self.acquire_timeout_ms)? {
             Some(frame) => frame,
             None => return Err(CaptureError::Timeout),
@@ -270,20 +277,20 @@ impl PrimaryScreenCapturer {
         unsafe { desktop_texture.GetDesc(&mut source_desc) };
 
         if source_desc.Width == 0 || source_desc.Height == 0 {
-            return Err(CaptureError::InvalidFrame("zero-sized texture"));
+            return Err(CaptureError::InvalidFrame(hidden!("zero-sized texture")));
         }
         if source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
             return Err(CaptureError::UnsupportedPixelFormat(source_desc.Format.0));
         }
         if source_desc.ArraySize != 1 || source_desc.MipLevels != 1 {
-            return Err(CaptureError::InvalidFrame(
-                "Desktop Duplication returned an unexpected texture layout",
-            ));
+            return Err(CaptureError::InvalidFrame(hidden!(
+                "Desktop Duplication returned an unexpected texture layout"
+            )));
         }
         if source_desc.SampleDesc.Count != 1 || source_desc.SampleDesc.Quality != 0 {
-            return Err(CaptureError::InvalidFrame(
-                "Desktop Duplication returned an unexpected multisampled texture",
-            ));
+            return Err(CaptureError::InvalidFrame(hidden!(
+                "Desktop Duplication returned an unexpected multisampled texture"
+            )));
         }
 
         session.ensure_staging(&source_desc)?;
@@ -291,7 +298,7 @@ impl PrimaryScreenCapturer {
             .staging
             .as_ref()
             .cloned()
-            .ok_or(CaptureError::MissingObject("D3D11 staging texture"))?;
+            .ok_or_else(|| CaptureError::MissingObject(hidden!("D3D11 staging texture")))?;
         let context = session.context.clone();
 
         unsafe { context.CopyResource(&staging, &desktop_texture) };
@@ -367,7 +374,9 @@ impl Session {
                 .CreateTexture2D(&staging_desc, None, Some(&mut texture))?;
         }
 
-        self.staging = Some(texture.ok_or(CaptureError::MissingObject("D3D11 staging texture"))?);
+        self.staging = Some(
+            texture.ok_or_else(|| CaptureError::MissingObject(hidden!("D3D11 staging texture")))?,
+        );
         self.staging_key = Some(key);
         Ok(())
     }
@@ -482,8 +491,8 @@ fn create_d3d11_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11D
     }
 
     Ok((
-        device.ok_or(CaptureError::MissingObject("D3D11 device"))?,
-        context.ok_or(CaptureError::MissingObject("D3D11 immediate context"))?,
+        device.ok_or_else(|| CaptureError::MissingObject(hidden!("D3D11 device")))?,
+        context.ok_or_else(|| CaptureError::MissingObject(hidden!("D3D11 immediate context")))?,
     ))
 }
 
@@ -506,7 +515,9 @@ impl AcquiredFrame {
         if resource.is_none() {
             // AcquireNextFrame 已成功，即使 API 返回无效空资源也必须调用 ReleaseFrame。
             let _ = unsafe { duplication.ReleaseFrame() };
-            return Err(CaptureError::MissingObject("DXGI desktop resource"));
+            return Err(CaptureError::MissingObject(hidden!(
+                "DXGI desktop resource"
+            )));
         }
 
         Ok(Some(Self {
@@ -518,7 +529,7 @@ impl AcquiredFrame {
     fn resource(&self) -> Result<&IDXGIResource> {
         self.resource
             .as_ref()
-            .ok_or(CaptureError::MissingObject("DXGI desktop resource"))
+            .ok_or_else(|| CaptureError::MissingObject(hidden!("DXGI desktop resource")))
     }
 }
 
@@ -545,9 +556,9 @@ impl MappedTexture {
 
         if mapped.pData.is_null() || mapped.RowPitch == 0 {
             unsafe { context.Unmap(&texture, 0) };
-            return Err(CaptureError::InvalidFrame(
-                "D3D11 Map returned a null address or zero row pitch",
-            ));
+            return Err(CaptureError::InvalidFrame(hidden!(
+                "D3D11 Map returned a null address or zero row pitch"
+            )));
         }
 
         Ok(Self {
@@ -612,20 +623,20 @@ fn copy_bgra_to_rgb_rotated(
     destination: &mut Vec<u8>,
 ) -> Result<(u32, u32)> {
     if source.is_null() {
-        return Err(CaptureError::InvalidFrame("null source address"));
+        return Err(CaptureError::InvalidFrame(hidden!("null source address")));
     }
 
     let width = source_width as usize;
     let height = source_height as usize;
     if width == 0 || height == 0 {
-        return Err(CaptureError::InvalidFrame("zero-sized image"));
+        return Err(CaptureError::InvalidFrame(hidden!("zero-sized image")));
     }
 
     let minimum_row = width.checked_mul(4).ok_or(CaptureError::ImageTooLarge)?;
     if row_pitch < minimum_row {
-        return Err(CaptureError::InvalidFrame(
-            "mapped row pitch is smaller than the BGRA row",
-        ));
+        return Err(CaptureError::InvalidFrame(hidden!(
+            "mapped row pitch is smaller than the BGRA row"
+        )));
     }
 
     // 进入无边界检查的热循环前，先验证所有偏移计算。
@@ -789,9 +800,9 @@ fn encode_png_into(
     // 预先建立接口约束：任何错误都不能让 `bytes` 留下残缺或过期 PNG。
     bytes.clear();
     if width == 0 || height == 0 {
-        return Err(CaptureError::InvalidFrame(
-            "cannot encode a zero-sized image",
-        ));
+        return Err(CaptureError::InvalidFrame(hidden!(
+            "cannot encode a zero-sized image"
+        )));
     }
 
     let expected_len = (width as usize)
@@ -799,9 +810,9 @@ fn encode_png_into(
         .and_then(|pixels| pixels.checked_mul(3))
         .ok_or(CaptureError::ImageTooLarge)?;
     if rgb.len() != expected_len {
-        return Err(CaptureError::InvalidFrame(
-            "RGB buffer length does not match the PNG dimensions",
-        ));
+        return Err(CaptureError::InvalidFrame(hidden!(
+            "RGB buffer length does not match the PNG dimensions"
+        )));
     }
 
     // 多数桌面图像压缩率较高。预留量故意低于原始 RGB 大小，既减少常见扩容，

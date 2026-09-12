@@ -1,50 +1,93 @@
-生产环境变量（IDEA 分号分隔）
+生产配置、生成与覆盖规则
 
-一键生成完整生产参数（证书、私钥、随机 secret、API token、SPKI pin 和 IDEA 配置）：
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\generate_production_identity.ps1
+一、灰度一键发布
 
-生成结果位于 target\prod。脚本默认拒绝覆盖已有身份；轮换时显式追加 -Force。
-IDEA 分号配置会生成到：
-- target\prod\env\idea_ctrl_server.txt
-- target\prod\env\idea_real_ctrl.txt
-PowerShell 可加载配置会生成到：
-- target\prod\env\ctrl_server.env.ps1
-- target\prod\env\real_ctrl.env.ps1
-- target\prod\env\production.env.ps1
+  双击 publish_gray.cmd
 
-本机三进程启动方式（先完成 hardened 构建）：
+或执行：
 
-终端一，启动服务端：
-. .\target\prod\env\ctrl_server.env.ps1
-.\target\hardened\ctrl_server.exe
+  .\scripts\publish_stack.ps1 -Channel Gray
 
-终端二，启动被控端（不需要环境变量）：
-.\target\hardened\ctrl_kik.exe
+发布后的 Windows 程序位于 target\deploy\gray\artifacts，可直接双击 EXE，不依赖运行脚本、
+证书或配置 sidecar。正式身份与构建输入先运行：
 
-终端三，启动命名管道和 HTTP API：
-. .\target\prod\env\real_ctrl.env.ps1
-.\target\hardened\real_ctrl_invoker_http_service.exe
+  .\scripts\generate_production_identity.ps1 -ServerAddress ytycc.com
+  .\scripts\build_hardened.ps1
 
-如果只在一个终端做临时联调，可加载 production.env.ps1；生产服务应按进程分别加载，避免 ctrl_server 继承不需要的 API token。
+二、编译默认值
 
-以下地址、端口和锁路径已有 build.rs 编译默认值，只有部署拓扑不同时才需要覆盖：
-CTRL_SERVER_BIND_HOST=0.0.0.0;CTRL_SERVER_PORT=9002;CTRL_SERVER_TLS_PORT=9443;REAL_CTRL_SERVER_HOST=localhost;REAL_CTRL_SERVER_PORT=9002;REAL_CTRL_TLS_PORT=9443;REAL_CTRL_TLS_SERVER_NAME=real-ctrl-server;REAL_CTRL_HTTP_LOCK_PATH=target/runtime/real_ctrl_invoker_http_service.lock
+ctrl_kik（运行时不可覆盖）：
+  RTC_CTRL_KIK_BUILD_HOST
+  RTC_CTRL_KIK_BUILD_PORT
+  RTC_CTRL_KIK_BUILD_CHANNEL
+  RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY
 
-下面示例仍列出完整值，便于 IDE 联调。认证 secret、证书路径和 SPKI pin 没有编译默认值，必须由部署身份材料提供。
+real_ctrl：
+  RTC_REAL_CTRL_BUILD_SERVER_HOST
+  RTC_REAL_CTRL_BUILD_TLS_PORT
+  RTC_REAL_CTRL_BUILD_TLS_SERVER_NAME
+  RTC_REAL_CTRL_BUILD_TLS_CA_PEM_BASE64
+  RTC_REAL_CTRL_BUILD_TLS_SPKI_SHA256
+  RTC_REAL_CTRL_BUILD_HTTP_LOCK_PATH
+  RTC_REAL_CTRL_BUILD_LOG_LEVEL
+  RTC_REAL_CTRL_BUILD_AUTH_SECRET
+  RTC_REAL_CTRL_BUILD_API_TOKEN
+  RTC_REAL_CTRL_BUILD_API_ALLOW_EXEC
 
 ctrl_server：
-CTRL_SERVER_BIND_HOST=127.0.0.1;CTRL_SERVER_PORT=9002;CTRL_SERVER_TLS_PORT=9443;CTRL_SERVER_TLS_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;CTRL_SERVER_TLS_KEY=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.key;CTRL_SERVER_AUTH_SECRET=<从部署秘密存储注入的至少32字符随机值:ddddddd234222ee23e233e2e32e2e2e232e>;RUST_BACKTRACE=1
+  RTC_CTRL_SERVER_BUILD_BIND_HOST
+  RTC_CTRL_SERVER_BUILD_KIK_PORT
+  RTC_CTRL_SERVER_BUILD_TLS_PORT
+  RTC_CTRL_SERVER_BUILD_TLS_CERT_PEM_BASE64
+  RTC_CTRL_SERVER_BUILD_TLS_KEY_PEM_BASE64
+  RTC_CTRL_SERVER_BUILD_LOG_LEVEL
+  RTC_CTRL_SERVER_BUILD_AUTH_SECRET
+  RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY
+  RTC_CTRL_SERVER_BUILD_ALLOW_EXEC
 
-real_ctrl / real_ctrl_invoker_http_service：
-REAL_CTRL_SERVER_HOST=127.0.0.1;REAL_CTRL_SERVER_PORT=9002;REAL_CTRL_TLS_PORT=9443;REAL_CTRL_TLS_SERVER_NAME=real-ctrl-server;REAL_CTRL_TLS_CA_CERT=D:\Code\Rust\my\real_time_ctrl\target\prod\certs\server.crt;REAL_CTRL_TLS_SERVER_SPKI_SHA256=<服务端叶子证书SPKI-SHA256十六进制>;REAL_CTRL_AUTH_SECRET=<与服务端一致的部署秘密>;REAL_CTRL_API_TOKEN=<至少32字符的独立随机API令牌>;RUST_BACKTRACE=1
+生成脚本把随机秘密和 TLS/Noise 身份保存到仓库 target 下，并收紧 ACL；构建脚本临时加载
+这些值。build.rs 只声明读取规则，实际值由 Cargo 传给 rustc，并经 hidden!(env!(...))
+转换为密文数组。发布审计会检查原始值不能在最终二进制中直接搜索到。
 
-说明：
-- ctrl_kik 不配置环境变量，继续使用编译期 HOST()/PORT()/LOCK_FILE_PATH()。
-- 控制面认证秘密不再写入 common/config.json 或二进制；生产应由 Windows 服务配置、CI/CD secret 或等价秘密存储注入，且不能与 HTTP token 复用。
-- 明文控制兼容需服务端和客户端分别显式设置 CTRL_SERVER_ALLOW_PLAIN_CTRL=1 / REAL_CTRL_ALLOW_PLAIN=1；生产禁止设置。
-- ctrl_kik 默认包含 Exec；开放 API 调用仍需分别配置 REAL_CTRL_API_ALLOW_EXEC=1、CTRL_SERVER_ALLOW_EXEC=1。
-- 以上证书是本仓库内生成的 127.0.0.1 本机部署证书；如果替换生产证书，必须同步替换 REAL_CTRL_TLS_CA_CERT 和 REAL_CTRL_TLS_SERVER_SPKI_SHA256。
-- 服务端不在本机时，生成时传入 -ServerAddress <服务端IP或域名>；证书 SAN 与 real_ctrl 连接地址会同步更新。
-- 私钥为无人值守服务可直接加载的无口令 PKCS#8 文件，依靠脚本设置的 Windows ACL 保护；部署到专用服务账户时需给该账户单独授予读取权限。
-- 不带 -Force 重复运行会拒绝覆盖。使用 -Force 会同时轮换 secret、API token、证书和 pin，所有相关进程必须一起重启。
-- real_ctrl HTTP 默认读取 config/app.toml，本项目当前默认绑定 127.0.0.1:9000。
+三、运行时覆盖
+
+real_ctrl：
+  REAL_CTRL_SERVER_HOST
+  REAL_CTRL_TLS_PORT
+  REAL_CTRL_TLS_SERVER_NAME
+  REAL_CTRL_TLS_CA_CERT
+  REAL_CTRL_TLS_SERVER_SPKI_SHA256
+  REAL_CTRL_AUTH_SECRET
+  REAL_CTRL_API_TOKEN
+  REAL_CTRL_API_ALLOW_EXEC
+  REAL_CTRL_HTTP_LOCK_PATH
+
+ctrl_server：
+  CTRL_SERVER_BIND_HOST
+  CTRL_SERVER_PORT
+  CTRL_SERVER_TLS_PORT
+  CTRL_SERVER_TLS_CERT
+  CTRL_SERVER_TLS_KEY
+  CTRL_SERVER_AUTH_SECRET
+  CTRL_SERVER_KIK_NOISE_PRIVATE_KEY
+  CTRL_SERVER_ALLOW_EXEC
+
+通用：
+  RUST_LOG
+  RUST_BACKTRACE
+
+运行环境变量优先于编译默认值。环境变量指定 TLS 文件路径时使用该文件，否则使用内置 PEM。
+这使 EXE/ELF 可以直接运行，也保留无需重新编译的应急轮换能力。
+
+四、安全边界
+
+二进制字符串混淆只阻止 strings/十六进制搜索，不能阻止动态调试、内存转储或控制流分析。
+ctrl_kik 仅内置 Noise 公钥，不持有控制认证秘密、API token、TLS 私钥或 Noise 私钥。
+real_ctrl 和 ctrl_server 只内置各自运行所必需的值。身份轮换后应重新构建全部关联组件；
+紧急情况下可先用运行环境覆盖。
+
+五、固定端口
+
+灰度：ctrl_kik Noise 9005，real_ctrl TLS 9009。
+正式：ctrl_kik Noise 9002，real_ctrl TLS 9007。
+两个职责端口相同会启动失败。

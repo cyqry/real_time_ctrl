@@ -1,5 +1,6 @@
 use crate::core::connection_meta::KIK_ID;
 use common::channel::Channel;
+use ctrl_common::cmd_resp_info::KikPresenceVo;
 use ctrl_common::kik::Kik;
 use log::error;
 use std::collections::{HashMap, HashSet};
@@ -17,6 +18,9 @@ struct CtrlSession {
 const CTRL_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 const MAX_CTRL_DATA_CHANNELS: usize = 8;
 const MAX_USED_DATA_NONCES: usize = 1024;
+/// 匿名 Kik 可以不断生成新 ID，最近状态表必须有硬上限。256 条即使按 JSON 最坏转义
+/// 也给 1 MiB 控制帧保留充足余量；完整在线集合仍由 `kiks` 独立维护。
+const MAX_KIK_PRESENCE_RECORDS: usize = 256;
 
 type SharedChannel = Arc<Mutex<Channel>>;
 
@@ -36,6 +40,7 @@ pub struct Context {
     active_command_id: Arc<Mutex<Option<String>>>,
     selected_kik: Arc<RwLock<Option<Kik>>>,
     pub(crate) kiks: Arc<RwLock<HashMap<String, Kik>>>,
+    kik_presence: Arc<RwLock<HashMap<String, KikPresenceVo>>>,
 }
 
 impl Context {
@@ -46,17 +51,25 @@ impl Context {
             active_command_id: Arc::new(Mutex::new(None)),
             selected_kik: Arc::new(RwLock::new(None)),
             kiks: Arc::new(RwLock::new(HashMap::new())),
+            kik_presence: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub async fn find_ctrl_data(&self) -> Option<Arc<Mutex<Channel>>> {
+    /// 返回以轮询游标开头的数据连接快照，转发失败时可继续尝试其他连接。
+    pub async fn ctrl_data_connections_for_send(&self) -> Vec<Arc<Mutex<Channel>>> {
         let ctrl = self.ctrl.read().await;
-        if ctrl.data_connections.is_empty() {
-            return None;
+        let count = ctrl.data_connections.len();
+        if count == 0 {
+            return Vec::new();
         }
-        let next =
-            self.next_ctrl_data.fetch_add(1, Ordering::Relaxed) % ctrl.data_connections.len();
-        ctrl.data_connections.values().nth(next).cloned()
+        let start = self.next_ctrl_data.fetch_add(1, Ordering::Relaxed) % count;
+        ctrl.data_connections
+            .values()
+            .cycle()
+            .skip(start)
+            .take(count)
+            .cloned()
+            .collect()
     }
 
     pub async fn active_command_id(&self) -> Option<String> {
@@ -76,10 +89,6 @@ impl Context {
 
     pub async fn finish_command(&self) {
         *self.active_command_id.lock().await = None;
-    }
-
-    pub async fn exist_ctrl(&self) -> bool {
-        self.ctrl.read().await.connection.is_some()
     }
 
     pub async fn delete_ctrl_conn_if(&self, channel: &Arc<Mutex<Channel>>) -> bool {
@@ -103,11 +112,6 @@ impl Context {
             data_connection.lock().await.try_write_half_close().await;
         }
         true
-    }
-
-    /// 替换控制连接时同时隔离旧数据通道；旧连接的 inactive 回调不能清掉新会话。
-    pub async fn set_ctrl_conn(&self, channel: Arc<Mutex<Channel>>) {
-        self.replace_ctrl(channel, None).await;
     }
 
     pub async fn set_ctrl_conn_with_session(
@@ -200,7 +204,7 @@ impl Context {
     }
 
     //清理对应id kik的 kik_conn,
-    pub async fn delete_kik_conn_if_id(&self, id: &str) {
+    pub async fn delete_kik_conn_if(&self, id: &str, channel: &Arc<Mutex<Channel>>) -> bool {
         // 先复制句柄再释放外层锁，不能在等待内部连接锁时阻塞当前选择状态。
         let selected = self
             .selected_kik
@@ -209,13 +213,13 @@ impl Context {
             .clone()
             .filter(|kik| kik.kik_client_info.kik_info.id.as_deref() == Some(id));
         if let Some(kik) = selected {
-            kik.delete_kik_conn().await;
-            return;
+            return kik.delete_kik_conn_if(channel).await;
         }
         let mapped = self.kiks.read().await.get(id).cloned();
         if let Some(kik) = mapped {
-            kik.delete_kik_conn().await;
+            return kik.delete_kik_conn_if(channel).await;
         }
+        false
     }
 
     pub async fn delete_kik_if_not_online(&self, kik_id: &str) -> Option<Kik> {
@@ -223,7 +227,11 @@ impl Context {
         let kik = self.find_kik(kik_id).await?;
         if !kik.exist_data_channel().await && !kik.exist_kik_conn().await {
             //从整个context中删除这个kik
-            self.just_delete_kik(kik_id).await
+            let removed = self.just_delete_kik(kik_id).await;
+            if let Some(kik) = removed.as_ref().filter(|kik| kik.initialized()) {
+                self.record_kik_offline(kik).await;
+            }
+            removed
         } else {
             None
         }
@@ -322,6 +330,101 @@ impl Context {
 
         kik.filter(|kik| kik.initialized()).cloned()
     }
+
+    /// 在 Kik 完成命令/数据通道初始化后记录上线时间；连接握手中的半成品不会进入历史。
+    pub async fn record_kik_online(&self, kik: &Kik) {
+        let Some(id) = kik.id().map(str::to_owned) else {
+            return;
+        };
+        let record = KikPresenceVo {
+            id: id.clone(),
+            name: kik.kik_client_info.kik_info.name.clone(),
+            ip: kik.kik_client_info.ip.read().await.clone(),
+            online: true,
+            recent_online_unix_ms: unix_time_millis(
+                *kik.kik_client_info.recent_online_time.read().await,
+            ),
+            recent_offline_unix_ms: None,
+        };
+
+        let mut records = self.kik_presence.write().await;
+        let previous_offline = records
+            .get(&id)
+            .and_then(|record| record.recent_offline_unix_ms);
+        evict_oldest_presence_record(&mut records, &id);
+        records.insert(
+            id,
+            KikPresenceVo {
+                recent_offline_unix_ms: previous_offline,
+                ..record
+            },
+        );
+    }
+
+    /// 只有命令连接和全部数据连接都消失时才记录下线，避免单条数据连接抖动产生假事件。
+    async fn record_kik_offline(&self, kik: &Kik) {
+        let Some(id) = kik.id().map(str::to_owned) else {
+            return;
+        };
+        let now = SystemTime::now();
+        let mut records = self.kik_presence.write().await;
+        if let Some(record) = records.get_mut(&id) {
+            record.online = false;
+            record.recent_offline_unix_ms = Some(unix_time_millis(now));
+        }
+    }
+
+    /// 查询一条或全部最近状态；全量结果按最后一次上下线事件倒序，便于控制端直接展示。
+    pub async fn kik_presence(&self, kik_id: Option<&str>) -> Vec<KikPresenceVo> {
+        let records = self.kik_presence.read().await;
+        if let Some(kik_id) = kik_id {
+            return records.get(kik_id).cloned().into_iter().collect();
+        }
+        let mut values = records.values().cloned().collect::<Vec<_>>();
+        values.sort_unstable_by(|left, right| {
+            let left_event = left
+                .recent_offline_unix_ms
+                .unwrap_or(left.recent_online_unix_ms);
+            let right_event = right
+                .recent_offline_unix_ms
+                .unwrap_or(right.recent_online_unix_ms);
+            right_event.cmp(&left_event)
+        });
+        values
+    }
+}
+
+fn evict_oldest_presence_record(records: &mut HashMap<String, KikPresenceVo>, incoming_id: &str) {
+    if records.len() < MAX_KIK_PRESENCE_RECORDS || records.contains_key(incoming_id) {
+        return;
+    }
+    // 优先保留当前在线项；全部记录都在线时仍必须淘汰最旧项，避免匿名客户端把表撑破硬上限。
+    let oldest = records
+        .iter()
+        .filter(|(_, record)| !record.online)
+        .min_by_key(|(_, record)| {
+            record
+                .recent_offline_unix_ms
+                .unwrap_or(record.recent_online_unix_ms)
+        })
+        .map(|(id, _)| id.clone())
+        .or_else(|| {
+            records
+                .iter()
+                .min_by_key(|(_, record)| record.recent_online_unix_ms)
+                .map(|(id, _)| id.clone())
+        });
+    if let Some(id) = oldest {
+        records.remove(&id);
+    }
+}
+
+fn unix_time_millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -379,7 +482,55 @@ mod tests {
         assert!(context.insert_ctrl_data_conn(data).await);
         assert!(context.delete_ctrl_conn_if(&ctrl).await);
 
-        assert!(context.find_ctrl_data().await.is_none());
+        assert!(context.ctrl_data_connections_for_send().await.is_empty());
         assert!(!context.validate_ctrl_data_session("session", "nonce").await);
+    }
+
+    #[tokio::test]
+    async fn kik_presence_records_online_and_offline_times() {
+        let context = Context::init();
+        let kik_channel = channel("kik-1", ChannelType::Kik);
+        let kik = Kik::new(
+            "kik-1",
+            "tester",
+            "127.0.0.1".to_string(),
+            SystemTime::now(),
+            kik_channel,
+        );
+        kik.set_kik_initialized(true);
+
+        context.record_kik_online(&kik).await;
+        let online = context.kik_presence(Some("kik-1")).await;
+        assert_eq!(online.len(), 1);
+        assert!(online[0].online);
+        assert!(online[0].recent_offline_unix_ms.is_none());
+
+        context.record_kik_offline(&kik).await;
+        let offline = context.kik_presence(Some("kik-1")).await;
+        assert!(!offline[0].online);
+        assert!(offline[0].recent_offline_unix_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn kik_presence_never_exceeds_hard_limit() {
+        let context = Context::init();
+        for index in 0..=MAX_KIK_PRESENCE_RECORDS {
+            let id = format!("kik-{index}");
+            let kik = Kik::new(
+                &id,
+                "tester",
+                "127.0.0.1".to_string(),
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(index as u64),
+                channel(&id, ChannelType::Kik),
+            );
+            kik.set_kik_initialized(true);
+            context.record_kik_online(&kik).await;
+        }
+
+        assert_eq!(
+            context.kik_presence(None).await.len(),
+            MAX_KIK_PRESENCE_RECORDS
+        );
+        assert!(context.kik_presence(Some("kik-0")).await.is_empty());
     }
 }

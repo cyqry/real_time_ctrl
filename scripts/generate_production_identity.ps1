@@ -1,16 +1,16 @@
 ﻿[CmdletBinding()]
 param(
     [ValidateNotNullOrEmpty()]
-    [string]$ServerAddress = "127.0.0.1",
+    [string]$ServerAddress = "ytycc.com",
 
     [ValidateNotNullOrEmpty()]
-    [string]$TlsServerName = "real-ctrl-server",
+    [string]$TlsServerName = "ytycc.com",
 
     [ValidateRange(1, 65535)]
-    [int]$PlainPort = 9002,
+    [int]$KikNoisePort = 9002,
 
     [ValidateRange(1, 65535)]
-    [int]$TlsPort = 9443,
+    [int]$ControlTlsPort = 9007,
 
     [ValidateRange(1, 3650)]
     [int]$CertificateDays = 825,
@@ -118,22 +118,30 @@ $certPath = Join-Path $certDir "server.crt"
 $keyPath = Join-Path $certDir "server.key"
 $pubKeyPath = Join-Path $certDir "server.pubkey.pem"
 $spkiPath = Join-Path $certDir "server.spki.der"
+$noisePrivatePemPath = Join-Path $certDir "kik-noise-private.pem"
+$noisePrivateDerPath = Join-Path $certDir "kik-noise-private.der"
+$noisePublicDerPath = Join-Path $certDir "kik-noise-public.der"
 $openSslConfigPath = Join-Path $certDir "openssl_real_ctrl.cnf"
 $ctrlServerEnvPath = Join-Path $envDir "ctrl_server.env.ps1"
 $realCtrlEnvPath = Join-Path $envDir "real_ctrl.env.ps1"
 $allEnvPath = Join-Path $envDir "production.env.ps1"
 $ideaCtrlServerPath = Join-Path $envDir "idea_ctrl_server.txt"
 $ideaRealCtrlPath = Join-Path $envDir "idea_real_ctrl.txt"
+$ctrlKikBuildEnvPath = Join-Path $envDir "ctrl_kik_build.env.ps1"
+$compiledDefaultsPath = Join-Path $envDir "compiled_defaults.env.ps1"
 $manifestPath = Join-Path $prodDir "identity_manifest.txt"
 $readmePath = Join-Path $prodDir "README.txt"
 
 $sensitiveOutputs = @(
     $keyPath,
+    $noisePrivatePemPath,
+    $noisePrivateDerPath,
     $ctrlServerEnvPath,
     $realCtrlEnvPath,
     $allEnvPath,
     $ideaCtrlServerPath,
-    $ideaRealCtrlPath
+    $ideaRealCtrlPath,
+    $compiledDefaultsPath
 )
 $existingOutputs = @($sensitiveOutputs | Where-Object { Test-Path -LiteralPath $_ })
 if ($existingOutputs.Count -gt 0 -and -not $Force) {
@@ -175,6 +183,25 @@ $openSslConfig | Set-Content -LiteralPath $openSslConfigPath -Encoding ASCII
     -keyout $keyPath -out $certPath -config $openSslConfigPath -extensions v3_server
 Assert-LastExitCode $LASTEXITCODE "Failed to generate TLS certificate"
 
+& $openSsl.Source genpkey -algorithm X25519 -out $noisePrivatePemPath
+Assert-LastExitCode $LASTEXITCODE "Failed to generate Kik Noise private key"
+& $openSsl.Source pkey -in $noisePrivatePemPath -outform DER -out $noisePrivateDerPath
+Assert-LastExitCode $LASTEXITCODE "Failed to export Kik Noise private key"
+& $openSsl.Source pkey -in $noisePrivatePemPath -pubout -outform DER -out $noisePublicDerPath
+Assert-LastExitCode $LASTEXITCODE "Failed to export Kik Noise public key"
+
+$noisePrivateBytes = [IO.File]::ReadAllBytes($noisePrivateDerPath)
+$noisePublicBytes = [IO.File]::ReadAllBytes($noisePublicDerPath)
+if ($noisePrivateBytes.Count -lt 32 -or $noisePublicBytes.Count -lt 32) {
+    throw "OpenSSL X25519 DER output is unexpectedly short"
+}
+$noisePrivate = [Convert]::ToBase64String(
+    [byte[]]$noisePrivateBytes[($noisePrivateBytes.Count - 32)..($noisePrivateBytes.Count - 1)]
+)
+$noisePublic = [Convert]::ToBase64String(
+    [byte[]]$noisePublicBytes[($noisePublicBytes.Count - 32)..($noisePublicBytes.Count - 1)]
+)
+
 & $openSsl.Source x509 -in $certPath -pubkey -noout -out $pubKeyPath
 Assert-LastExitCode $LASTEXITCODE "Failed to export TLS public key"
 & $openSsl.Source pkey -pubin -in $pubKeyPath -outform DER -out $spkiPath
@@ -192,18 +219,18 @@ $httpLockPath = Join-Path $runtimeDir "real_ctrl_invoker_http_service.lock"
 
 $ctrlServerValues = [ordered]@{
     CTRL_SERVER_BIND_HOST = "0.0.0.0"
-    CTRL_SERVER_PORT = [string]$PlainPort
-    CTRL_SERVER_TLS_PORT = [string]$TlsPort
+    CTRL_SERVER_PORT = [string]$KikNoisePort
+    CTRL_SERVER_TLS_PORT = [string]$ControlTlsPort
     CTRL_SERVER_TLS_CERT = $certPath
     CTRL_SERVER_TLS_KEY = $keyPath
+    CTRL_SERVER_KIK_NOISE_PRIVATE_KEY = $noisePrivate
     CTRL_SERVER_AUTH_SECRET = $controlAuthSecret
     CTRL_SERVER_ALLOW_EXEC = "1"
     RUST_BACKTRACE = "1"
 }
 $realCtrlValues = [ordered]@{
     REAL_CTRL_SERVER_HOST = $ServerAddress
-    REAL_CTRL_SERVER_PORT = [string]$PlainPort
-    REAL_CTRL_TLS_PORT = [string]$TlsPort
+    REAL_CTRL_TLS_PORT = [string]$ControlTlsPort
     REAL_CTRL_TLS_SERVER_NAME = $TlsServerName
     REAL_CTRL_TLS_CA_CERT = $certPath
     REAL_CTRL_TLS_SERVER_SPKI_SHA256 = $spkiPin
@@ -213,6 +240,37 @@ $realCtrlValues = [ordered]@{
     REAL_CTRL_HTTP_LOCK_PATH = $httpLockPath
     RUST_BACKTRACE = "1"
 }
+$ctrlKikBuildValues = [ordered]@{
+    RTC_CTRL_KIK_BUILD_HOST = $ServerAddress
+    RTC_CTRL_KIK_BUILD_PORT = [string]$KikNoisePort
+    RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $noisePublic
+    RTC_CTRL_KIK_BUILD_CHANNEL = "production"
+}
+$compiledDefaultValues = [ordered]@{
+    RTC_REAL_CTRL_BUILD_SERVER_HOST = $ServerAddress
+    RTC_REAL_CTRL_BUILD_TLS_PORT = [string]$ControlTlsPort
+    RTC_REAL_CTRL_BUILD_TLS_SERVER_NAME = $TlsServerName
+    RTC_REAL_CTRL_BUILD_TLS_CA_PEM_BASE64 = [Convert]::ToBase64String(
+        [IO.File]::ReadAllBytes($certPath)
+    )
+    RTC_REAL_CTRL_BUILD_TLS_SPKI_SHA256 = $spkiPin
+    RTC_REAL_CTRL_BUILD_HTTP_LOCK_PATH = "real_ctrl-http-production.lock"
+    RTC_REAL_CTRL_BUILD_AUTH_SECRET = $controlAuthSecret
+    RTC_REAL_CTRL_BUILD_API_TOKEN = $apiToken
+    RTC_REAL_CTRL_BUILD_API_ALLOW_EXEC = "1"
+    RTC_CTRL_SERVER_BUILD_BIND_HOST = "0.0.0.0"
+    RTC_CTRL_SERVER_BUILD_KIK_PORT = [string]$KikNoisePort
+    RTC_CTRL_SERVER_BUILD_TLS_PORT = [string]$ControlTlsPort
+    RTC_CTRL_SERVER_BUILD_TLS_CERT_PEM_BASE64 = [Convert]::ToBase64String(
+        [IO.File]::ReadAllBytes($certPath)
+    )
+    RTC_CTRL_SERVER_BUILD_TLS_KEY_PEM_BASE64 = [Convert]::ToBase64String(
+        [IO.File]::ReadAllBytes($keyPath)
+    )
+    RTC_CTRL_SERVER_BUILD_AUTH_SECRET = $controlAuthSecret
+    RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY = $noisePrivate
+    RTC_CTRL_SERVER_BUILD_ALLOW_EXEC = "1"
+}
 $allValues = [ordered]@{}
 foreach ($entry in $ctrlServerValues.GetEnumerator()) {
     $allValues[$entry.Key] = $entry.Value
@@ -220,9 +278,14 @@ foreach ($entry in $ctrlServerValues.GetEnumerator()) {
 foreach ($entry in $realCtrlValues.GetEnumerator()) {
     $allValues[$entry.Key] = $entry.Value
 }
+foreach ($entry in $ctrlKikBuildValues.GetEnumerator()) {
+    $allValues[$entry.Key] = $entry.Value
+}
 
 Write-EnvironmentScript -Path $ctrlServerEnvPath -Values $ctrlServerValues -Description "Load this file for the ctrl_server process."
 Write-EnvironmentScript -Path $realCtrlEnvPath -Values $realCtrlValues -Description "Load this file for real_ctrl or real_ctrl_invoker_http_service."
+Write-EnvironmentScript -Path $ctrlKikBuildEnvPath -Values $ctrlKikBuildValues -Description "Load this file only while building ctrl_kik."
+Write-EnvironmentScript -Path $compiledDefaultsPath -Values $compiledDefaultValues -Description "Load this file only while building direct-run production binaries."
 Write-EnvironmentScript -Path $allEnvPath -Values $allValues -Description "Loads all values for local integration. Production services should use per-process files."
 Write-IdeaEnvironmentLine -Path $ideaCtrlServerPath -Values $ctrlServerValues
 Write-IdeaEnvironmentLine -Path $ideaRealCtrlPath -Values $realCtrlValues
@@ -239,8 +302,9 @@ Assert-LastExitCode $LASTEXITCODE "Failed to read certificate fingerprint"
     "generated_at=$(Get-Date -Format o)",
     "server_address=$ServerAddress",
     "tls_server_name=$TlsServerName",
-    "plain_port=$PlainPort",
-    "tls_port=$TlsPort",
+    "kik_noise_port=$KikNoisePort",
+    "control_tls_port=$ControlTlsPort",
+    "kik_noise_public_key=$noisePublic",
     "certificate_not_before=$notBefore",
     "certificate_not_after=$notAfter",
     "certificate_sha256=$certFingerprint",
@@ -250,23 +314,38 @@ Assert-LastExitCode $LASTEXITCODE "Failed to read certificate fingerprint"
 @(
     "Production identity has been generated.",
     "",
-    "Load all variables into the current PowerShell session:",
-    ". .\target\prod\env\production.env.ps1",
+    "Production binaries embed these values as encrypted build defaults and can run directly.",
+    "Runtime environment variables remain higher-priority overrides.",
     "",
-    "For separate processes, load one file in each terminal:",
+    "Advanced/manual environment loading:",
+    ". .\target\prod\env\production.env.ps1",
     ". .\target\prod\env\ctrl_server.env.ps1",
     ". .\target\prod\env\real_ctrl.env.ps1",
+    ". .\target\prod\env\ctrl_kik_build.env.ps1  # build time only",
+    ". .\target\prod\env\compiled_defaults.env.ps1  # build time only",
     "",
     "IDEA environment fields:",
     "target\prod\env\idea_ctrl_server.txt",
     "target\prod\env\idea_real_ctrl.txt",
     "",
-    "server.key and the env directory contain secrets. Never commit, share or package them.",
+    "server.key and env contain secrets used as protected build inputs.",
+    "Never commit, share or package the secret files.",
     "Rotation: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\generate_production_identity.ps1 -Force"
 ) | Set-Content -LiteralPath $readmePath -Encoding UTF8
 
 foreach ($path in $sensitiveOutputs) {
     Protect-SensitiveFile -Path $path
+}
+
+# 最终构建只需要证书、私钥 PEM 和受保护的环境文件；删除可再生中间件，减少私钥副本。
+foreach ($intermediate in @(
+    $noisePrivateDerPath,
+    $noisePublicDerPath,
+    $pubKeyPath,
+    $spkiPath,
+    $openSslConfigPath
+)) {
+    [IO.File]::Delete($intermediate)
 }
 
 [pscustomobject]@{
@@ -277,9 +356,11 @@ foreach ($path in $sensitiveOutputs) {
     spki_sha256 = $spkiPin
     ctrl_server_env = $ctrlServerEnvPath
     real_ctrl_env = $realCtrlEnvPath
+    ctrl_kik_build_env = $ctrlKikBuildEnvPath
     all_env = $allEnvPath
     idea_ctrl_server = $ideaCtrlServerPath
     idea_real_ctrl = $ideaRealCtrlPath
     certificate_not_after = $notAfter
     exec_management_enabled = $true
+    compiled_defaults = $compiledDefaultsPath
 } | ConvertTo-Json -Depth 3

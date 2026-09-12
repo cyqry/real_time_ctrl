@@ -1,7 +1,7 @@
+use common::kik_info::KikInfo;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
-use common::kik_info::KikInfo;
 
 #[derive(Clone)]
 pub struct KikClientInfo {

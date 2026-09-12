@@ -1,11 +1,12 @@
 use super::backend::{CaptureArtifact, CaptureFuture, CaptureRequest, ScreenCaptureBackend};
+use common::hidden;
 
 #[derive(Debug, Default)]
 pub struct LegacyGdiCaptureBackend;
 
 impl ScreenCaptureBackend for LegacyGdiCaptureBackend {
-    fn name(&self) -> &'static str {
-        "legacy-gdi"
+    fn name(&self) -> String {
+        hidden!("legacy-gdi")
     }
 
     fn capture(&self, _request: CaptureRequest) -> CaptureFuture<'_> {

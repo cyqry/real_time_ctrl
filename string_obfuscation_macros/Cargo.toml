@@ -1,0 +1,15 @@
+[package]
+name = "string_obfuscation_macros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+aes-gcm = "0.10.1"
+proc-macro2 = "1"
+quote = "1"
+sha2 = "0.10.9"
+syn = { version = "2", features = ["full", "visit"] }

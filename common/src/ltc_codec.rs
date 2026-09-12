@@ -2,13 +2,16 @@ use bytes::{Buf, BytesMut};
 use std::io::{Error, ErrorKind};
 use tokio_util::codec::Decoder;
 
+use crate::hidden;
+
 /// 握手阶段只允许小型身份/角色帧，认证完成后再按通道类型放宽。
 pub const INIT_MAX_FRAME_LENGTH: usize = 4 * 1024;
 /// 控制通道建议上限。当前先暴露常量，后续按连接类型逐步启用。
 pub const CONTROL_MAX_FRAME_LENGTH: usize = 1024 * 1024;
-/// 数据通道为了兼容历史的大文件一次性传输，默认仍保留较大上限。
-pub const DATA_MAX_FRAME_LENGTH: usize = 1024 * 1024 * 1024 + 16 * 1024 * 1024;
-/// 兼容旧行为的默认上限。后续应把控制通道切到 CONTROL_MAX_FRAME_LENGTH。
+/// 大文件使用 4 MiB 分片；保留 64 MiB payload 空间承载截图和小文件，
+/// 同时阻止异常端仅凭长度前缀诱导进程申请 1 GiB 连续内存。
+pub const DATA_MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024 + 64 * 1024;
+/// 未识别连接在握手后会切换到明确上限；默认值仅供尚未分型的通用调用点使用。
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = DATA_MAX_FRAME_LENGTH;
 
 pub struct LengthFieldBasedFrameDecoder {
@@ -43,9 +46,11 @@ impl LengthFieldBasedFrameDecoder {
         if len > self.max_frame_len {
             Err(Error::new(
                 ErrorKind::InvalidData,
-                format!(
-                    "frame length {} exceeds max frame length {}",
-                    len, self.max_frame_len
+                hidden!(
+                    "frame length ",
+                    len,
+                    " exceeds max frame length ",
+                    self.max_frame_len
                 ),
             ))
         } else {

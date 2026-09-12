@@ -1,11 +1,11 @@
-use crate::api_contract::ApiResponse;
+use crate::api_contract::{ApiErrorBody, ApiResponse};
 use crate::api_service::RealCtrlApi;
 use crate::context::Context;
 use crate::pipe::pipe_common::{
-    deserialize_pipe_request, serialize_api_response, PipeRequest, ServerResponse,
-    MAX_PIPE_REQUEST_BYTES, MAX_PIPE_RESPONSE_BYTES, PIPE_IO_TIMEOUT,
+    deserialize_pipe_request, serialize_api_response, MAX_PIPE_REQUEST_BYTES,
+    MAX_PIPE_RESPONSE_BYTES, PIPE_IO_TIMEOUT,
 };
-use anyhow::{anyhow, Context as AnyhowContext};
+use anyhow::anyhow;
 use common::protocol::transfer_b_encode;
 use interprocess::os::windows::named_pipe::pipe_mode::Bytes;
 use interprocess::os::windows::named_pipe::tokio::PipeStream;
@@ -36,9 +36,12 @@ pub async fn handle_client(
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len > MAX_PIPE_REQUEST_BYTES {
             // 请求体过大时不继续读取 body，直接返回错误并关闭本次管道连接。
-            write_legacy_response(
+            write_api_response(
                 &mut stream,
-                &ServerResponse::Error(format!("请求过大: {} bytes", msg_len)),
+                &ApiResponse::error(
+                    None,
+                    ApiErrorBody::payload_too_large(format!("请求过大: {} bytes", msg_len)),
+                ),
             )
             .await?;
             return Ok(());
@@ -57,32 +60,21 @@ pub async fn handle_client(
             };
         }
 
-        let request = deserialize_pipe_request(data.as_ref()).context("请求错误")?;
-        match request {
-            PipeRequest::Legacy(input_cmd) => {
-                debug!("input_cmd: {:?}", input_cmd);
-                let response = api
-                    .execute(input_cmd)
-                    .await
-                    .map(ServerResponse::Success)
-                    .unwrap_or_else(|e| ServerResponse::Error(format!("{}", e)));
-                write_legacy_response(&mut stream, &response).await?;
-            }
-            PipeRequest::Api(api_request) => {
+        match deserialize_pipe_request(data.as_ref()) {
+            Ok(api_request) => {
                 debug!("api_request: {:?}", api_request);
                 let response = api.execute_request(api_request).await;
                 write_api_response(&mut stream, &response).await?;
             }
+            Err(error) => {
+                let response = ApiResponse::error(
+                    None,
+                    ApiErrorBody::bad_request(format!("管道请求错误: {error}")),
+                );
+                write_api_response(&mut stream, &response).await?;
+            }
         }
     }
-}
-
-async fn write_legacy_response(
-    stream: &mut PipeStream<Bytes, Bytes>,
-    response: &ServerResponse,
-) -> anyhow::Result<()> {
-    let bys = postcard::to_allocvec(response)?;
-    write_framed_response(stream, &bys).await
 }
 
 async fn write_api_response(

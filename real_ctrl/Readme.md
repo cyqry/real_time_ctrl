@@ -1,37 +1,28 @@
-```
+# real_ctrl
 
-// c-s-c 结构
-// 如果没有命令连接，那么每隔10秒尝试连接服务端
-// 与服务器的连接分为: 控制端，被控端，数据传输连接
-// 除了命令和其返回结果，任何数据的传输使用新建的连接
-// 控制端发送控制命令后，需要等待服务器返回(OK帧或者Err帧)，包含content或错误信息，并由控制端自己处理这个content和错误信息
-// 效果:
-//   控制端:
-//   $开头的为自动识别命令
-//     $sys_list -> (服务端返回信息)返回被控列表
-//     $sys_use ...-> (服务端判断)为这条控制连接设置当前被控者，任意不以$sys_开头的命令，必须被设置了控制者后发送才生效，否则返回错误信息(服务端返回)
-//     $local_exit ... -> (本地判断)直接断开连接，输出结束控制信息
-//     $getfile "D:\\aa" to "E:\\bb"  -> 将被控端的aa传输到本地的bb，该命令只支持500M以内的文件
-//     $getbigfile "" to ""  -> 将被控端的大文件逐渐写入本地，实现较难
-//     $setfile "E:\\bb" to "D:\\aa" -> 将本地文件写入被控端 , 该命令只支持500M以内的文件
-//     $ls "D:\\"  -> 返回给定目录的子目录列表（每一项详细信息:目录名或文件名,为目录还是文件，文件大小，为目录的话要展示目录下级目录或文件的数量文件的话展示文件大小带单位,全路径，）
+`real_ctrl` 是 Windows 控制端，三个入口共用同一套业务服务和命令门禁：
 
-// let commands = vec![
-//     "$sys_list",
-//     "$sys_use \"config\"",
-//     "$local_exit",
-//     "$getfile \"D:\\aa\" to \"E:\\bb\"",
-//     "$getbigfile \"D:\\cc\" to \"E:\\dd\"",
-//     "$setfile \"E:\\bb\" to \"D:\\aa\"",
-//     "$ls \"D:\\\"",
-//     "echo Hello, World!"
-// ];
-//
-// for command in commands {
-//     println!("{}", command);
-//     match command.parse::<Command>() {
-//         Ok(cmd) => println!("{:?}", cmd),
-//         Err(e) => println!("Error: {}", e),
-//     }
-// }
-```
+- `real_ctrl.exe`：交互控制台；
+- `real_ctrl_local_server.exe`：本地命名管道 API；
+- `real_ctrl_invoker_http_service.exe`：本地 HTTP API 与命名管道 API。
+
+灰度发布后可直接双击 `target/deploy/gray/artifacts/` 中对应的 EXE，不需要启动脚本、证书或
+配置 sidecar。HTTP 配置已通过 `include_str!` 编入服务进程，锁文件默认放在系统临时目录。
+
+服务端地址、TLS 端口、服务名、CA PEM、SPKI pin、日志级别、锁文件名、控制认证秘密、
+API token 和 Exec 策略均有加密构建默认值；同名 `REAL_CTRL_*` 运行环境变量优先。
+混淆用于阻止直接二进制搜索，不等同硬件密钥存储；默认秘密轮换后应重新构建全部关联组件。
+
+常用命令：
+
+- `$sys_list`：列出当前在线 Kik；
+- `$sys_history [kik_id]`：查询最近上线、下线时间；
+- `$sys_use <kik_id>`：选择当前 Kik；
+- `$sys_now`：查询当前选择；
+- `$ls <path>`：读取远端目录；
+- `$getfile <remote> to <local>`：下载文件；
+- `$setfile <local> to <remote>`：上传文件；
+- `$local_exit`：断开本地控制会话。
+
+HTTP 和命名管道共享单命令门禁；已有命令执行时稳定返回 `busy`，不会并发消费同一数据响应。
+网络控制面固定使用证书链、DNS 名称和 SPKI 三重校验的 TLS 1.3，不提供明文降级。

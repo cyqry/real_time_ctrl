@@ -1,15 +1,12 @@
 use anyhow::anyhow;
-use bytes::BytesMut;
 use common::command::LocalCommand::LocalExit;
 use common::command::SysCommand::*;
 use common::command::{CtrlCommand, LocalCommand, SysCommand};
 use common::message::kik_cmd_resp_info;
-use common::protocol::BufSerializable;
-use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
-use serde::{Deserialize, Serialize};
+use ctrl_common::cmd_resp_info::{KikInfoVo, KikPresenceVo, SysNow};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum InputCommand {
     Sys(SysCommand),
     Local(LocalCommand),
@@ -17,7 +14,7 @@ pub enum InputCommand {
     Exec(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum InputCtrlCommand {
     GetFile(String, String),
     GetBigFile(String, String),
@@ -27,33 +24,20 @@ pub enum InputCtrlCommand {
     Screen(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum RemoteResp {
     Success(RemoteSuccessResp),
     SuccessData(Vec<u8>),
     Error(u32, String),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum RemoteSuccessResp {
     Info(String),
     Ls(Vec<kik_cmd_resp_info::Ls>),
     SysList(Vec<KikInfoVo>),
+    History(Vec<KikPresenceVo>),
     Now(SysNow),
-}
-
-impl BufSerializable for RemoteResp {
-    fn to_buf(&self) -> BytesMut {
-        let vec = postcard::to_allocvec(self).expect("failed to serialize RemoteResp");
-        BytesMut::from(vec.as_slice())
-    }
-
-    fn from_buf(bys: BytesMut) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        postcard::from_bytes::<RemoteResp>(bys.as_ref()).ok()
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -67,7 +51,8 @@ impl TryFrom<InputCtrlCommand> for CtrlCommand {
             InputCtrlCommand::GetFile(a, _) => Ok(CtrlCommand::GetFile(a, String::new())),
             InputCtrlCommand::GetBigFile(a, _) => Ok(CtrlCommand::GetBigFile(a, String::new())),
             InputCtrlCommand::Ls(s) => Ok(CtrlCommand::Ls(s)),
-            InputCtrlCommand::Screen(s) => Ok(CtrlCommand::Screen(s)),
+            // 保存路径属于 real_ctrl 本地状态，被控端只负责产生截图数据，不应获知该路径。
+            InputCtrlCommand::Screen(_) => Ok(CtrlCommand::Screen(String::new())),
             InputCtrlCommand::SetFile(_, _) | InputCtrlCommand::SetBigFile(_, _) => {
                 Err(anyhow!("文件上传命令必须先经过本地数据预处理"))
             }
@@ -89,12 +74,16 @@ impl FromStr for InputCommand {
             match parts.as_slice() {
                 ["sys_now"] => Ok(InputCommand::Sys(Now)),
                 ["sys_list"] => Ok(InputCommand::Sys(List)),
+                ["sys_history"] => Ok(InputCommand::Sys(History(None))),
+                ["sys_history", value] => Ok(InputCommand::Sys(History(Some(
+                    value.trim_matches('"').to_string(),
+                )))),
                 ["sys_use", value] => {
                     let val = value.trim_matches('"').to_string();
                     Ok(InputCommand::Sys(Use(val)))
                 }
                 ["local_exit"] => Ok(InputCommand::Local(LocalExit)),
-                // 兼容 CLI 目前按空白切分，带空格路径应通过 HTTP/pipe 结构化 API 传入。
+                // CLI 按空白切分，带空格路径应通过 HTTP/pipe 结构化 API 传入。
                 ["screen", save_path] => {
                     let save_path = save_path.trim_matches('"').to_string();
                     Ok(InputCommand::Ctrl(InputCtrlCommand::Screen(save_path)))
@@ -145,17 +134,6 @@ fn unknown<T>(s: &str) -> anyhow::Result<T> {
     Err(anyhow!(format!("Unknown command: {}", s)))
 }
 
-pub fn serialize_command(cmd: &InputCommand) -> anyhow::Result<Vec<u8>> {
-    let bytes = postcard::to_allocvec(cmd)?;
-    Ok(bytes)
-}
-
-/// 从字节切片反序列化 InputCommand
-pub fn deserialize_command(bytes: &[u8]) -> anyhow::Result<InputCommand> {
-    let cmd = postcard::from_bytes(bytes)?;
-    Ok(cmd)
-}
-
 #[test]
 fn parses_recursive_ls_command() {
     let command: InputCommand = "$ls sdfsdf -r".parse().unwrap();
@@ -166,10 +144,28 @@ fn parses_recursive_ls_command() {
 }
 
 #[test]
-fn de_test() {
-    let command = InputCommand::Ctrl(InputCtrlCommand::Ls("sss".to_string()));
-    let vec = serialize_command(&command).unwrap();
-    println!("{}", vec.len());
-    let input_command = deserialize_command(vec.as_slice()).unwrap();
-    println!("{:?}", input_command);
+fn strips_controller_local_paths_before_sending_to_kik() {
+    assert!(matches!(
+        CtrlCommand::try_from(InputCtrlCommand::GetFile(
+            "remote.txt".to_string(),
+            "D:/controller/private.txt".to_string(),
+        ))
+        .unwrap(),
+        CtrlCommand::GetFile(_, destination) if destination.is_empty()
+    ));
+    assert!(matches!(
+        CtrlCommand::try_from(InputCtrlCommand::GetBigFile(
+            "remote.bin".to_string(),
+            "D:/controller/private.bin".to_string(),
+        ))
+        .unwrap(),
+        CtrlCommand::GetBigFile(_, destination) if destination.is_empty()
+    ));
+    assert!(matches!(
+        CtrlCommand::try_from(InputCtrlCommand::Screen(
+            "D:/controller/screen.png".to_string(),
+        ))
+        .unwrap(),
+        CtrlCommand::Screen(destination) if destination.is_empty()
+    ));
 }

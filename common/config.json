@@ -11,6 +11,10 @@
     "START_ERROR_1": "start在隐藏路径执行失败",
     "START_ERROR_2": "start保存至隐藏路径失败",
     "START_ERROR_3": "start获取后台执行文件失败",
-    "BUILD_CHANNEL": "default"
+    "BUILD_CHANNEL": "default",
+    "KIK_NOISE_SERVER_PUBLIC_KEY": "",
+    "DATE_TIME_FORMAT": "%Y-%m-%d %H:%M:%S",
+    "CMD_OPTIONS_TIMEOUT_TRUE": "{\"timeout\":true}",
+    "CMD_OPTIONS_TIMEOUT_FALSE": "{\"timeout\":false}"
   }
 }

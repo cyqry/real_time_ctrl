@@ -104,7 +104,7 @@ impl RealCtrlApi {
     fn ensure_allowed(&self, command: &InputCommand) -> Result<(), ApiServiceError> {
         match command {
             InputCommand::Exec(_) if !self.policy.allow_exec => Err(ApiServiceError::Forbidden(
-                "开放 API 默认禁用 Exec，请显式设置 REAL_CTRL_API_ALLOW_EXEC=1".to_string(),
+                "开放 API 的当前策略禁止 Exec，可通过 REAL_CTRL_API_ALLOW_EXEC=1 覆盖".to_string(),
             )),
             InputCommand::Local(_) => Err(ApiServiceError::Forbidden(
                 "开放 API 不支持本地生命周期命令".to_string(),
@@ -127,35 +127,12 @@ impl ApiServiceError {
 impl ApiPolicy {
     pub fn from_env() -> Self {
         Self {
-            allow_exec: env_flag("REAL_CTRL_API_ALLOW_EXEC"),
+            allow_exec: crate::runtime_config::api_allow_exec(),
         }
     }
 
     #[cfg(test)]
     pub fn allow_exec_for_test() -> Self {
         Self { allow_exec: true }
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_flag_accepts_enabled_values() {
-        std::env::set_var("REAL_CTRL_API_TEST_FLAG", "true");
-        assert!(env_flag("REAL_CTRL_API_TEST_FLAG"));
-        std::env::remove_var("REAL_CTRL_API_TEST_FLAG");
     }
 }

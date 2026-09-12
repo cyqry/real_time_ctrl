@@ -74,10 +74,7 @@ fn authorize(headers: &HeaderMap) -> Result<(), AppError> {
 }
 
 fn configured_api_token() -> Option<String> {
-    std::env::var("REAL_CTRL_API_TOKEN")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    crate::runtime_config::api_token()
 }
 
 fn token_from_headers(headers: &HeaderMap) -> Option<String> {

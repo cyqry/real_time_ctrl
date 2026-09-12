@@ -5,18 +5,18 @@ use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::command::Command;
 use common::config::Config;
+use common::hidden;
 use common::kik_info::KikInfo;
 use common::ltc_codec::{
     LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH, INIT_MAX_FRAME_LENGTH,
 };
 use common::message::init_frame::InitFrame;
+use common::noise_transport::connect_kik_noise;
 use common::protocol;
 use common::protocol::CmdOptions;
-use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -26,22 +26,25 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 
 pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
-    let endpoint = format!("{}:{}", config.server_host, config.server_port);
-    let socket = timeout(config.read_timeout, TcpStream::connect(&endpoint))
-        .await
-        .map_err(|_| anyhow::anyhow!("连接服务端超时"))??;
-    socket.set_nodelay(true)?;
-    let (reader, writer) = socket.into_split();
+    let transport = connect_kik_noise(
+        &config.server_host,
+        &config.server_port,
+        config.read_timeout,
+        &common::generated::encrypted_strings::KIK_NOISE_SERVER_PUBLIC_KEY(),
+    )
+    .await?;
     // Kik 命令通道不传输大块数据，使用控制通道上限减少异常帧的内存影响。
     let framed_read = FramedRead::new(
-        BufReader::new(reader),
+        BufReader::new(transport.reader),
         LengthFieldBasedFrameDecoder::new_with_max_frame_len(INIT_MAX_FRAME_LENGTH),
     );
     let framed_arc = Arc::new(Mutex::new(framed_read));
-    let channel_arc = Arc::new(Mutex::new(Channel::from_tcp_writer(
-        writer,
+    let channel_arc = Arc::new(Mutex::new(Channel::new(
+        transport.writer,
         None,
         ChannelType::Unknown,
+        transport.local_addr,
+        transport.peer_addr,
     )));
     channel_arc
         .lock()
@@ -85,7 +88,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
                             if let Err(error) =
                                 handle_read(&context, channel.clone(), msg, &mut tx).await
                             {
-                                debug!("读取错误");
+                                dev_debug!("读取错误");
                                 break Some(error);
                             }
                             if channel.lock().await.channel_type == ChannelType::Kik {
@@ -98,7 +101,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
                             continue;
                         }
                         Some(Err(e)) => {
-                            println!("连接异常:{}", e);
+                            dev_debug!("连接异常:{}", e);
                             break Some(anyhow::Error::new(e));
                         }
                         //对方正常关闭
@@ -125,7 +128,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     match timeout(read_timeout, rx.recv()).await {
         Ok(recv) => match recv {
             None => {
-                return Err(anyhow::Error::msg("校验时连接断开"));
+                return Err(anyhow::Error::msg(hidden!("校验时连接断开")));
             }
             Some(kik_id) => {
                 {
@@ -139,7 +142,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
         },
         Err(_error) => {
             channel.lock().await.try_write_half_close().await;
-            return Err(anyhow::Error::msg("服务器超时未响应"));
+            return Err(anyhow::Error::msg(hidden!("服务器超时未响应")));
         }
     };
     Ok(handle)
@@ -205,8 +208,8 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
     }
 }
 
-async fn handle_error(_channel: Arc<Mutex<Channel>>, e: Error) {
-    println!("handle_error:{}", e);
+async fn handle_error(_channel: Arc<Mutex<Channel>>, _error: Error) {
+    dev_debug!("handle_error:{}", _error);
 }
 
 async fn handle_read(
@@ -223,6 +226,6 @@ async fn handle_read(
             channel.lock().await.channel_type = ChannelType::Kik;
             Ok(())
         }
-        _ => Err(anyhow::anyhow!("连接状态与帧类型不匹配")),
+        _ => Err(anyhow::Error::msg(hidden!("连接状态与帧类型不匹配"))),
     }
 }

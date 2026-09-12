@@ -1,11 +1,8 @@
-use crate::auth_util;
+use crate::hidden;
 use anyhow::{anyhow, Context};
 use std::env;
 use std::string::ToString;
 use std::time::Duration;
-
-const DEFAULT_TLS_PORT: &str = env!("RTC_DEFAULT_TLS_PORT");
-const DEFAULT_TLS_SERVER_NAME: &str = env!("RTC_DEFAULT_TLS_SERVER_NAME");
 
 #[derive(Clone)]
 pub struct Config {
@@ -19,125 +16,104 @@ pub struct Config {
 
 #[derive(Clone)]
 pub struct Id {
-    pub username: String,
-    pub password: String,
+    control_plane_secret: String,
 }
 
 impl Id {
-    /// 从进程级秘密注入控制面凭据，避免把可复用控制秘密编译进客户端或服务端二进制。
+    /// `ctrl_kik` 不持有控制面凭据，使用显式匿名身份避免空用户名/口令散落在调用点。
+    pub fn anonymous() -> Self {
+        Self {
+            control_plane_secret: String::new(),
+        }
+    }
+
+    /// 从进程级秘密注入控制面凭据。
     pub fn control_plane_from_env(name: &str) -> anyhow::Result<Self> {
         let secret =
-            env::var(name).with_context(|| format!("缺少控制面认证秘密环境变量 {name}"))?;
+            env::var(name).with_context(|| hidden!("缺少控制面认证秘密环境变量 ", name))?;
+        Self::control_plane(secret, name)
+    }
+
+    /// 运行环境优先，缺失时使用构建期加密写入的部署默认值。默认值只解决单文件直接运行，
+    /// 并不具备服务端密钥管理系统的轮换与进程隔离能力。
+    pub fn control_plane_from_env_or(name: &str, default: String) -> anyhow::Result<Self> {
+        let secret = env::var(name).unwrap_or(default);
+        Self::control_plane(secret, name)
+    }
+
+    fn control_plane(secret: String, name: &str) -> anyhow::Result<Self> {
         let secret = secret.trim().to_string();
         if secret.len() < 32 {
-            return Err(anyhow!("{name} 至少需要 32 个 ASCII 字符"));
+            return Err(anyhow!(hidden!(name, " 至少需要 32 个 ASCII 字符")));
         }
         if !secret.is_ascii() {
-            return Err(anyhow!(
-                "{name} 当前只接受 ASCII，避免跨平台编码产生不同 HMAC"
-            ));
+            return Err(anyhow!(hidden!(
+                name,
+                " 当前只接受 ASCII，避免跨平台编码产生不同 HMAC"
+            )));
         }
 
         Ok(Self {
-            username: "real_ctrl_v2".to_string(),
-            password: secret,
+            control_plane_secret: secret,
         })
     }
 
-    /// v2 challenge/session 直接使用高熵部署秘密作为 HMAC key，不再套用历史摘要算法。
+    /// challenge/session 直接使用高熵部署秘密作为 HMAC key，不再套用静态摘要算法。
     pub fn control_plane_secret(&self) -> &str {
-        &self.password
+        &self.control_plane_secret
     }
-
-    /// 仅供显式明文迁移模式兼容旧协议，不能作为抗中间人安全边界。
-    pub fn encrypt(&self) -> String {
-        auth_util::encrypt(self.username.as_str(), self.password.as_str())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClientTransportMode {
-    Plain,
-    PinnedTls,
 }
 
 #[derive(Clone, Debug)]
 pub struct SecurityConfig {
-    pub client_mode: ClientTransportMode,
     pub tls_port: String,
     pub tls_server_name: String,
     pub pinned_spki_sha256: Option<String>,
     pub ca_cert_path: Option<String>,
+    /// 与 `ca_cert_path` 二选一；用于无需旁路证书文件即可直接运行的控制端产物。
+    pub ca_cert_pem: Option<String>,
     pub server_cert_path: Option<String>,
+    /// 与 `server_cert_path` 二选一；运行环境指定路径时必须覆盖该构建默认值。
+    pub server_cert_pem: Option<String>,
     pub server_key_path: Option<String>,
-    /// 仅迁移期允许服务端明文端口接收 real_ctrl；生产默认必须关闭。
-    pub allow_plain_ctrl: bool,
+    /// 与 `server_key_path` 二选一；只用于用户明确要求的单文件服务端部署。
+    pub server_key_pem: Option<String>,
+    /// Noise NK 服务端 X25519 私钥；运行环境优先，构建默认值用于直接运行。
+    pub kik_noise_private_key: Option<String>,
     /// 服务端最终授权开关；开放 API 和被控端命令分派不能绕过它。
     pub allow_remote_exec: bool,
 }
 
 impl SecurityConfig {
-    pub fn plain() -> Self {
+    /// `ctrl_kik` 只需要 Noise 公钥侧配置；TLS/服务端私钥字段保持为空。
+    pub fn kik() -> Self {
         Self {
-            client_mode: ClientTransportMode::Plain,
-            tls_port: DEFAULT_TLS_PORT.to_string(),
-            tls_server_name: DEFAULT_TLS_SERVER_NAME.to_string(),
+            tls_port: String::new(),
+            tls_server_name: String::new(),
             pinned_spki_sha256: None,
             ca_cert_path: None,
+            ca_cert_pem: None,
             server_cert_path: None,
+            server_cert_pem: None,
             server_key_path: None,
-            allow_plain_ctrl: false,
+            server_key_pem: None,
+            kik_noise_private_key: None,
             allow_remote_exec: false,
         }
     }
-
-    pub fn real_ctrl_from_env() -> Self {
-        let mut config = Self::plain();
-        config.client_mode = ClientTransportMode::PinnedTls;
-        config.tls_port = env::var("REAL_CTRL_TLS_PORT").unwrap_or(config.tls_port);
-        config.tls_server_name =
-            env::var("REAL_CTRL_TLS_SERVER_NAME").unwrap_or(config.tls_server_name);
-        config.pinned_spki_sha256 = env::var("REAL_CTRL_TLS_SERVER_SPKI_SHA256").ok();
-        config.ca_cert_path = env::var("REAL_CTRL_TLS_CA_CERT").ok();
-
-        if env_flag("REAL_CTRL_ALLOW_PLAIN") {
-            config.client_mode = ClientTransportMode::Plain;
-        }
-
-        config
-    }
-
-    pub fn ctrl_server_from_env() -> Self {
-        let mut config = Self::plain();
-        config.tls_port = env::var("CTRL_SERVER_TLS_PORT").unwrap_or(config.tls_port);
-        config.server_cert_path = env::var("CTRL_SERVER_TLS_CERT").ok();
-        config.server_key_path = env::var("CTRL_SERVER_TLS_KEY").ok();
-        config.allow_plain_ctrl = env_flag("CTRL_SERVER_ALLOW_PLAIN_CTRL");
-        config.allow_remote_exec = env_flag("CTRL_SERVER_ALLOW_EXEC");
-        config
-    }
-
-    pub fn server_tls_enabled(&self) -> bool {
-        self.server_cert_path.is_some() || self.server_key_path.is_some()
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    matches!(
-        env::var(name).map(|value| value.to_ascii_lowercase()),
-        Ok(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
-    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Id, SecurityConfig, DEFAULT_TLS_PORT, DEFAULT_TLS_SERVER_NAME};
+    use super::{Id, SecurityConfig};
 
     #[test]
-    fn plain_security_config_uses_build_defaults() {
-        let config = SecurityConfig::plain();
-        assert_eq!(config.tls_port, DEFAULT_TLS_PORT);
-        assert_eq!(config.tls_server_name, DEFAULT_TLS_SERVER_NAME);
+    fn kik_security_config_does_not_carry_tls_identity() {
+        let config = SecurityConfig::kik();
+        assert!(config.tls_port.is_empty());
+        assert!(config.tls_server_name.is_empty());
+        assert!(config.ca_cert_path.is_none());
+        assert!(config.pinned_spki_sha256.is_none());
     }
 
     #[test]

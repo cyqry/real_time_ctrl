@@ -9,11 +9,11 @@ pub type KikResponseSender = Sender<KikResponse>;
 pub type KikResponseReceiver = Arc<Mutex<Receiver<KikResponse>>>;
 
 pub const CTRL_AUTH_CLIENT_NONCE: ChannelAttributeKey<String> =
-    ChannelAttributeKey::new("ctrl_auth_v2_client_nonce");
+    ChannelAttributeKey::new(0x6374_726c_636e_6f6e);
 pub const CTRL_AUTH_SERVER_NONCE: ChannelAttributeKey<String> =
-    ChannelAttributeKey::new("ctrl_auth_v2_server_nonce");
-pub const KIK_ID: ChannelAttributeKey<String> = ChannelAttributeKey::new("kik_id");
+    ChannelAttributeKey::new(0x6374_726c_736e_6f6e);
+pub const KIK_ID: ChannelAttributeKey<String> = ChannelAttributeKey::new(0x6b69_6b5f_6964);
 pub const KIK_RESPONSE_TX: ChannelAttributeKey<KikResponseSender> =
-    ChannelAttributeKey::new("kik_response_tx");
+    ChannelAttributeKey::new(0x6b69_6b5f_7274_7801);
 pub const KIK_RESPONSE_RX: ChannelAttributeKey<KikResponseReceiver> =
-    ChannelAttributeKey::new("kik_response_rx");
+    ChannelAttributeKey::new(0x6b69_6b5f_7272_7802);
