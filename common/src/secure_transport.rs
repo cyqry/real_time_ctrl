@@ -21,7 +21,7 @@ pub type ServerTlsAcceptor = TlsAcceptor;
 /// 部分公网中间设备会复位非标准端口上“首包即 TLS”的连接，因此生产独立 TLS
 /// 端口也保留此前导。它只用于穿透与协议识别，不参与认证、授权或降级协商；
 /// 服务端身份仍由证书链、DNS 名称和 SPKI pin 共同验证。
-pub const CTRL_TLS_PREFIX: [u8; 5] = [0x52, 0x54, 0x43, 0x54, 0x03];
+pub const CTRL_TLS_PREFIX: [u8; 5] = [0x52, 0x54, 0x43, 0x54, 0x04];
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send>>;

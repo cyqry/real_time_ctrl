@@ -36,6 +36,10 @@ pub fn ctrl_cmd_req(req: ReqCmd) -> BytesMut {
     protocol::transfer_encode_frame(Frame::Cmd(req))
 }
 
+pub fn ctrl_data_ack(data_id: String) -> BytesMut {
+    protocol::transfer_encode_frame(Frame::DataAck(data_id))
+}
+
 pub fn ctrl_kik_resp(id: String, resp: KikResp) -> BytesMut {
     protocol::transfer_encode_frame(Frame::Resp(CmdResp::new(id, Kik(resp))))
 }

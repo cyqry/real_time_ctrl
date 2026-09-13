@@ -1,5 +1,5 @@
 use crate::core::connection_meta::{
-    CTRL_AUTH_CLIENT_NONCE, CTRL_AUTH_SERVER_NONCE, KIK_ID, KIK_RESPONSE_RX, KIK_RESPONSE_TX,
+    CTRL_ACCOUNT_ID, CTRL_AUTH_CLIENT_NONCE, CTRL_AUTH_SERVER_NONCE, CTRL_INSTANCE_ID, KIK_ID,
 };
 use crate::core::context::Context;
 use bytes::BytesMut;
@@ -7,7 +7,6 @@ use common::channel::{Channel, ChannelType};
 use common::config::Config;
 use common::kik_info::KikInfo;
 use common::message::init_frame::InitFrame;
-use common::message::kik_resp;
 use common::protocol::{self, BufSerializable};
 use common::session_auth::{
     is_valid_nonce_hex, random_nonce_hex, verify_ctrl_auth_proof, verify_ctrl_data_proof,
@@ -18,14 +17,14 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的初始化帧类型")
 }
 pub async fn handle_init_message(
-    config: Config,
+    _config: Config,
     context: Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
@@ -35,7 +34,7 @@ pub async fn handle_init_message(
     let frame = InitFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     let is_ctrl_frame = matches!(
         &frame,
-        InitFrame::CtrlAuthStart(_)
+        InitFrame::CtrlAuthStart { .. }
             | InitFrame::CtrlAuthProof { .. }
             | InitFrame::CtrlDataSessionReq { .. }
     );
@@ -53,8 +52,15 @@ pub async fn handle_init_message(
     //初始化id
     debug!("init frame:{:?}", frame);
     match frame {
-        InitFrame::CtrlAuthStart(client_nonce) => {
-            if !is_valid_nonce_hex(&client_nonce) {
+        InitFrame::CtrlAuthStart {
+            account_id,
+            instance_id,
+            client_nonce,
+        } => {
+            if !is_valid_nonce_hex(&client_nonce)
+                || !valid_identity(&account_id)
+                || !valid_identity(&instance_id)
+            {
                 return Err(anyhow::Error::msg("控制端 client nonce 格式错误"));
             }
             e2e_trace("server: received ctrl auth start");
@@ -63,6 +69,8 @@ pub async fn handle_init_message(
                 let mut guard = channel.lock().await;
                 guard.insert_attribute(&CTRL_AUTH_CLIENT_NONCE, client_nonce);
                 guard.insert_attribute(&CTRL_AUTH_SERVER_NONCE, server_nonce.clone());
+                guard.insert_attribute(&CTRL_ACCOUNT_ID, account_id);
+                guard.insert_attribute(&CTRL_INSTANCE_ID, instance_id);
             }
             channel
                 .lock()
@@ -78,7 +86,7 @@ pub async fn handle_init_message(
             proof,
         } => {
             e2e_trace("server: received ctrl auth proof");
-            let (expected_client_nonce, server_nonce) = {
+            let (expected_client_nonce, server_nonce, account_id, instance_id) = {
                 let guard = channel.lock().await;
                 let expected_client_nonce = guard
                     .attribute(&CTRL_AUTH_CLIENT_NONCE)
@@ -88,16 +96,39 @@ pub async fn handle_init_message(
                     .attribute(&CTRL_AUTH_SERVER_NONCE)
                     .cloned()
                     .ok_or(anyhow::Error::msg("缺少控制端认证 server nonce"))?;
-                (expected_client_nonce, server_nonce)
+                let account_id = guard
+                    .attribute(&CTRL_ACCOUNT_ID)
+                    .cloned()
+                    .ok_or(anyhow::Error::msg("缺少控制端账号 ID"))?;
+                let instance_id = guard
+                    .attribute(&CTRL_INSTANCE_ID)
+                    .cloned()
+                    .ok_or(anyhow::Error::msg("缺少控制端实例 ID"))?;
+                (expected_client_nonce, server_nonce, account_id, instance_id)
             };
 
-            let secret = config.id.control_plane_secret();
+            // 未知账号仍执行一次等价 HMAC，降低按响应耗时枚举账号的价值。
+            let policy = context.account(&account_id);
+            let dummy_secret = "unknown-account-dummy-secret-0000000000000000";
+            let secret = policy
+                .as_ref()
+                .map_or(dummy_secret, |policy| policy.secret.as_ref());
             if expected_client_nonce == client_nonce
-                && verify_ctrl_auth_proof(secret, &client_nonce, &server_nonce, &proof)
+                && verify_ctrl_auth_proof(
+                    secret,
+                    &account_id,
+                    &instance_id,
+                    &client_nonce,
+                    &server_nonce,
+                    &proof,
+                )
+                && policy.is_some()
             {
                 e2e_trace("server: ctrl auth proof verified");
                 let session_id = random_nonce_hex();
-                let auth = complete_ctrl_auth(&context, &channel, session_id).await;
+                let auth =
+                    complete_ctrl_auth(&context, &channel, session_id, account_id, instance_id)
+                        .await;
                 channel.lock().await.channel_type = ChannelType::Ctrl;
                 auth?;
                 e2e_trace("server: sent ctrl auth session");
@@ -115,8 +146,10 @@ pub async fn handle_init_message(
             if !is_valid_nonce_hex(&session_id) || !is_valid_nonce_hex(&channel_nonce) {
                 return Err(anyhow::Error::msg("数据通道会话或 nonce 格式错误"));
             }
-            let secret = config.id.control_plane_secret();
-            let proof_ok = verify_ctrl_data_proof(secret, &session_id, &channel_nonce, &proof);
+            let secret = context.session_auth_secret(&session_id).await;
+            let proof_ok = secret.as_ref().is_some_and(|secret| {
+                verify_ctrl_data_proof(secret, &session_id, &channel_nonce, &proof)
+            });
             let session_ok = if proof_ok {
                 context
                     .validate_ctrl_data_session(&session_id, &channel_nonce)
@@ -126,7 +159,7 @@ pub async fn handle_init_message(
             };
             if session_ok {
                 e2e_trace("server: ctrl data session verified");
-                let auth = complete_ctrl_data_auth(&context, &channel).await;
+                let auth = complete_ctrl_data_auth(&context, &channel, &session_id).await;
                 channel.lock().await.channel_type = ChannelType::CtrlData;
                 auth?;
                 e2e_trace("server: sent ctrl data session reply");
@@ -240,28 +273,11 @@ async fn kik_req(
         }
     };
 
-    // 响应队列必须先于 initialized 发布，避免控制线程观察到“已上线”却取不到 rx/tx。
-    let (tx, rx) = mpsc::channel::<(kik_resp::KikResp, String)>(5);
-    {
-        let mut channel = channel.lock().await;
-        channel.insert_attribute(&KIK_RESPONSE_RX, Arc::new(Mutex::new(rx)));
-        channel.insert_attribute(&KIK_RESPONSE_TX, tx);
-    }
-
     //先响应确认和分配内存，但是上线延迟(等待kik数据连接等状态准备好)
     tokio::time::sleep(Duration::from_secs(5)).await;
     //初始化完成，即kik上线
     kik.set_kik_initialized(true);
     context.record_kik_online(&kik).await;
-    //没有当前被控者，默认设置一个
-    let current = match context.get_kik().await {
-        None => false,
-        Some(kik) => kik.exist_kik_conn().await,
-    };
-    if !current {
-        context.set_kik(kik.clone()).await;
-    }
-
     Ok(())
 }
 
@@ -299,6 +315,7 @@ async fn kik_reconnect_line(
         }
     };
     if existed {
+        kik.set_kik_initialized(false);
         *kik.kik_client_info.ip.write().await = ip;
         *kik.kik_client_info.recent_online_time.write().await = SystemTime::now();
         if let Some(old) = kik.set_kik_conn(channel.clone()).await {
@@ -338,8 +355,12 @@ async fn new_kik_login_line(
 async fn complete_ctrl_data_auth(
     context: &Context,
     channel: &Arc<Mutex<Channel>>,
+    session_id: &str,
 ) -> anyhow::Result<()> {
-    if !context.insert_ctrl_data_conn(channel.clone()).await {
+    if !context
+        .insert_ctrl_data_conn(session_id, channel.clone())
+        .await
+    {
         return Err(anyhow::Error::msg("控制数据通道达到上限或控制会话已离线"));
     }
     channel
@@ -356,10 +377,12 @@ async fn complete_ctrl_auth(
     context: &Context,
     channel: &Arc<Mutex<Channel>>,
     session_id: String,
+    account_id: String,
+    instance_id: String,
 ) -> anyhow::Result<()> {
     context
-        .set_ctrl_conn_with_session(channel.clone(), session_id.clone())
-        .await;
+        .register_ctrl_session(channel.clone(), session_id.clone(), account_id, instance_id)
+        .await?;
     channel
         .lock()
         .await
@@ -368,6 +391,14 @@ async fn complete_ctrl_auth(
         ))
         .await?;
     Ok(())
+}
+
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn e2e_trace(message: &str) {

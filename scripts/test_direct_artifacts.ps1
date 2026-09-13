@@ -120,7 +120,7 @@ try {
     }
     Start-Sleep -Seconds 1
 
-    # 三种控制端进程共享一个活动控制会话，必须顺序验证，不能制造相互替换的假失败。
+    # 这里验证各入口都能无 sidecar 直启；完整的多控制实例并存由 e2e_ctrl_stack.ps1 覆盖。
     Assert-StaysRunning -Name "real_ctrl_local_server.exe"
     Assert-StaysRunning -Name "real_ctrl.exe"
     Assert-StaysRunning -Name "ctrl_kik.exe"

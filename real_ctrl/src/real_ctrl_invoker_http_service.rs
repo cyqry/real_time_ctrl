@@ -29,6 +29,8 @@ impl Configurable for HttpExposureConfig {
 
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
 const DEFAULT_HTTP_LOCK_PATH: &str = env!("REAL_CTRL_DEFAULT_HTTP_LOCK_PATH");
+const DEFAULT_HTTP_BINDING: &str = env!("REAL_CTRL_DEFAULT_HTTP_BINDING");
+const DEFAULT_HTTP_PORT: &str = env!("REAL_CTRL_DEFAULT_HTTP_PORT");
 
 #[auto_config(WebConfigurator)]
 #[tokio::main]
@@ -66,7 +68,8 @@ async fn main() -> Result<()> {
     let mut app = App::new();
     // HTTP 默认配置随 EXE 编译，直接双击时不再依赖当前工作目录下的 config/app.toml。
     // Spring 的显式字符串配置仍保持 127.0.0.1、1 MiB 请求上限和统一 /api 前缀。
-    app.use_config_str(include_str!("../../config/app.toml"));
+    let web_config = web_config()?;
+    app.use_config_str(&web_config);
     validate_http_exposure(&app)?;
     app.add_component(api)
         .add_router(routes::router())
@@ -74,6 +77,41 @@ async fn main() -> Result<()> {
         .run()
         .await;
     Ok(())
+}
+
+fn web_config() -> anyhow::Result<String> {
+    let binding = match env::var("REAL_CTRL_HTTP_BINDING") {
+        Ok(value) => value
+            .trim()
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow::anyhow!("REAL_CTRL_HTTP_BINDING 必须是有效 IP 地址"))?
+            .to_string(),
+        Err(_) => DEFAULT_HTTP_BINDING.to_string(),
+    };
+    let port = match env::var("REAL_CTRL_HTTP_PORT") {
+        Ok(value) => value
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| anyhow::anyhow!("REAL_CTRL_HTTP_PORT 必须是 1..65535"))?,
+        Err(_) => DEFAULT_HTTP_PORT.parse().expect("构建期 HTTP 端口必须有效"),
+    };
+    let template = include_str!("../../config/app.toml");
+    if !template.contains("binding = \"127.0.0.1\"") || !template.contains("port = 9000") {
+        return Err(anyhow::anyhow!(
+            "内置 HTTP 配置模板缺少预期的 binding 或 port"
+        ));
+    }
+    Ok(template
+        .replacen(
+            "binding = \"127.0.0.1\"",
+            &format!("binding = \"{binding}\""),
+            1,
+        )
+        .replacen("port = 9000", &format!("port = {port}"), 1)
+        .replace("127.0.0.1:9000", &format!("127.0.0.1:{port}"))
+        .replace("localhost:9000", &format!("localhost:{port}")))
 }
 
 fn validate_http_exposure(app: &impl ConfigRegistry) -> anyhow::Result<()> {

@@ -11,6 +11,8 @@ pub enum Frame {
     Resp(CmdResp),
 
     Data(String, BytesMut), //数据传输的data帧
+    /// 控制端确认下载数据已经消费完成，服务端据此尽早释放长传输路由。
+    DataAck(String),
 
     Ping,
     Pong,
@@ -56,6 +58,13 @@ impl BufSerializable for Frame {
                 bytes_mut.put_u8(15);
                 bytes_mut
             }
+            Frame::DataAck(data_id) => {
+                let mut bytes_mut = BytesMut::with_capacity(5 + data_id.len());
+                bytes_mut.put_u8(16);
+                bytes_mut.put_u32(data_id.len() as u32);
+                bytes_mut.put_slice(data_id.as_bytes());
+                bytes_mut
+            }
         }
     }
 
@@ -81,6 +90,16 @@ impl BufSerializable for Frame {
             }
             14 if bys.is_empty() => Some(Frame::Ping),
             15 if bys.is_empty() => Some(Frame::Pong),
+            16 => {
+                if bys.remaining() < 4 {
+                    return None;
+                }
+                let id_len = bys.get_u32() as usize;
+                if id_len == 0 || id_len > MAX_DATA_ID_BYTES || bys.remaining() != id_len {
+                    return None;
+                }
+                Some(Frame::DataAck(String::from_utf8(bys.to_vec()).ok()?))
+            }
             _ => None,
         }
     }
@@ -130,5 +149,16 @@ mod tests {
             }
             _ => panic!("unexpected frame"),
         }
+    }
+
+    #[test]
+    fn data_ack_round_trip_and_rejects_trailing_bytes() {
+        let frame = Frame::DataAck("data-id".to_string());
+        assert!(
+            matches!(Frame::from_buf(frame.to_buf()), Some(Frame::DataAck(id)) if id == "data-id")
+        );
+        let mut invalid = frame.to_buf();
+        invalid.put_u8(1);
+        assert!(Frame::from_buf(invalid).is_none());
     }
 }

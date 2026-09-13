@@ -5,11 +5,11 @@
 - `secure_transport` 是 `real_ctrl -> ctrl_server` 强身份传输入口；不要在业务 crate 中绕过它手写 TLS 连接。
 - SPKI pin 指的是服务端叶子证书 SubjectPublicKeyInfo DER 的 SHA-256，不是整张证书文件 hash。
 - 强安全模式缺少 CA 证书或 SPKI pin 时必须失败，不能自动回退明文。
-- pinned TLS 客户端固定先发送 `RTCT v3` 非秘密前导，以兼容会复位非标准端口首包 TLS 的公网中间设备；此前导不是认证、授权或降级信号，后续仍必须完成 TLS 1.3、证书链、DNS 名称和 SPKI pin 校验。
+- pinned TLS 客户端固定先发送 `RTCT v4` 非秘密前导，以兼容会复位非标准端口首包 TLS 的公网中间设备；此前导不是认证、授权或降级信号，后续仍必须完成 TLS 1.3、证书链、DNS 名称和 SPKI pin 校验。
 - `ctrl_kik` 的全部控制/数据帧必须先经过 Noise NK 记录层；每条连接独立握手、严格递增 nonce，AEAD 失败立即关闭连接。
 - Noise 单记录密文不得超过 65535 字节；大协议帧由流适配器自动分段，不得改变上层 4 MiB `FilePart` 契约。
 - `session_auth` 负责 real_ctrl 会话 proof；不要在业务 crate 中复制 HMAC 拼接逻辑。
-- 当前 `InitFrame` 只保留 v3 Kik、challenge/session 和会话数据通道帧；修改时同步升级传输版本并整体发布，不维护旧线协议分支。
+- 当前 `InitFrame` 只保留 v4 Kik、账号/实例 challenge/session 和会话数据通道帧；修改时同步升级传输版本并整体发布，不维护旧线协议分支。
 - HMAC key 直接使用部署注入的高熵控制面秘密；禁止恢复历史静态摘要认证。
 - 握手阶段使用 4 KiB 上限，角色认证完成后才能切换到控制/数据帧上限。
 
@@ -33,7 +33,9 @@
 
 - 新传输安全能力应通过独立模块引入；Noise 是 `ctrl_kik` 默认安全边界，不得改成可选 feature 或自动明文降级。
 - 任何涉及密钥、pin、token 的实现都要说明存储位置和生命周期。
-- `build.rs` 生成代码只能写入 Cargo `OUT_DIR`。编译期字符串混淆不是秘密存储，不能放入控制凭据或 API token。
+- `build.rs` 生成代码只能写入 Cargo `OUT_DIR`。本 crate 的混淆字符串不是秘密存储，不能承载控制
+  凭据或 API token；用户要求单文件直启时，秘密只允许由确实需要它的 `real_ctrl` / `ctrl_server`
+  以各自 `hidden!(env!(...))` 默认值持有，并由发布脚本审计原始明文。
 - 需要集中复用或调整的非秘密字符串统一维护在 `config.json`；nonce 必须绑定字段名和字段值，生成函数使用 `OnceLock` 缓存解密结果。
 - `common` 会被受保护 Kik 静态链接：除 `#[cfg(test)]` 测试数据和编译期路径外，运行时字符串都必须来自 `config.json` 或 `common::hidden!`；静态片段不得重新放回 `format!`、`anyhow!`、断言消息或 `io::Error` 明文字面量。
 - 字符串混淆 key 会进入二进制，只用于提高静态搜索成本，禁止复用于 TLS、认证、文件加密或业务数据保护。

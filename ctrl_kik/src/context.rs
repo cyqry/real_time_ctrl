@@ -8,15 +8,18 @@ use common::protocol::CmdOptions;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
-use uuid::Uuid;
 
 const DATA_QUEUE_CAPACITY: usize = 2;
 const DATA_QUEUE_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const DATA_READ_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+const PRE_REGISTERED_ROUTE_TTL: Duration = Duration::from_secs(30);
+const MAX_DATA_ROUTES: usize = 64;
+const MAX_PRE_REGISTERED_ROUTES: usize = 16;
+const MAX_PRE_REGISTERED_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) type CommandMessage = (String, CmdOptions, Command);
 pub(crate) const COMMAND_SENDER: ChannelAttributeKey<Sender<CommandMessage>> =
@@ -26,13 +29,15 @@ pub(crate) const COMMAND_SENDER: ChannelAttributeKey<Sender<CommandMessage>> =
 pub struct Context {
     pub id: Arc<Mutex<Option<String>>>,
     kik_op: Arc<Mutex<Option<Kik>>>,
-    data_x: DataChan,
+    data_routes: Arc<Mutex<HashMap<String, DataChan>>>,
 }
 
-#[derive(Clone)]
 struct DataChan {
     tx: Sender<(String, BytesMut)>,
     rx: Arc<Mutex<Receiver<(String, BytesMut)>>>,
+    registered: bool,
+    created_at: Instant,
+    pre_registered_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -107,14 +112,10 @@ impl Kik {
 impl Context {
     pub fn new() -> Self {
         // 有界队列把背压传回 TCP 读循环，避免对端持续发送大帧时无限占用内存。
-        let (tx, rx) = channel(DATA_QUEUE_CAPACITY);
         Self {
             id: Arc::new(Mutex::new(None)),
             kik_op: Arc::new(Mutex::new(None)),
-            data_x: DataChan {
-                tx,
-                rx: Arc::new(Mutex::new(rx)),
-            },
+            data_routes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -127,7 +128,69 @@ impl Context {
     }
 
     pub async fn send_data(&self, op: (String, BytesMut)) -> anyhow::Result<()> {
-        timeout(DATA_QUEUE_SEND_TIMEOUT, self.data_x.tx.send(op))
+        let (sender, cleanup) = {
+            let mut routes = self.data_routes.lock().await;
+            let now = Instant::now();
+            routes.retain(|_, route| {
+                route.registered
+                    || now.saturating_duration_since(route.created_at) <= PRE_REGISTERED_ROUTE_TTL
+            });
+
+            let current_pre_registered_bytes = routes
+                .values()
+                .filter(|route| !route.registered)
+                .map(|route| route.pre_registered_bytes)
+                .sum::<usize>();
+            if let Some(route) = routes.get_mut(&op.0) {
+                if !route.registered {
+                    let new_total = current_pre_registered_bytes.saturating_add(op.1.len());
+                    if new_total > MAX_PRE_REGISTERED_BYTES {
+                        return Err(anyhow::Error::msg(hidden!("预到达数据缓冲达到上限")));
+                    }
+                    route.pre_registered_bytes =
+                        route.pre_registered_bytes.saturating_add(op.1.len());
+                }
+                (route.tx.clone(), None)
+            } else {
+                let pre_registered_count =
+                    routes.values().filter(|route| !route.registered).count();
+                if routes.len() >= MAX_DATA_ROUTES
+                    || pre_registered_count >= MAX_PRE_REGISTERED_ROUTES
+                    || current_pre_registered_bytes.saturating_add(op.1.len())
+                        > MAX_PRE_REGISTERED_BYTES
+                {
+                    return Err(anyhow::Error::msg(hidden!("预到达数据路由达到上限")));
+                }
+                let key = op.0.clone();
+                let created_at = Instant::now();
+                let (tx, rx) = channel(DATA_QUEUE_CAPACITY);
+                routes.insert(
+                    key.clone(),
+                    DataChan {
+                        tx: tx.clone(),
+                        rx: Arc::new(Mutex::new(rx)),
+                        registered: false,
+                        created_at,
+                        pre_registered_bytes: op.1.len(),
+                    },
+                );
+                (tx, Some((key, created_at)))
+            }
+        };
+        if let Some((key, created_at)) = cleanup {
+            let routes = self.data_routes.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PRE_REGISTERED_ROUTE_TTL).await;
+                let mut routes = routes.lock().await;
+                if routes
+                    .get(&key)
+                    .is_some_and(|route| !route.registered && route.created_at == created_at)
+                {
+                    routes.remove(&key);
+                }
+            });
+        }
+        timeout(DATA_QUEUE_SEND_TIMEOUT, sender.send(op))
             .await
             .map_err(|_| anyhow::Error::msg(hidden!("数据接收队列持续拥塞")))?
             .context(hidden!("数据接收者已关闭"))?;
@@ -135,24 +198,59 @@ impl Context {
     }
 
     pub async fn read_data(&self, key: &str) -> anyhow::Result<BytesMut> {
+        let receiver = self
+            .data_routes
+            .lock()
+            .await
+            .get(key)
+            .filter(|route| route.registered)
+            .map(|route| route.rx.clone())
+            .ok_or_else(|| anyhow::Error::msg(hidden!("数据接收路由未登记")))?;
         timeout(DATA_READ_TIMEOUT, async {
-            loop {
-                let (id, data) = self
-                    .data_x
-                    .rx
-                    .lock()
-                    .await
-                    .recv()
-                    .await
-                    .ok_or_else(|| anyhow::Error::msg(hidden!("数据接收通道已关闭")))?;
-                if id == key {
-                    return Ok(data);
-                }
-                // 连接重建时可能残留旧请求数据；丢弃不匹配帧，不能让它污染当前命令。
-            }
+            let (_, data) = receiver
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::Error::msg(hidden!("数据接收通道已关闭")))?;
+            Ok(data)
         })
         .await
         .map_err(|_| anyhow::Error::msg(hidden!("数据读取超时")))?
+    }
+
+    /// 命令通道与数据通道是独立 TCP 流，公网中数据帧可能合法地先到达。此处把短期预到达
+    /// 路由升级为已登记路由；预到达数量、总字节数和存活时间均有硬上限。
+    pub async fn register_data_route(&self, key: &str) -> anyhow::Result<()> {
+        let mut routes = self.data_routes.lock().await;
+        if let Some(route) = routes.get_mut(key) {
+            if route.registered {
+                return Err(anyhow::Error::msg(hidden!("数据接收路由重复")));
+            }
+            route.registered = true;
+            route.pre_registered_bytes = 0;
+            return Ok(());
+        }
+        if routes.len() >= MAX_DATA_ROUTES {
+            return Err(anyhow::Error::msg(hidden!("活动数据传输达到上限")));
+        }
+        let (tx, rx) = channel(DATA_QUEUE_CAPACITY);
+        let rx = Arc::new(Mutex::new(rx));
+        routes.insert(
+            key.to_string(),
+            DataChan {
+                tx: tx.clone(),
+                rx: rx.clone(),
+                registered: true,
+                created_at: Instant::now(),
+                pre_registered_bytes: 0,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn remove_data_route(&self, key: &str) {
+        self.data_routes.lock().await.remove(key);
     }
 
     pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
@@ -180,12 +278,6 @@ impl Context {
         }
     }
 
-    pub async fn find_and_send_data(&self, data: &[u8]) -> anyhow::Result<String> {
-        let data_id = Uuid::new_v4().to_string();
-        self.send_data_with_id(&data_id, data).await?;
-        Ok(data_id)
-    }
-
     pub async fn send_data_with_id(&self, data_id: &str, data: &[u8]) -> anyhow::Result<()> {
         let encoded = encode_data_frame(data_id, data)?;
         let kik = self
@@ -209,6 +301,7 @@ impl Context {
     }
 
     pub async fn clear(&self) {
+        self.data_routes.lock().await.clear();
         let kik = self.kik_op.lock().await.clone();
         if let Some(kik) = kik {
             kik.clear().await;
@@ -217,8 +310,10 @@ impl Context {
 }
 
 #[tokio::test]
-async fn data_channel_safely_skips_stale_frame() {
+async fn data_channels_are_isolated_by_id() {
     let context = Context::new();
+    context.register_data_route("stale").await.unwrap();
+    context.register_data_route("wanted").await.unwrap();
     context
         .send_data(("stale".to_string(), BytesMut::from(&b"old"[..])))
         .await
@@ -229,4 +324,29 @@ async fn data_channel_safely_skips_stale_frame() {
         .unwrap();
 
     assert_eq!(context.read_data("wanted").await.unwrap(), b"new"[..]);
+    assert_eq!(context.read_data("stale").await.unwrap(), b"old"[..]);
+}
+
+#[tokio::test]
+async fn data_may_arrive_before_its_command_on_an_independent_connection() {
+    let context = Context::new();
+    context
+        .send_data((
+            "unsolicited-route-test-id".to_string(),
+            BytesMut::from(&b"unsolicited-payload-test-value"[..]),
+        ))
+        .await
+        .unwrap();
+    context
+        .register_data_route("unsolicited-route-test-id")
+        .await
+        .unwrap();
+    assert_eq!(
+        context
+            .read_data("unsolicited-route-test-id")
+            .await
+            .unwrap(),
+        b"unsolicited-payload-test-value"[..]
+    );
+    context.remove_data_route("unsolicited-route-test-id").await;
 }

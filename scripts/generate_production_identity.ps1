@@ -235,6 +235,7 @@ $realCtrlValues = [ordered]@{
     REAL_CTRL_TLS_CA_CERT = $certPath
     REAL_CTRL_TLS_SERVER_SPKI_SHA256 = $spkiPin
     REAL_CTRL_AUTH_SECRET = $controlAuthSecret
+    REAL_CTRL_ACCOUNT_ID = "default"
     REAL_CTRL_API_TOKEN = $apiToken
     REAL_CTRL_API_ALLOW_EXEC = "1"
     REAL_CTRL_HTTP_LOCK_PATH = $httpLockPath
@@ -255,6 +256,10 @@ $compiledDefaultValues = [ordered]@{
     )
     RTC_REAL_CTRL_BUILD_TLS_SPKI_SHA256 = $spkiPin
     RTC_REAL_CTRL_BUILD_HTTP_LOCK_PATH = "real_ctrl-http-production.lock"
+    RTC_REAL_CTRL_BUILD_HTTP_BINDING = "127.0.0.1"
+    RTC_REAL_CTRL_BUILD_HTTP_PORT = "9000"
+    RTC_REAL_CTRL_BUILD_ACCOUNT_ID = "default"
+    RTC_REAL_CTRL_BUILD_INSTANCE_ID = ""
     RTC_REAL_CTRL_BUILD_AUTH_SECRET = $controlAuthSecret
     RTC_REAL_CTRL_BUILD_API_TOKEN = $apiToken
     RTC_REAL_CTRL_BUILD_API_ALLOW_EXEC = "1"
@@ -268,6 +273,7 @@ $compiledDefaultValues = [ordered]@{
         [IO.File]::ReadAllBytes($keyPath)
     )
     RTC_CTRL_SERVER_BUILD_AUTH_SECRET = $controlAuthSecret
+    RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64 = ""
     RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY = $noisePrivate
     RTC_CTRL_SERVER_BUILD_ALLOW_EXEC = "1"
 }

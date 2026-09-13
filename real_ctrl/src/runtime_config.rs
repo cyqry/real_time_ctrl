@@ -36,11 +36,22 @@ pub fn connection_config() -> anyhow::Result<Config> {
         allow_remote_exec: false,
     };
 
+    let account_id =
+        runtime_or_default("REAL_CTRL_ACCOUNT_ID", env!("REAL_CTRL_DEFAULT_ACCOUNT_ID"));
+    let instance_id = runtime_optional("REAL_CTRL_INSTANCE_ID")
+        .or_else(|| {
+            let compiled = hidden!(env!("REAL_CTRL_DEFAULT_INSTANCE_ID"));
+            (!compiled.is_empty()).then_some(compiled)
+        })
+        // 默认每个进程使用独立实例 ID，同一份 EXE 可同时双击启动且不会互相踢下线。
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     Ok(Config {
         id: Id::control_plane_from_env_or(
             "REAL_CTRL_AUTH_SECRET",
             hidden!(env!("REAL_CTRL_DEFAULT_AUTH_SECRET")),
-        )?,
+        )?
+        .with_control_identity(account_id, instance_id)?,
         server_host: get_host_from_env_or("REAL_CTRL_SERVER_HOST", DEFAULT_SERVER_HOST),
         // real_ctrl 仅使用 security.tls_port；保留字段为空，避免产生两个端口来源。
         server_port: String::new(),

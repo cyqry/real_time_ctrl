@@ -16,7 +16,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
-use uuid::Uuid;
 
 pub struct RunOutcome {
     response: KikResp,
@@ -47,12 +46,12 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
     match cmd {
         Command::Ctrl(c) => {
             let resp = match c {
-                CtrlCommand::GetFile(file_path, _) => {
+                CtrlCommand::GetFile(file_path, data_id) => {
                     match file_util::read_file_limited(file_path, file_util::MAX_INLINE_FILE_BYTES)
                         .await
                     {
-                        Ok(v) => match context.find_and_send_data(&v).await {
-                            Ok(data_id) => {
+                        Ok(v) => match context.send_data_with_id(&data_id, &v).await {
+                            Ok(()) => {
                                 return RunOutcome::immediate(kik_success_data_id(data_id));
                             }
                             Err(e) => kik_error(hidden!("Kik发送数据失败,error:", e)),
@@ -60,8 +59,8 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
                         Err(e) => kik_error(hidden!("Kik读取文件失败:", e)),
                     }
                 }
-                CtrlCommand::GetBigFile(file_path, _) => {
-                    return prepare_get_big_file(context, file_path).await;
+                CtrlCommand::GetBigFile(file_path, data_id) => {
+                    return prepare_get_big_file(context, file_path, data_id).await;
                 }
                 CtrlCommand::SetBigFile(data_id, total, hash, save_path) => {
                     match set_big_file(context, data_id, total, hash, save_path.clone()).await {
@@ -123,11 +122,11 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
                         Err(e) => kik_error(e.to_string()),
                     }
                 }
-                CtrlCommand::Screen(_) => {
+                CtrlCommand::Screen(data_id) => {
                     let request = screen::CaptureRequest::png(screen::PngProfile::Balanced);
                     match screen::capture_screen(request).await {
-                        Ok(v) => match context.find_and_send_data(&v).await {
-                            Ok(data_id) => {
+                        Ok(v) => match context.send_data_with_id(&data_id, &v).await {
+                            Ok(()) => {
                                 return RunOutcome::immediate(kik_success_data_id(data_id));
                             }
                             Err(e) => kik_error(hidden!("Kik发送数据失败,error:", e)),
@@ -148,7 +147,7 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
     }
 }
 
-async fn prepare_get_big_file(context: &Context, file_path: String) -> RunOutcome {
+async fn prepare_get_big_file(context: &Context, file_path: String, data_id: String) -> RunOutcome {
     let prepared =
         match file_util::prepare_big_file(&file_path, file_util::FILE_TRANSFER_CHUNK_BYTES).await {
             Ok(value) => value,
@@ -163,7 +162,6 @@ async fn prepare_get_big_file(context: &Context, file_path: String) -> RunOutcom
     if context.find_data_conn().await.is_none() {
         return RunOutcome::immediate(kik_error(hidden!("Kik数据连接未初始化完成")));
     }
-    let data_id = Uuid::new_v4().to_string();
     let response = kik_success_big_file(data_id.clone(), file_size, hash);
     let send_context = context.clone();
     let (start_tx, start_rx) = oneshot::channel();

@@ -17,6 +17,8 @@ pub struct Config {
 #[derive(Clone)]
 pub struct Id {
     control_plane_secret: String,
+    account_id: String,
+    instance_id: String,
 }
 
 impl Id {
@@ -24,6 +26,8 @@ impl Id {
     pub fn anonymous() -> Self {
         Self {
             control_plane_secret: String::new(),
+            account_id: String::new(),
+            instance_id: String::new(),
         }
     }
 
@@ -55,6 +59,8 @@ impl Id {
 
         Ok(Self {
             control_plane_secret: secret,
+            account_id: hidden!("default"),
+            instance_id: String::new(),
         })
     }
 
@@ -62,6 +68,42 @@ impl Id {
     pub fn control_plane_secret(&self) -> &str {
         &self.control_plane_secret
     }
+
+    /// 构造可并存的控制实例身份。账号决定服务端授权域，实例 ID 只用于会话隔离与重连替换。
+    pub fn with_control_identity(
+        mut self,
+        account_id: String,
+        instance_id: String,
+    ) -> anyhow::Result<Self> {
+        validate_identity(&hidden!("account_id"), &account_id)?;
+        validate_identity(&hidden!("instance_id"), &instance_id)?;
+        self.account_id = account_id;
+        self.instance_id = instance_id;
+        Ok(self)
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
+fn validate_identity(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(anyhow!(hidden!(
+            name,
+            " 必须是 1..64 位 ASCII 字母、数字、- 或 _"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

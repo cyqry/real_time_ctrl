@@ -1,56 +1,48 @@
-use crate::core::connection_meta::KIK_RESPONSE_TX;
 use crate::core::context::Context;
 use bytes::BytesMut;
 use common::channel::Channel;
 use common::message::kik_frame::KikFrame;
 use common::protocol::BufSerializable;
-use log::debug;
+use log::{debug, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的 Kik 业务帧类型")
 }
+
 pub async fn handle_kik(
     context: Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
-    let frame = KikFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
-    match frame {
-        KikFrame::RespExtra(resp, cmd_id) => {
-            debug!("handle kik,kik响应:{:?},cmd_id:{}", resp, cmd_id);
-            let tx = channel
+    match KikFrame::from_buf(msg).ok_or_else(|| anyhow::anyhow!("帧格式错误"))? {
+        KikFrame::RespExtra(response, command_id) => {
+            let kik_id = channel
                 .lock()
                 .await
-                .attribute(&KIK_RESPONSE_TX)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("被控端响应发送队列未初始化"))?;
-            match context.active_command_id().await {
-                None => {
-                    //过期id或异常id,不处理
-                    return Ok(());
-                }
-                Some(id) => {
-                    if cmd_id != id {
-                        //过期id或异常id,不处理
-                        return Ok(());
-                    }
-                }
-            };
-            //这里可能发生cmd_id改变
-            tx.send((resp, cmd_id))
+                .id()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("Kik 响应连接缺少 ID"))?;
+            let kik = context
+                .get_initialized_kik_by_id(&kik_id)
                 .await
-                .map_err(|_| anyhow::anyhow!("被控端响应接收任务已关闭"))?;
+                .ok_or_else(|| anyhow::anyhow!("Kik 响应来自非活动连接"))?;
+            if !kik.is_kik_conn(&channel).await {
+                warn!("丢弃已被替换的旧 Kik 连接响应: kik_id={}", kik_id);
+                return Ok(());
+            }
+            debug!("收到 Kik 响应: kik_id={}, cmd_id={}", kik_id, command_id);
+            if !kik.complete_command(&command_id, response).await {
+                // 超时或伪造关联 ID 不会影响其他请求，只记录并丢弃。
+                warn!(
+                    "丢弃无等待者的 Kik 响应: kik_id={}, cmd_id={}",
+                    kik_id, command_id
+                );
+            }
         }
-        KikFrame::Ping => {}
-        KikFrame::Pong => {}
-        _ => {
-            return Err(default_error());
-        }
+        KikFrame::Ping | KikFrame::Pong => {}
+        _ => return Err(default_error()),
     }
     Ok(())
 }
-
-// channel的id在 此方法中初始化
-// return err会跳出循环关闭连接

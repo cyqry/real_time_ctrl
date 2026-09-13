@@ -7,7 +7,7 @@ use crate::input_command::{InputCommand, RemoteResp};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiServiceError {
-    #[error("另一个控制命令正在执行")]
+    #[error("控制命令并发达到上限")]
     Busy,
     #[error("{0}")]
     Forbidden(String),
@@ -68,7 +68,7 @@ impl RealCtrlApi {
             Err(_) => {
                 return ApiResponse::error(
                     request.request_id,
-                    ApiErrorBody::busy("另一个控制命令正在执行，请稍后重试"),
+                    ApiErrorBody::busy("控制命令并发达到上限，请稍后重试"),
                 )
             }
         };
@@ -95,7 +95,7 @@ impl RealCtrlApi {
     }
 
     async fn execute_allowed(&self, command: InputCommand) -> Result<RemoteResp, ApiServiceError> {
-        // 所有协议入口最终都进入这个分发点；并发门禁的 permit 由上层持有到数据处理结束。
+        // 所有开放 API 入口最终进入同一分发点；有界 permit 持有到关联数据处理结束。
         dispatch::distribution_other(&self.context, command)
             .await
             .map_err(ApiServiceError::Execution)
@@ -117,7 +117,7 @@ impl RealCtrlApi {
 impl ApiServiceError {
     fn into_api_error(self) -> ApiErrorBody {
         match self {
-            Self::Busy => ApiErrorBody::busy("另一个控制命令正在执行，请稍后重试"),
+            Self::Busy => ApiErrorBody::busy("控制命令并发达到上限，请稍后重试"),
             Self::Forbidden(message) => ApiErrorBody::forbidden(message),
             Self::Execution(_) => ApiErrorBody::internal("命令执行失败"),
         }

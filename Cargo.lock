@@ -741,6 +741,7 @@ dependencies = [
 name = "ctrl_common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "common",
  "serde",
@@ -785,6 +786,7 @@ dependencies = [
  "ctrl_common",
  "futures",
  "log",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",

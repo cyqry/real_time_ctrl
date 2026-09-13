@@ -47,10 +47,34 @@ fn main() {
         valid_path,
     );
     emit_default(
+        "REAL_CTRL_DEFAULT_HTTP_BINDING",
+        "RTC_REAL_CTRL_BUILD_HTTP_BINDING",
+        "127.0.0.1",
+        valid_host,
+    );
+    emit_default(
+        "REAL_CTRL_DEFAULT_HTTP_PORT",
+        "RTC_REAL_CTRL_BUILD_HTTP_PORT",
+        "9000",
+        valid_port,
+    );
+    emit_default(
         "REAL_CTRL_DEFAULT_AUTH_SECRET",
         "RTC_REAL_CTRL_BUILD_AUTH_SECRET",
         "development-control-secret-0000000000000000",
         |value| value.len() >= 32 && value.is_ascii(),
+    );
+    emit_default(
+        "REAL_CTRL_DEFAULT_ACCOUNT_ID",
+        "RTC_REAL_CTRL_BUILD_ACCOUNT_ID",
+        "default",
+        valid_identity,
+    );
+    emit_default(
+        "REAL_CTRL_DEFAULT_INSTANCE_ID",
+        "RTC_REAL_CTRL_BUILD_INSTANCE_ID",
+        "",
+        |value| value.is_empty() || valid_identity(value),
     );
     emit_default(
         "REAL_CTRL_DEFAULT_API_TOKEN",
@@ -110,4 +134,12 @@ fn valid_base64(value: &str) -> bool {
 
 fn valid_bool(value: &str) -> bool {
     matches!(value, "0" | "1" | "false" | "true")
+}
+
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }

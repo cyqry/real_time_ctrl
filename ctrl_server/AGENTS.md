@@ -4,15 +4,16 @@
 
 - `ctrl_server` 的 `real_ctrl` 管理面 TLS 端口由 `CTRL_SERVER_TLS_CERT` / `CTRL_SERVER_TLS_KEY` 启用。
 - 生产环境必须让 TLS 管理端口与 Kik Noise 端口分离，并分别做公网监听与发布健康检查。
-- 独立 TLS 管理端口只允许 TLS：既接受标准 ClientHello，也接受 `RTCT v3` 固定前导后紧跟的 ClientHello；两条路径必须进入同一个 rustls TLS 1.3 acceptor，固定前导不得成为认证或明文降级依据。
-- 业务端口只以 Noise NK v3 服务 `ctrl_kik`；生产控制面必须走 TLS 管理端口。
+- 独立 TLS 管理端口只允许 TLS：既接受标准 ClientHello，也接受 `RTCT v4` 固定前导后紧跟的 ClientHello；两条路径必须进入同一个 rustls TLS 1.3 acceptor，固定前导不得成为认证或明文降级依据。
+- 业务端口只以 Noise NK v4 服务 `ctrl_kik`；生产控制面必须走 TLS 管理端口。
 - 不要把 `ctrl_kik` 最小客户端假设和 `real_ctrl` 强身份管理面混成同一套认证要求。
 - `CtrlData` 数据通道必须绑定当前 `CtrlSession`，并拒绝重复 `channel_nonce`。
 - TLS 只接受 `Ctrl` / `CtrlData`，Noise NK 只接受 `Kik` / `KikData`；不存在明文或旧认证兼容开关。
 - Noise 私钥可由受 ACL 保护的发布身份作为构建输入生成加密默认值，也可由
   `CTRL_SERVER_KIK_NOISE_PRIVATE_KEY` 在运行时覆盖；禁止写入源码、公开配置、发布清单或日志。
 - TLS 与 Kik 端口配置为同一值时必须启动失败；禁止恢复首字节协议分流。
-- 替换控制连接必须原子切换当前连接并关闭旧数据通道；旧连接的 inactive 回调不得清除新会话。
+- 同账号同实例重连必须原子切换自身会话并关闭旧数据通道；不同实例必须并存。旧连接的 inactive
+  回调不得清除新会话或其他账号/实例。
 
 ## 职责边界
 
@@ -35,13 +36,29 @@
 - 控制会话默认 12 小时过期，单会话最多记录 1024 个数据 nonce；会话失效时必须关闭其数据通道。
 - 数据转发必须在读循环中等待下游写入形成背压，禁止为每个大帧无界 `tokio::spawn`。
 - 控制命令写入被控连接的错误必须立即返回给 real_ctrl，禁止吞掉写错误后继续等待响应；无超时的大文件命令尤其不能因此永久占住命令门禁。
+- 下载命令的 `KikResp::Error` 是不携带 data ID 的合法业务失败，必须原样返回并释放数据路由；只有
+  成功响应携带错误 ID 或错误成功类型时才报告关联 ID 不匹配。
 - CtrlData/KikData 数据帧必须完整解析并重新连续编码，在多条下游数据连接间轮询；首选连接写失败时尝试其余连接，所有写入仍在读任务内等待以保持背压，禁止无界派生转发任务。
-- 当前控制连接、数据连接和 `CtrlSession` 必须共同存放在单个 `CtrlState` 锁内原子替换；禁止重新拆成互相独立的锁。
+- 会话以随机 `session_id` 为主键，实例索引以 `(account_id, instance_id)` 为主键；会话选择、数据连接、
+  nonce 和实例级命令配额均为会话私有状态。任何集合锁内不得等待网络 I/O。
+- 命令并发必须同时取得全局、账号、实例和 Kik 四级许可；默认上限分别为 256、64、16、16。
+  许可由命令任务 RAII 持有到响应和必要的数据路由处理完成，所有错误与 panic 路径必须自动释放。
+- 服务端发往 Kik 的命令 ID 必须是随机内部 ID；客户端 ID 只用于原控制会话返回。Kik 响应通过
+  per-Kik oneshot 定向投递，禁止共享响应 Receiver。
+- 文件数据路由必须绑定 `session_id + kik_id + direction`；全局最多 4096、单会话最多 64，最长
+  4 小时 15 分钟，并在单帧完成、失败、超时、DataAck、会话断开或 Kik 下线时清理。
+- CtrlData 可比对应控制命令先到；服务端最多允许 32 个数据读任务等待路由、每帧最多等待 5 秒。
+  禁止直接因跨 TLS 连接乱序关闭合法数据通道，也禁止无界缓存未知 ID。
 - 已认证帧处理按 `handler/read_handle/{control,data,kik,init}.rs` 分责；新增认证状态只进入 `init`，不要重新堆回单文件。
 - 在线 Kik 表或当前选择锁内禁止等待网络关闭或内部连接锁；先克隆/移出共享句柄，再执行异步 I/O。
+- 控制会话没有当前目标时，必须自动选择最近上线且通过账号 ACL 的在线 Kik：既要覆盖控制端先连接，
+  也要覆盖 Kik 先连接和双方并发上线。自动选择只能填充空值，不能覆盖 `$sys_use` 的显式选择；当前
+  Kik 完整下线后应清除旧引用并选择仍在线的合法候选。
 - 非 debug Cargo profile 的编译期默认日志级别为 INFO；显式 `RUST_LOG` 优先。
 - `ctrl_server/build.rs` 提供 bind、端口、TLS PEM、认证 secret、Noise 私钥和 Exec 策略的正式默认值，
   运行环境变量优先。敏感构建输入只来自仓库 `target` 下受 ACL 保护的身份目录，发布后必须审计明文泄漏。
+- 多账号配置由 `CTRL_SERVER_ACCOUNTS_JSON_BASE64` 或同名构建默认值提供；账号 secret、Kik ACL、
+  最大实例数和账号/实例并发上限必须逐项验证。配置缺失时只生成兼容部署用的 `default` 账号。
 - Kik 最近状态表最多保留 256 条、仅驻留当前服务端进程；只在初始化完成后记录上线，只在主/数据连接全部消失后记录下线，旧连接回调不得删除重连后的新会话。
 
 ## 测试要求

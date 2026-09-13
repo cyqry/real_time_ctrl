@@ -41,7 +41,7 @@ pub enum RemoteSuccessResp {
 }
 
 #[cfg(target_os = "windows")]
-static DEFAULT_SCREEN_PATH: &str = "target\\screen\\1.png";
+static DEFAULT_SCREEN_PATH: &str = "D:\\MyTest\\1.png";
 
 impl TryFrom<InputCtrlCommand> for CtrlCommand {
     type Error = anyhow::Error;

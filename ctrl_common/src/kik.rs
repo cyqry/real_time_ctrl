@@ -1,11 +1,12 @@
 use crate::entity::KikClientInfo;
 use common::channel::Channel;
 use common::kik_info::KikInfo;
+use common::message::kik_resp::KikResp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError, oneshot};
 
 /// 服务端持有的单个被控端会话。
 ///
@@ -21,6 +22,8 @@ pub struct Kik {
 
     //是否已上线(只在初始化时修改一次)
     initialized: Arc<AtomicBool>,
+    pending_commands: Arc<Mutex<HashMap<String, oneshot::Sender<KikResp>>>>,
+    command_limit: Arc<Semaphore>,
 }
 
 impl Kik {
@@ -44,6 +47,9 @@ impl Kik {
             conn_op: Arc::new(RwLock::new(Some(conn))),
             data_conns: Arc::new(Mutex::new(HashMap::new())),
             initialized: Arc::new(AtomicBool::new(false)),
+            pending_commands: Arc::new(Mutex::new(HashMap::new())),
+            // 同一被控端允许有限并行，防止一个慢 Kik 被大量已认证请求耗尽服务端内存。
+            command_limit: Arc::new(Semaphore::new(16)),
         }
     }
 
@@ -87,23 +93,38 @@ impl Kik {
     pub async fn get_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
         self.conn_op.read().await.clone()
     }
+    pub async fn is_kik_conn(&self, channel: &Arc<Mutex<Channel>>) -> bool {
+        self.conn_op
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, channel))
+    }
     pub async fn delete_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
         self.conn_op.write().await.take()
     }
     /// 只清理由该回调持有的连接，防止旧连接迟到的 inactive 事件删除刚完成的重连。
     pub async fn delete_kik_conn_if(&self, channel: &Arc<Mutex<Channel>>) -> bool {
-        let mut current = self.conn_op.write().await;
-        if current
-            .as_ref()
-            .is_some_and(|registered| Arc::ptr_eq(registered, channel))
-        {
-            current.take();
-            true
-        } else {
-            false
+        let removed = {
+            let mut current = self.conn_op.write().await;
+            if current
+                .as_ref()
+                .is_some_and(|registered| Arc::ptr_eq(registered, channel))
+            {
+                current.take();
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.pending_commands.lock().await.clear();
         }
+        removed
     }
     pub async fn set_kik_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
+        // 重连不会重放旧命令，立即取消旧连接上的等待者，避免占用许可直到超时。
+        self.pending_commands.lock().await.clear();
         self.conn_op.write().await.replace(conn)
     }
 
@@ -127,6 +148,7 @@ impl Kik {
         !self.data_conns.lock().await.is_empty()
     }
     pub async fn clear(&self) {
+        self.pending_commands.lock().await.clear();
         // 先移出连接再等待网络关闭，避免一个慢连接长期占住会话状态锁。
         let data_connections = self
             .data_conns
@@ -141,5 +163,35 @@ impl Kik {
         if let Some(connection) = self.conn_op.write().await.take() {
             connection.lock().await.try_write_half_close().await;
         }
+    }
+
+    pub fn try_acquire_command(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        self.command_limit.clone().try_acquire_owned()
+    }
+
+    pub async fn register_command(
+        &self,
+        command_id: String,
+    ) -> anyhow::Result<oneshot::Receiver<KikResp>> {
+        use std::collections::hash_map::Entry;
+        let mut pending = self.pending_commands.lock().await;
+        match pending.entry(command_id) {
+            Entry::Vacant(entry) => {
+                let (tx, rx) = oneshot::channel();
+                entry.insert(tx);
+                Ok(rx)
+            }
+            Entry::Occupied(_) => Err(anyhow::anyhow!("被控端命令关联 ID 冲突")),
+        }
+    }
+
+    pub async fn cancel_command(&self, command_id: &str) {
+        self.pending_commands.lock().await.remove(command_id);
+    }
+
+    /// 响应只唤醒拥有该内部关联 ID 的请求；未知或超时后的响应直接丢弃。
+    pub async fn complete_command(&self, command_id: &str, response: KikResp) -> bool {
+        let sender = self.pending_commands.lock().await.remove(command_id);
+        sender.is_some_and(|sender| sender.send(response).is_ok())
     }
 }

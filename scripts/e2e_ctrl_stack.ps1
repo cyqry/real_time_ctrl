@@ -6,6 +6,7 @@
 
 $ErrorActionPreference = "Stop"
 $script:Processes = @()
+Add-Type -AssemblyName System.Net.Http
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
@@ -15,6 +16,9 @@ $LogDir = Join-Path $E2eDir "logs"
 $ReportPath = Join-Path $E2eDir "e2e_report.json"
 $ApiToken = "e2e-local-token"
 $ControlAuthSecret = "e2e-control-auth-secret-0123456789abcdef"
+$SecondAccountSecret = "e2e-second-account-secret-0123456789abcdef"
+$SameAccountHttpPort = $HttpPort + 1
+$SecondAccountHttpPort = $HttpPort + 3
 
 New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir | Out-Null
 Set-Content -LiteralPath (Join-Path $E2eDir "ctrl_ls_marker.txt") -Encoding UTF8 -Value "real_time_ctrl e2e marker"
@@ -292,7 +296,7 @@ function Assert-RealCtrlRejected {
 }
 
 function Invoke-ApiCommand {
-    param([hashtable]$Command, [string]$RequestId)
+    param([hashtable]$Command, [string]$RequestId, [int]$Port = $HttpPort)
     $body = @{
         version    = 1
         request_id = $RequestId
@@ -301,10 +305,46 @@ function Invoke-ApiCommand {
 
     Invoke-RestMethod `
         -Method Post `
-        -Uri "http://127.0.0.1:$HttpPort/api/v1/commands" `
+        -Uri "http://127.0.0.1:$Port/api/v1/commands" `
         -Headers @{ "Authorization" = "Bearer $ApiToken" } `
         -ContentType "application/json" `
         -Body $body
+}
+
+function Invoke-ParallelApiCommands {
+    param([hashtable[]]$Commands)
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Authorization =
+        [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $ApiToken)
+    try {
+        $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+        for ($i = 0; $i -lt $Commands.Count; $i++) {
+            $body = @{
+                version = 1
+                request_id = "parallel-$i"
+                command = $Commands[$i]
+            } | ConvertTo-Json -Depth 12 -Compress
+            $content = [System.Net.Http.StringContent]::new(
+                $body,
+                [System.Text.Encoding]::UTF8,
+                "application/json"
+            )
+            $tasks.Add($client.PostAsync("http://127.0.0.1:$HttpPort/api/v1/commands", $content))
+        }
+        if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$tasks.ToArray(), 20000)) {
+            throw "Parallel HTTP commands timed out"
+        }
+        @($tasks | ForEach-Object {
+            $response = $_.Result
+            $body = $response.Content.ReadAsStringAsync().Result
+            if (-not $response.IsSuccessStatusCode) {
+                throw "Parallel HTTP command failed with $([int]$response.StatusCode): $body"
+            }
+            $body | ConvertFrom-Json
+        })
+    } finally {
+        $client.Dispose()
+    }
 }
 
 $result = [ordered]@{
@@ -322,11 +362,31 @@ try {
     Test-PortFree -Port $KikNoisePort
     Test-PortFree -Port $TlsPort
     Test-PortFree -Port $HttpPort
+    Test-PortFree -Port $SameAccountHttpPort
+    Test-PortFree -Port $SecondAccountHttpPort
 
     $cert = New-E2eCertificate
     $noise = New-E2eNoiseIdentity
     Build-E2eBinaries -NoisePublicKey $noise.Public
     $result.tls_pin = $cert.Pin
+
+    $accountsJson = @(
+        @{
+            account_id = "tenant_a"
+            secret = $ControlAuthSecret
+            allowed_kiks = @("*")
+            max_instances = 8
+            max_commands_per_instance = 16
+        },
+        @{
+            account_id = "tenant_b"
+            secret = $SecondAccountSecret
+            allowed_kiks = @("*")
+            max_instances = 8
+            max_commands_per_instance = 16
+        }
+    ) | ConvertTo-Json -Depth 8 -Compress
+    $accountsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($accountsJson))
 
     $serverEnv = @{
         "CTRL_SERVER_BIND_HOST" = "127.0.0.1"
@@ -337,6 +397,7 @@ try {
         "CTRL_SERVER_KIK_NOISE_PRIVATE_KEY" = $noise.Private
         "CTRL_SERVER_E2E_TRACE_PATH" = (Join-Path $E2eDir "ctrl_server_trace.log")
         "CTRL_SERVER_AUTH_SECRET" = $ControlAuthSecret
+        "CTRL_SERVER_ACCOUNTS_JSON_BASE64" = $accountsBase64
         "RUST_BACKTRACE" = "1"
     }
     $kikEnv = @{ "LOG" = "DEBUG" }
@@ -350,6 +411,8 @@ try {
         "REAL_CTRL_E2E_TRACE_PATH" = (Join-Path $E2eDir "real_ctrl_trace.log")
         "REAL_CTRL_API_TOKEN" = $ApiToken
         "REAL_CTRL_AUTH_SECRET" = $ControlAuthSecret
+        "REAL_CTRL_ACCOUNT_ID" = "tenant_a"
+        "REAL_CTRL_INSTANCE_ID" = "tenant-a-primary"
         "RUST_BACKTRACE" = "1"
     }
 
@@ -370,6 +433,14 @@ try {
     $wrongRoleEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "wrong_role_trace.log")
     Assert-RealCtrlRejected -Name "real_ctrl_wrong_role_probe" -EnvMap $wrongRoleEnv
     $result.assertions += "Kik Noise port rejects real_ctrl TLS role"
+
+    $wrongAccountEnv = $realCtrlEnv.Clone()
+    $wrongAccountEnv["REAL_CTRL_ACCOUNT_ID"] = "tenant_b"
+    $wrongAccountEnv["REAL_CTRL_INSTANCE_ID"] = "wrong-account-secret-probe"
+    $wrongAccountEnv["REAL_CTRL_AUTH_SECRET"] = $ControlAuthSecret
+    $wrongAccountEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "wrong_account_trace.log")
+    Assert-RealCtrlRejected -Name "real_ctrl_wrong_account_secret_probe" -EnvMap $wrongAccountEnv
+    $result.assertions += "account identity is cryptographically bound to its own secret"
 
     $kik = Start-E2eProcess -Name "ctrl_kik" -ExePath (Join-Path $Root "target\debug\ctrl_kik.exe") -EnvMap $kikEnv
     $result.started += @{ name = "ctrl_kik"; pid = $kik.Proc.Id }
@@ -415,6 +486,14 @@ try {
     $result.kik_id = $kikId
     $result.assertions += "sys_list sees ctrl_kik"
 
+    $autoNow = Invoke-ApiCommand -Command @{ kind = "sys_now" } -RequestId "sys-now-auto"
+    if (-not ($autoNow.ok -and
+        $autoNow.data.kind -eq "sys_now" -and
+        [string]$autoNow.data.value.Kik.id -eq $kikId)) {
+        throw "First online Kik was not selected automatically: $($autoNow | ConvertTo-Json -Depth 12 -Compress)"
+    }
+    $result.assertions += "first accessible online Kik is selected automatically"
+
     $history = Invoke-ApiCommand -Command @{ kind = "sys_history"; kik_id = $kikId } -RequestId "sys-history"
     if (-not ($history.ok -and $history.data.kind -eq "sys_history" -and $history.data.items.Count -eq 1 -and $history.data.items[0].online)) {
         throw "sys_history did not return the online Kik: $($history | ConvertTo-Json -Depth 12 -Compress)"
@@ -433,12 +512,93 @@ try {
     }
     $result.assertions += "sys_now ok"
 
+    $sameAccountEnv = $realCtrlEnv.Clone()
+    $sameAccountEnv["REAL_CTRL_HTTP_PORT"] = "$SameAccountHttpPort"
+    $sameAccountEnv["REAL_CTRL_HTTP_LOCK_PATH"] = (Join-Path $E2eDir "real_ctrl_http_same_account.lock")
+    $sameAccountEnv["REAL_CTRL_INSTANCE_ID"] = "tenant-a-secondary"
+    $sameAccount = Start-E2eProcess `
+        -Name "real_ctrl_same_account_instance" `
+        -ExePath (Join-Path $Root "target\debug\real_ctrl_invoker_http_service.exe") `
+        -EnvMap $sameAccountEnv
+    $result.started += @{ name = "real_ctrl_same_account_instance"; pid = $sameAccount.Proc.Id }
+    Wait-TcpPort -HostName "127.0.0.1" -Port $SameAccountHttpPort -TimeoutSeconds 30
+    $sameList = Invoke-ApiCommand @{ kind = "sys_list" } "same-account-list" $SameAccountHttpPort
+    $sameAutoNow = Invoke-ApiCommand @{ kind = "sys_now" } "same-account-auto-now" $SameAccountHttpPort
+    $sameUse = Invoke-ApiCommand @{ kind = "sys_use"; kik_id = $kikId } "same-account-use" $SameAccountHttpPort
+    $primaryStillAlive = Invoke-ApiCommand @{ kind = "sys_now" } "primary-after-secondary" $HttpPort
+    if (-not ($sameList.ok -and
+        $sameAutoNow.ok -and
+        [string]$sameAutoNow.data.value.Kik.id -eq $kikId -and
+        $sameUse.ok -and
+        $primaryStillAlive.ok)) {
+        throw "Same-account control instances did not remain independently active"
+    }
+    $result.assertions += "same account instances independently auto-select an accessible Kik"
+
+    $secondAccountEnv = $realCtrlEnv.Clone()
+    $secondAccountEnv["REAL_CTRL_HTTP_PORT"] = "$SecondAccountHttpPort"
+    $secondAccountEnv["REAL_CTRL_HTTP_LOCK_PATH"] = (Join-Path $E2eDir "real_ctrl_http_second_account.lock")
+    $secondAccountEnv["REAL_CTRL_ACCOUNT_ID"] = "tenant_b"
+    $secondAccountEnv["REAL_CTRL_INSTANCE_ID"] = "tenant-b-primary"
+    $secondAccountEnv["REAL_CTRL_AUTH_SECRET"] = $SecondAccountSecret
+    $secondAccount = Start-E2eProcess `
+        -Name "real_ctrl_second_account_instance" `
+        -ExePath (Join-Path $Root "target\debug\real_ctrl_invoker_http_service.exe") `
+        -EnvMap $secondAccountEnv
+    $result.started += @{ name = "real_ctrl_second_account_instance"; pid = $secondAccount.Proc.Id }
+    Wait-TcpPort -HostName "127.0.0.1" -Port $SecondAccountHttpPort -TimeoutSeconds 30
+    $secondList = Invoke-ApiCommand @{ kind = "sys_list" } "second-account-list" $SecondAccountHttpPort
+    $secondAutoNow = Invoke-ApiCommand @{ kind = "sys_now" } "second-account-auto-now" $SecondAccountHttpPort
+    $secondUse = Invoke-ApiCommand @{ kind = "sys_use"; kik_id = $kikId } "second-account-use" $SecondAccountHttpPort
+    $secondNow = Invoke-ApiCommand @{ kind = "sys_now" } "second-account-now" $SecondAccountHttpPort
+    if (-not ($secondList.ok -and
+        $secondAutoNow.ok -and
+        [string]$secondAutoNow.data.value.Kik.id -eq $kikId -and
+        $secondUse.ok -and
+        $secondNow.ok)) {
+        throw "Second control account could not establish an independent instance"
+    }
+    $result.assertions += "multiple accounts independently auto-select an authorized Kik"
+
+    $missingRemote = Join-Path $E2eDir "missing-download-source.bin"
+    $missingLocal = Join-Path $E2eDir "missing-download-target.bin"
+    Remove-Item -LiteralPath $missingRemote, $missingLocal -Force -ErrorAction SilentlyContinue
+    $missingDownload = Invoke-ApiCommand -Command @{
+        kind = "ctrl_get_file"
+        remote_path = $missingRemote
+        local_path = $missingLocal
+    } -RequestId "missing-download"
+    if ($missingDownload.ok -or
+        $missingDownload.error.message -match "不匹配的数据关联 ID") {
+        throw "Kik file read error was incorrectly reported as a data-id mismatch"
+    }
+    $result.assertions += "download business errors preserve the real Kik error instead of an ID mismatch"
+
     $ls = Invoke-ApiCommand -Command @{ kind = "ctrl_ls"; path = $E2eDir } -RequestId "ctrl-ls"
     if (-not ($ls.ok -and $ls.data.kind -eq "ls" -and $ls.data.entries.Count -gt 0)) {
         throw "ctrl_ls failed: $($ls | ConvertTo-Json -Depth 12 -Compress)"
     }
     $result.ls_entry_count = $ls.data.entries.Count
     $result.assertions += "ctrl_ls through ctrl_server and ctrl_kik ok"
+
+    # 六个各等待约两秒的命令若串行至少需要约十二秒；阈值给慢 CI 留出余量，
+    # 同时能稳定识别旧的全局单命令门禁。
+    $parallelCommands = @(0..5 | ForEach-Object {
+        @{ kind = "exec"; command = "ping -n 3 127.0.0.1 >NUL && echo parallel-ok" }
+    })
+    $parallelWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $parallelResponses = Invoke-ParallelApiCommands -Commands $parallelCommands
+    $parallelWatch.Stop()
+    if ($parallelResponses.Count -ne 6 -or
+        @($parallelResponses | Where-Object { -not $_.ok -or $_.data.message -notmatch "parallel-ok" }).Count -ne 0) {
+        throw "Parallel HTTP command responses were incomplete or mismatched"
+    }
+    if ($parallelWatch.ElapsedMilliseconds -ge 8000) {
+        throw "HTTP commands appear serialized: $($parallelWatch.ElapsedMilliseconds) ms"
+    }
+    $result.parallel_http_commands = 6
+    $result.parallel_http_ms = $parallelWatch.ElapsedMilliseconds
+    $result.assertions += "six HTTP commands execute independently in parallel"
 
     # 12 MiB 覆盖多个 4 MiB 分片，同时保持 CI 运行时间可控。上传和下载都必须经过
     # real_ctrl -> ctrl_server -> ctrl_kik 数据通道，不能用同机文件存在替代协议验收。

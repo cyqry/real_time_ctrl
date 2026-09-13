@@ -1,33 +1,44 @@
+use crate::core::connection_meta::{CTRL_SESSION_ID, KIK_ID};
 use crate::core::context::Context;
 use bytes::BytesMut;
 use common::channel::Channel;
 use common::message::kik_frame::{encode_data_frame as encode_kik_data_frame, KikFrame};
 use common::protocol::BufSerializable;
 use ctrl_common::ctrl_frame::{encode_data_frame as encode_ctrl_data_frame, Frame};
-use log::info;
+use log::warn;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的数据帧类型")
 }
+
 pub async fn handle_ctrl_data(
     context: Context,
-    _: Arc<Mutex<Channel>>,
+    channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
     match Frame::from_buf(msg).ok_or_else(default_error)? {
-        Frame::Data(data_id, data) => {
-            let encoded = encode_kik_data_frame(&data_id, &data)?;
-            if let Some(kik) = context.get_kik().await {
-                let connections = kik.data_connections_for_send().await;
-                if connections.is_empty() {
-                    info!("当前kik没有数据连接")
-                } else {
-                    write_to_available_connection(connections, &encoded).await?;
-                }
-            } else {
-                info!("数据发送失败当前没有在线kik")
+        Frame::Data(external_id, data) => {
+            let session_id = channel
+                .lock()
+                .await
+                .attribute(&CTRL_SESSION_ID)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("控制数据通道缺少会话绑定"))?;
+            let Some((kik, wire_id, single_frame)) = context
+                .wait_ctrl_data_target(&session_id, &external_id)
+                .await
+            else {
+                // 未注册、过期或属于其他会话的数据一律拒绝，防止跨租户注入。
+                anyhow::bail!("数据关联 ID 未授权或已过期");
+            };
+            let encoded = encode_kik_data_frame(&wire_id, &data)?;
+            write_to_available_connection(kik.data_connections_for_send().await, &encoded).await?;
+            if single_frame {
+                context
+                    .complete_ctrl_single_frame_route(&session_id, &external_id)
+                    .await;
             }
         }
         Frame::Ping | Frame::Pong => {}
@@ -38,15 +49,34 @@ pub async fn handle_ctrl_data(
 
 pub async fn handle_kik_data(
     context: Context,
-    _channel: Arc<Mutex<Channel>>,
+    channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
 ) -> anyhow::Result<()> {
     match KikFrame::from_buf(msg).ok_or_else(default_error)? {
-        KikFrame::Data(data_id, data) => {
-            let connections = context.ctrl_data_connections_for_send().await;
-            if !connections.is_empty() {
-                let encoded = encode_ctrl_data_frame(&data_id, &data)?;
-                write_to_available_connection(connections, &encoded).await?;
+        KikFrame::Data(wire_id, data) => {
+            let kik_id = channel
+                .lock()
+                .await
+                .attribute(&KIK_ID)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Kik 数据通道缺少 Kik ID"))?;
+            let Some((session_id, external_id, single_frame)) =
+                context.kik_data_target(&kik_id, &wire_id).await
+            else {
+                warn!(
+                    "丢弃未注册或跨 Kik 的数据帧: kik_id={}, data_id={}",
+                    kik_id, wire_id
+                );
+                return Ok(());
+            };
+            let connections = context.ctrl_data_connections_for_send(&session_id).await;
+            if connections.is_empty() {
+                anyhow::bail!("目标控制会话没有可用数据通道");
+            }
+            let encoded = encode_ctrl_data_frame(&external_id, &data)?;
+            write_to_available_connection(connections, &encoded).await?;
+            if single_frame {
+                context.complete_kik_single_frame_route(&wire_id).await;
             }
         }
         KikFrame::Ping | KikFrame::Pong => {}
@@ -55,10 +85,7 @@ pub async fn handle_kik_data(
     Ok(())
 }
 
-/// 单个完整帧在首选连接失败后尝试其余连接。
-///
-/// 写失败可能发生在对端已收到完整帧之后，因此文件接收端必须把完全相同的
-/// 区间视为幂等重试；部分重叠仍按协议错误拒绝。
+/// 单帧写失败后尝试其余连接。接收端以区间为幂等键，所以完整帧重试是安全的。
 async fn write_to_available_connection(
     connections: Vec<Arc<Mutex<Channel>>>,
     encoded: &[u8],

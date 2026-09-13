@@ -33,5 +33,5 @@
 - 至少验证错误 SPKI pin、HTTP token、Noise Kik 接入、系统命令、Kik 最近上下线状态、Exec 双层授权、小文件和大文件双向 SHA-256。
 - 性能报告必须包含应用吞吐和独立链路基线，不能把公网带宽上限误报为协议瓶颈。
 - 测试结束必须清理本地进程和远端临时基线文件；失败也必须落结构化报告。
-- artifact 的无环境直启回归使用 `test_direct_artifacts.ps1`；三个 real_ctrl 入口必须顺序测试，
-  避免单活动控制会话相互替换，HTTP 入口还必须通过真实 health 请求证明已完成启动。
+- artifact 的无环境直启回归使用 `test_direct_artifacts.ps1`；HTTP 入口必须通过真实 health 请求证明
+  已完成启动。多实例验收需使用不同锁路径/HTTP 端口，并验证同账号与不同账号的会话不会相互替换。

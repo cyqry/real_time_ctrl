@@ -85,12 +85,19 @@
 
 - `real_ctrl` 的 HTTP 与新版命名管道 API 必须共用稳定契约，不要让协议层直接绕过服务层。
 - 默认本地入口不能暴露公网地址；确需远程 HTTP 访问时必须显式配置 token 和原因。
-- 当前服务端协议只允许一个活动控制命令；HTTP 与管道必须共用同一个命令门禁，忙时返回稳定 `busy` 错误，不能并发消费数据响应。
+- 控制台保持逐条请求/响应；HTTP 与命名管道通过关联 ID 路由并发响应。每个请求必须持有有界许可，
+  独立拥有响应 oneshot 和数据 ID 队列，禁止恢复共享 Receiver 或全局串行门禁。
+- 服务端按账号、实例、Kik 和全局四级配额限制命令并发；同账号不同实例、不同账号不得相互替换会话，
+  同账号同实例重连只替换自身旧会话。
+- 每个控制会话没有当前目标时自动选择最近上线且 ACL 允许的在线 Kik；自动选择不得覆盖显式
+  `sys_use`，当前目标完整下线时需要切换到仍在线的合法候选。
 
 ## 端到端验收
 
-- `ctrl_server`、`ctrl_kik`、`real_ctrl_invoker_http_service` 三实例端到端测试使用 `scripts/e2e_ctrl_stack.ps1`。
+- `ctrl_server`、`ctrl_kik` 与多个 `real_ctrl_invoker_http_service` 实例的端到端测试使用 `scripts/e2e_ctrl_stack.ps1`。
 - 该脚本默认使用本地端口 `9002` / `19443` / `9000`；脚本通过 Cargo 构建期变量生成测试专用 `ctrl_kik`，运行时仍不得覆盖端点或 Noise 公钥。
-- E2E 会通过 HTTP API 验证 `health`、token 拒绝、`sys_list`、`sys_history`、`sys_use`、`sys_now` 和 `ctrl_ls`，并在结束时清理三个进程。
+- E2E 会通过 HTTP API 验证 `health`、token 拒绝、Kik 自动选择、`sys_list`、`sys_history`、`sys_use`、`sys_now` 和 `ctrl_ls`，并在结束时清理全部测试进程。
 - E2E 还必须验证错误 SPKI pin、端口角色隔离、Kik/KikData 只能通过 Noise NK 接入，以及真实 Kik 退出后记录最近下线时间。
+- E2E 必须同时验证同账号多实例、多账号多实例和同一 HTTP 进程的命令乱序响应隔离；用有耗时的
+  独立命令证明请求确实并行，不能只验证多个请求最终都成功。
 - 修改连接读循环时，不要把 `framed_arc.lock().await.next()` 直接放进 `match` 条件里；如果 match 臂内还需要同一个 reader，会被临时值生命周期拖住形成隐式自锁。

@@ -16,6 +16,10 @@ $BuildVariableNames = @(
     "RTC_REAL_CTRL_BUILD_TLS_CA_PEM_BASE64",
     "RTC_REAL_CTRL_BUILD_TLS_SPKI_SHA256",
     "RTC_REAL_CTRL_BUILD_HTTP_LOCK_PATH",
+    "RTC_REAL_CTRL_BUILD_HTTP_BINDING",
+    "RTC_REAL_CTRL_BUILD_HTTP_PORT",
+    "RTC_REAL_CTRL_BUILD_ACCOUNT_ID",
+    "RTC_REAL_CTRL_BUILD_INSTANCE_ID",
     "RTC_REAL_CTRL_BUILD_AUTH_SECRET",
     "RTC_REAL_CTRL_BUILD_API_TOKEN",
     "RTC_REAL_CTRL_BUILD_API_ALLOW_EXEC",
@@ -25,6 +29,7 @@ $BuildVariableNames = @(
     "RTC_CTRL_SERVER_BUILD_TLS_CERT_PEM_BASE64",
     "RTC_CTRL_SERVER_BUILD_TLS_KEY_PEM_BASE64",
     "RTC_CTRL_SERVER_BUILD_AUTH_SECRET",
+    "RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64",
     "RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY",
     "RTC_CTRL_SERVER_BUILD_ALLOW_EXEC"
 )
@@ -58,6 +63,17 @@ try {
     }
     # 该文件由身份生成器创建并收紧 ACL，只在构建进程中加载；生成的 EXE 内仅保留加密值。
     . $CompiledDefaultsPath
+    $AccountSecrets = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64)) {
+        try {
+            $AccountsJson = [Text.Encoding]::UTF8.GetString(
+                [Convert]::FromBase64String($env:RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64)
+            )
+            $AccountSecrets = @($AccountsJson | ConvertFrom-Json | ForEach-Object { $_.secret })
+        } catch {
+            throw "RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64 不是有效的账号 JSON Base64"
+        }
+    }
     $CfgFlag = "-Ccontrol-flow-guard=yes"
     if ([string]::IsNullOrWhiteSpace($PreviousRustFlags)) {
         $env:RUSTFLAGS = $CfgFlag
@@ -92,11 +108,14 @@ try {
 
     foreach ($Artifact in $Artifacts) {
         if ((Split-Path $Artifact -Leaf) -eq "ctrl_server.exe") {
-            Assert-PlaintextAbsent -Path $Artifact -Values @(
+            $ServerSensitiveValues = @(
                 $env:RTC_CTRL_SERVER_BUILD_AUTH_SECRET,
                 $env:RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY,
-                $env:RTC_CTRL_SERVER_BUILD_TLS_KEY_PEM_BASE64
+                $env:RTC_CTRL_SERVER_BUILD_TLS_KEY_PEM_BASE64,
+                $env:RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64
             )
+            $ServerSensitiveValues += $AccountSecrets
+            Assert-PlaintextAbsent -Path $Artifact -Values $ServerSensitiveValues
         } else {
             Assert-PlaintextAbsent -Path $Artifact -Values @(
                 $env:RTC_REAL_CTRL_BUILD_AUTH_SECRET,

@@ -321,6 +321,10 @@ function Build-Stack {
         )
         RTC_REAL_CTRL_BUILD_TLS_SPKI_SHA256 = $Identity.Pin
         RTC_REAL_CTRL_BUILD_HTTP_LOCK_PATH = "real_ctrl-http-$ChannelName.lock"
+        RTC_REAL_CTRL_BUILD_HTTP_BINDING = "127.0.0.1"
+        RTC_REAL_CTRL_BUILD_HTTP_PORT = "9000"
+        RTC_REAL_CTRL_BUILD_ACCOUNT_ID = "default"
+        RTC_REAL_CTRL_BUILD_INSTANCE_ID = ""
         RTC_REAL_CTRL_BUILD_AUTH_SECRET = $Identity.ControlSecret
         RTC_REAL_CTRL_BUILD_API_TOKEN = $Identity.ApiToken
         RTC_REAL_CTRL_BUILD_API_ALLOW_EXEC = "1"
@@ -334,6 +338,7 @@ function Build-Stack {
             [IO.File]::ReadAllBytes($Identity.Key)
         )
         RTC_CTRL_SERVER_BUILD_AUTH_SECRET = $Identity.ControlSecret
+        RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64 = ""
         RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY = $Identity.NoisePrivate
         RTC_CTRL_SERVER_BUILD_ALLOW_EXEC = "1"
     }

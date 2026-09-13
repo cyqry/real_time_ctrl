@@ -47,6 +47,12 @@ fn main() {
         |value| value.len() >= 32 && value.is_ascii(),
     );
     emit_default(
+        "CTRL_SERVER_DEFAULT_ACCOUNTS_JSON_BASE64",
+        "RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64",
+        "",
+        valid_base64,
+    );
+    emit_default(
         "CTRL_SERVER_DEFAULT_KIK_NOISE_PRIVATE_KEY",
         "RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY",
         "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",

@@ -71,7 +71,11 @@ function Start-TestProcess {
             "REAL_CTRL_AUTH_SECRET",
             "REAL_CTRL_API_TOKEN",
             "REAL_CTRL_API_ALLOW_EXEC",
-            "REAL_CTRL_HTTP_LOCK_PATH"
+            "REAL_CTRL_HTTP_LOCK_PATH",
+            "REAL_CTRL_HTTP_BINDING",
+            "REAL_CTRL_HTTP_PORT",
+            "REAL_CTRL_ACCOUNT_ID",
+            "REAL_CTRL_INSTANCE_ID"
         )) {
             [void]$info.Environment.Remove($variable)
         }
@@ -299,6 +303,8 @@ try {
     if ($baseline.ok -and $baseline.data.items) {
         foreach ($item in $baseline.data.items) { $baselineIds[[string]$item.id] = $true }
     }
+    $beforeKikNow = Invoke-ApiCommand @{ kind = "sys_now" } "before-kik-now" $apiToken
+    $hadCurrentKik = $beforeKikNow.ok -and $null -ne $beforeKikNow.data.value.Kik
 
     $kik = Start-TestProcess -Name "ctrl-kik" -Path $KikExe -WorkingDirectory $RunDir -Environment @{}
     $selected = $null
@@ -320,11 +326,32 @@ try {
     }
     $result.assertions += "sys_history 返回最近上线时间与在线状态"
 
+    if (-not $hadCurrentKik) {
+        $autoNow = Invoke-ApiCommand @{ kind = "sys_now" } "auto-now" $apiToken
+        if (-not ($autoNow.ok -and [string]$autoNow.data.value.Kik.id -eq $kikId)) {
+            throw "无当前目标时，新上线 Kik 未被自动选择"
+        }
+        $result.assertions += "无当前目标时自动选择新上线 Kik"
+    }
+
     $use = Invoke-ApiCommand @{ kind = "sys_use"; kik_id = $kikId } "use" $apiToken
     if (-not $use.ok) { throw "sys_use 失败: $($use.error.message)" }
     $now = Invoke-ApiCommand @{ kind = "sys_now" } "now" $apiToken
     if (-not $now.ok) { throw "sys_now 失败: $($now.error.message)" }
     $result.assertions += "sys_list/sys_use/sys_now 通过"
+
+    $missingRemote = Join-Path $RunDir "missing-download-source.bin"
+    $missingLocal = Join-Path $RunDir "missing-download-target.bin"
+    Remove-Item -LiteralPath $missingRemote, $missingLocal -Force -ErrorAction SilentlyContinue
+    $missingDownload = Invoke-ApiCommand @{
+        kind = "ctrl_get_file"
+        remote_path = $missingRemote
+        local_path = $missingLocal
+    } "missing-download" $apiToken
+    if ($missingDownload.ok -or $missingDownload.error.message -match "不匹配的数据关联 ID") {
+        throw "被控端文件读取错误被错误映射成数据关联 ID 不匹配"
+    }
+    $result.assertions += "文件读取业务错误保留真实原因且释放数据路由"
 
     $listPath = Join-Path $RunDir "list-marker.txt"
     [IO.File]::WriteAllText($listPath, "public e2e", [Text.UTF8Encoding]::new($false))

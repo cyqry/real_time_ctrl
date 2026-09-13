@@ -1,3 +1,4 @@
+use crate::context::ResponseRouter;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
 use common::config::Config;
@@ -19,7 +20,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::Mutex;
 use tokio::time::{self, timeout};
 use tokio_stream::StreamExt;
@@ -34,9 +35,19 @@ enum AuthPhase {
     Authenticated,
 }
 
-pub async fn ctrl_conn(
+struct ControlReadContext {
+    auth_secret: String,
+    account_id: String,
+    instance_id: String,
+    client_nonce: String,
+    auth_phase: AuthPhase,
+    responses: ResponseRouter,
+}
+
+pub(crate) async fn ctrl_conn(
     config: &Config,
-) -> anyhow::Result<(Arc<Mutex<Channel>>, Receiver<CmdResp>, Option<String>)> {
+    responses: ResponseRouter,
+) -> anyhow::Result<(Arc<Mutex<Channel>>, Option<String>)> {
     let parts = connect_real_ctrl(config).await?;
     // 控制通道只承载命令和响应，使用较小帧上限避免异常输入占用过多内存。
     let framed_read = FramedRead::new(
@@ -59,16 +70,23 @@ pub async fn ctrl_conn(
     let channel = channel_arc.clone();
     let client_nonce = random_nonce_hex();
     let auth_secret = config.id.control_plane_secret().to_string();
+    let account_id = config.id.account_id().to_string();
+    let instance_id = config.id.instance_id().to_string();
     let read_timeout = config.read_timeout;
-    let mut auth_phase = AuthPhase::AwaitingChallenge;
     e2e_trace("ctrl_conn: connected transport");
-    handle_active(&client_nonce, channel.clone()).await?;
+    handle_active(&account_id, &instance_id, &client_nonce, channel.clone()).await?;
     e2e_trace("ctrl_conn: sent auth start");
 
     let (mut tx, mut rx) = mpsc::channel::<CmdResp>(5);
     tokio::spawn(async move {
-        let client_nonce = client_nonce;
-        let auth_secret = auth_secret;
+        let mut read_context = ControlReadContext {
+            auth_secret,
+            account_id,
+            instance_id,
+            client_nonce,
+            auth_phase: AuthPhase::AwaitingChallenge,
+            responses,
+        };
         let chan = channel.clone();
         tokio::spawn(async move {
             heartbeat(chan).await;
@@ -84,16 +102,9 @@ pub async fn ctrl_conn(
             match read_result {
                 Ok(Some(Ok(msg))) => {
                     let channel = channel.clone();
-                    if handle_read(
-                        channel.clone(),
-                        msg,
-                        &mut tx,
-                        &auth_secret,
-                        &client_nonce,
-                        &mut auth_phase,
-                    )
-                    .await
-                    .is_none()
+                    if handle_read(channel.clone(), msg, &mut tx, &mut read_context)
+                        .await
+                        .is_none()
                     {
                         debug!("控制连接读取处理失败");
                         break;
@@ -122,8 +133,8 @@ pub async fn ctrl_conn(
             };
         }
 
-        let chan = channel.clone();
-        tokio::spawn(async move { handle_inactive(chan).await });
+        handle_inactive(channel.clone()).await;
+        read_context.responses.fail_all().await;
     });
 
     // 第一次响应只用于控制通道鉴权确认，后续 rx 才承载业务响应。
@@ -143,7 +154,7 @@ pub async fn ctrl_conn(
     };
 
     debug!("控制连接校验成功");
-    Ok((channel_arc, rx, session_id))
+    Ok((channel_arc, session_id))
 }
 
 async fn heartbeat(channel: Arc<Mutex<Channel>>) {
@@ -159,8 +170,17 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     }
 }
 
-async fn handle_active(client_nonce: &str, channel: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
-    let frame = InitFrame::CtrlAuthStart(client_nonce.to_string());
+async fn handle_active(
+    account_id: &str,
+    instance_id: &str,
+    client_nonce: &str,
+    channel: Arc<Mutex<Channel>>,
+) -> anyhow::Result<()> {
+    let frame = InitFrame::CtrlAuthStart {
+        account_id: account_id.to_string(),
+        instance_id: instance_id.to_string(),
+        client_nonce: client_nonce.to_string(),
+    };
     channel
         .lock()
         .await
@@ -179,9 +199,7 @@ async fn handle_read(
     channel: Arc<Mutex<Channel>>,
     msg: BytesMut,
     tx: &mut Sender<CmdResp>,
-    auth_secret: &str,
-    client_nonce: &str,
-    auth_phase: &mut AuthPhase,
+    context: &mut ControlReadContext,
 ) -> Option<()> {
     let channel_type = channel.lock().await.channel_type;
     if channel_type == ChannelType::Unknown {
@@ -189,29 +207,35 @@ async fn handle_read(
         match frame {
             InitFrame::CtrlAuthChallenge(server_nonce) => {
                 e2e_trace("ctrl_conn: received auth challenge");
-                if *auth_phase != AuthPhase::AwaitingChallenge {
+                if context.auth_phase != AuthPhase::AwaitingChallenge {
                     return None;
                 }
-                let proof = ctrl_auth_proof(auth_secret, client_nonce, &server_nonce);
+                let proof = ctrl_auth_proof(
+                    &context.auth_secret,
+                    &context.account_id,
+                    &context.instance_id,
+                    &context.client_nonce,
+                    &server_nonce,
+                );
                 channel
                     .lock()
                     .await
                     .write_and_flush(&protocol::transfer_encode_frame(InitFrame::CtrlAuthProof {
-                        client_nonce: client_nonce.to_string(),
+                        client_nonce: context.client_nonce.clone(),
                         proof,
                     }))
                     .await
                     .ok()?;
-                *auth_phase = AuthPhase::AwaitingSession;
+                context.auth_phase = AuthPhase::AwaitingSession;
                 e2e_trace("ctrl_conn: sent auth proof");
             }
             InitFrame::CtrlAuthSession(session_id) => {
-                if *auth_phase != AuthPhase::AwaitingSession {
+                if context.auth_phase != AuthPhase::AwaitingSession {
                     return None;
                 }
                 e2e_trace("ctrl_conn: received auth session");
                 channel.lock().await.channel_type = ChannelType::Ctrl;
-                *auth_phase = AuthPhase::Authenticated;
+                context.auth_phase = AuthPhase::Authenticated;
                 tx.send(CmdResp::new(
                     "##cmdId".to_string(),
                     Server(ServerResp::Success(ServerSuccessResp::Info(format!(
@@ -228,7 +252,7 @@ async fn handle_read(
         let frame = Frame::from_buf(msg)?;
         match frame {
             Frame::Resp(resp) => {
-                tx.send(resp).await.ok()?;
+                context.responses.deliver(resp).await;
             }
             Frame::Ping | Frame::Pong => {}
             f => {

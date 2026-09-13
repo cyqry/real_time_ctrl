@@ -86,14 +86,14 @@ pub async fn execute(
         }
         Resp::Kik(KikResp::Success(ClientSuccessResp::DataId(data_id))) => {
             if return_raw_data {
-                let v = context
-                    .wait_data(data_id.as_str())
-                    .await
-                    .context("获取数据失败")?;
+                let result = context.wait_data(data_id.as_str()).await;
+                context.finish_data_route(data_id).await;
+                let v = result.context("获取数据失败")?;
                 Ok(RemoteResp::SuccessData(v.to_vec()))
             } else {
-                let ok_info =
-                    process_ctrl_cmd_data_id_resp(context, input_ctrl_cmd, data_id).await?;
+                let result = process_ctrl_cmd_data_id_resp(context, input_ctrl_cmd, data_id).await;
+                context.finish_data_route(data_id).await;
+                let ok_info = result?;
                 Ok(RemoteResp::Success(RemoteSuccessResp::Info(ok_info)))
             }
         }
@@ -103,7 +103,9 @@ pub async fn execute(
             hash,
         })) => match input_ctrl_cmd {
             InputCtrlCommand::GetBigFile(_, save_path) => {
-                receive_big_file(context, data_id, &save_path, *total, hash).await?;
+                let result = receive_big_file(context, data_id, &save_path, *total, hash).await;
+                context.finish_data_route(data_id).await;
+                result?;
                 Ok(RemoteResp::Success(RemoteSuccessResp::Info(format!(
                     "保存大文件至:{save_path}"
                 ))))

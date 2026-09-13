@@ -38,23 +38,50 @@ pub fn verify_hmac_sha256_hex(secret: &str, parts: &[&str], expected_hex: &str) 
     mac.verify_slice(&expected).is_ok()
 }
 
-pub fn ctrl_auth_proof(secret: &str, client_nonce: &str, server_nonce: &str) -> String {
-    let label = hidden!("real_ctrl.auth.v3");
-    hmac_sha256_hex(secret, &[label.as_str(), client_nonce, server_nonce])
+pub fn ctrl_auth_proof(
+    secret: &str,
+    account_id: &str,
+    instance_id: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+) -> String {
+    let label = hidden!("real_ctrl.auth.v4");
+    hmac_sha256_hex(
+        secret,
+        &[
+            label.as_str(),
+            account_id,
+            instance_id,
+            client_nonce,
+            server_nonce,
+        ],
+    )
 }
 
 pub fn verify_ctrl_auth_proof(
     secret: &str,
+    account_id: &str,
+    instance_id: &str,
     client_nonce: &str,
     server_nonce: &str,
     proof: &str,
 ) -> bool {
-    let label = hidden!("real_ctrl.auth.v3");
-    verify_hmac_sha256_hex(secret, &[label.as_str(), client_nonce, server_nonce], proof)
+    let label = hidden!("real_ctrl.auth.v4");
+    verify_hmac_sha256_hex(
+        secret,
+        &[
+            label.as_str(),
+            account_id,
+            instance_id,
+            client_nonce,
+            server_nonce,
+        ],
+        proof,
+    )
 }
 
 pub fn ctrl_data_proof(secret: &str, session_id: &str, channel_nonce: &str) -> String {
-    let label = hidden!("real_ctrl.data.v3");
+    let label = hidden!("real_ctrl.data.v4");
     hmac_sha256_hex(secret, &[label.as_str(), session_id, channel_nonce])
 }
 
@@ -64,7 +91,7 @@ pub fn verify_ctrl_data_proof(
     channel_nonce: &str,
     proof: &str,
 ) -> bool {
-    let label = hidden!("real_ctrl.data.v3");
+    let label = hidden!("real_ctrl.data.v4");
     verify_hmac_sha256_hex(secret, &[label.as_str(), session_id, channel_nonce], proof)
 }
 
@@ -83,10 +110,12 @@ mod tests {
 
     #[test]
     fn auth_proof_round_trip() {
-        let proof = ctrl_auth_proof("secret", "client", "server");
-        assert!(verify_ctrl_auth_proof("secret", "client", "server", &proof));
+        let proof = ctrl_auth_proof("secret", "account", "instance", "client", "server");
+        assert!(verify_ctrl_auth_proof(
+            "secret", "account", "instance", "client", "server", &proof
+        ));
         assert!(!verify_ctrl_auth_proof(
-            "secret", "client2", "server", &proof
+            "secret", "account", "instance", "client2", "server", &proof
         ));
     }
 

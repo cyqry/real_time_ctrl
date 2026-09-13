@@ -25,7 +25,11 @@ pub enum InitFrame {
     KikDataConn(bool),
 
     // TLS 内使用 nonce + HMAC，避免长期认证秘密直接过线。
-    CtrlAuthStart(String),
+    CtrlAuthStart {
+        account_id: String,
+        instance_id: String,
+        client_nonce: String,
+    },
     CtrlAuthChallenge(String),
     CtrlAuthProof {
         client_nonce: String,
@@ -55,9 +59,11 @@ impl BufSerializable for InitFrame {
             InitFrame::KikId(id) => single_string_frame(KIK_ID, id),
             InitFrame::KikDataConnReq(id) => single_string_frame(KIK_DATA_REQ, id),
             InitFrame::KikDataConn(success) => bool_frame(KIK_DATA_REPLY, *success),
-            InitFrame::CtrlAuthStart(client_nonce) => {
-                single_string_frame(CTRL_AUTH_START, client_nonce)
-            }
+            InitFrame::CtrlAuthStart {
+                account_id,
+                instance_id,
+                client_nonce,
+            } => multi_string_frame(CTRL_AUTH_START, &[account_id, instance_id, client_nonce]),
             InitFrame::CtrlAuthChallenge(server_nonce) => {
                 single_string_frame(CTRL_AUTH_CHALLENGE, server_nonce)
             }
@@ -101,11 +107,19 @@ impl BufSerializable for InitFrame {
                 false,
             )?)),
             KIK_DATA_REPLY => Some(InitFrame::KikDataConn(read_bool(&mut bys)?)),
-            CTRL_AUTH_START => Some(InitFrame::CtrlAuthStart(read_exact_string(
-                &mut bys,
-                MAX_AUTH_FIELD_BYTES,
-                false,
-            )?)),
+            CTRL_AUTH_START => {
+                let account_id = read_one_string(&mut bys)?;
+                let instance_id = read_one_string(&mut bys)?;
+                let client_nonce = read_one_string(&mut bys)?;
+                if bys.has_remaining() {
+                    return None;
+                }
+                Some(InitFrame::CtrlAuthStart {
+                    account_id,
+                    instance_id,
+                    client_nonce,
+                })
+            }
             CTRL_AUTH_CHALLENGE => Some(InitFrame::CtrlAuthChallenge(read_exact_string(
                 &mut bys,
                 MAX_AUTH_FIELD_BYTES,
@@ -240,7 +254,11 @@ mod tests {
 
     #[test]
     fn ctrl_auth_frames_round_trip() {
-        assert_round_trip(InitFrame::CtrlAuthStart("client_nonce".to_string()));
+        assert_round_trip(InitFrame::CtrlAuthStart {
+            account_id: "account".to_string(),
+            instance_id: "instance".to_string(),
+            client_nonce: "client_nonce".to_string(),
+        });
         assert_round_trip(InitFrame::CtrlAuthChallenge("server_nonce".to_string()));
         assert_round_trip(InitFrame::CtrlAuthProof {
             client_nonce: "client_nonce".to_string(),
@@ -268,7 +286,12 @@ mod tests {
 
     #[test]
     fn ctrl_auth_rejects_trailing_bytes() {
-        let mut buf = InitFrame::CtrlAuthStart("client".to_string()).to_buf();
+        let mut buf = InitFrame::CtrlAuthStart {
+            account_id: "account".to_string(),
+            instance_id: "instance".to_string(),
+            client_nonce: "client".to_string(),
+        }
+        .to_buf();
         buf.put_u8(99);
 
         assert!(InitFrame::from_buf(buf).is_none());

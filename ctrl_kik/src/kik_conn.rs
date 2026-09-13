@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::timeout;
@@ -187,12 +187,20 @@ async fn handle_active(
             },
         )))
         .await?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, CmdOptions, Command)>(8);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, CmdOptions, Command)>(32);
     channel.lock().await.insert_attribute(&COMMAND_SENDER, tx);
     // Sender 绑定在连接属性上；主连接释放后发送端全部销毁，任务会自然退出。
     tokio::spawn(async move {
+        let limit = Arc::new(Semaphore::new(16));
         while let Some((cmd_id, cmd_options, cmd)) = rx.recv().await {
-            read_handle::handle_kik_cmd(context.clone(), &channel, cmd_id, cmd_options, cmd).await;
+            let Ok(permit) = limit.clone().acquire_owned().await else {
+                break;
+            };
+            let (context, channel) = (context.clone(), channel.clone());
+            tokio::spawn(async move {
+                let _permit = permit;
+                read_handle::handle_kik_cmd(context, &channel, cmd_id, cmd_options, cmd).await;
+            });
         }
     });
     Ok(())

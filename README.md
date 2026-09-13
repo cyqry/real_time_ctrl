@@ -1,7 +1,10 @@
 # real_time_ctrl
 
-Windows 被控端、Windows 控制端与 Linux 中继服务组成的远程控制项目。当前协议为 v3：
+Windows 被控端、Windows 控制端与 Linux 中继服务组成的远程控制项目。当前协议为 v4：
 `ctrl_kik` 使用 Noise NK，`real_ctrl` 使用 pinned TLS 1.3，控制与数据均不允许明文降级。
+
+服务端支持多账号、同账号多控制实例和独立命令并行。交互控制台仍逐条请求/响应；HTTP API
+最多并行 32 个请求，通过命令与数据关联 ID 隔离乱序响应。账号 ACL 和并发配额由服务端统一执行。
 
 ## 一键灰度发布
 
@@ -19,7 +22,7 @@ Windows 被控端、Windows 控制端与 Linux 中继服务组成的远程控制
 - `real_ctrl_invoker_http_service.exe`：HTTP 与命名管道组合服务；
 - `ctrl_kik.exe`：被控端。
 
-地址、端口、TLS PEM、SPKI pin、控制认证秘密、API token 和 Exec 策略由 `build.rs` 接收
+地址、端口、HTTP 监听、账号/实例、TLS PEM、SPKI pin、控制认证秘密、API token 和 Exec 策略由 `build.rs` 接收
 `RTC_*_BUILD_*` 并以混淆密文写入发布产物；同名运行环境变量优先，可用于轮换和应急切换。
 这种设计消除了 sidecar 和启动脚本，但不能阻止有能力的攻击者动态提取进程内秘密。
 

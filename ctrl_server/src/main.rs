@@ -2,6 +2,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use common::config::{Config, Id, SecurityConfig};
 use common::hidden;
+use core::account::AccountRegistry;
 use core::context::Context;
 use core::server;
 use std::env;
@@ -65,13 +66,19 @@ async fn main() -> anyhow::Result<()> {
     security.allow_remote_exec = env_bool("CTRL_SERVER_ALLOW_EXEC")
         .unwrap_or_else(|| parse_bool(&hidden!(env!("CTRL_SERVER_DEFAULT_ALLOW_EXEC"))));
 
+    let default_secret = env::var("CTRL_SERVER_AUTH_SECRET")
+        .unwrap_or_else(|_| hidden!(env!("CTRL_SERVER_DEFAULT_AUTH_SECRET")));
+    let accounts_json = match env_optional("CTRL_SERVER_ACCOUNTS_JSON_BASE64") {
+        Some(value) => decode_optional_base64(&value)?,
+        None => decode_optional_base64(&hidden!(env!("CTRL_SERVER_DEFAULT_ACCOUNTS_JSON_BASE64")))?,
+    };
+    let accounts = AccountRegistry::from_json_or_default(accounts_json.as_deref(), default_secret)?;
+
     server::run(
-        Context::init(),
+        Context::init_with_accounts(accounts),
         Config {
-            id: Id::control_plane_from_env_or(
-                "CTRL_SERVER_AUTH_SECRET",
-                hidden!(env!("CTRL_SERVER_DEFAULT_AUTH_SECRET")),
-            )?,
+            // 服务端认证材料由 AccountRegistry 持有，通用 Config 不再承载租户秘密。
+            id: Id::anonymous(),
             server_host: bind_host,
             server_port,
             read_timeout: Duration::from_secs(45),
