@@ -1,3 +1,8 @@
+//! Kik 执行命令后的响应模型。
+//!
+//! 小文件/截图成功时返回数据 ID；大文件下载返回数据 ID、总长度和 SHA-256 元数据。真实文件内容
+//! 始终走 KikData，不会塞进控制响应。
+
 use crate::protocol;
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};

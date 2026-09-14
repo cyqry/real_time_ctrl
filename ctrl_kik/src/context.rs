@@ -1,3 +1,8 @@
+//! ctrl_kik 单进程内的主连接、数据连接和按数据 ID 隔离的收件箱。
+//!
+//! 控制命令与文件数据来自不同 TCP/Noise 连接，先后顺序没有保证。`Context` 因此允许数据先有界
+//! 预登记，命令到达后再认领；每个 ID 使用自己的容量受限队列，避免并行上传串流。
+
 use anyhow::Context as AnyhowContext;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelAttributeKey};
@@ -26,24 +31,37 @@ pub(crate) const COMMAND_SENDER: ChannelAttributeKey<Sender<CommandMessage>> =
     ChannelAttributeKey::new(0x6b69_6b5f_636d_6473);
 
 #[derive(Clone)]
+/// 当前 Kik 生命周期共享的状态；主连接断开时整体清空。
 pub struct Context {
+    /// 服务端分配的 Kik ID，数据连接初始化时需要读取。
     pub id: Arc<Mutex<Option<String>>>,
+    /// 当前主会话及其数据连接池。
     kik_op: Arc<Mutex<Option<Kik>>>,
+    /// 上传数据 ID 到私有队列的映射。
     data_routes: Arc<Mutex<HashMap<String, DataChan>>>,
 }
 
+/// 一个数据 ID 的有界收件箱。
 struct DataChan {
+    /// KikData 读循环持有的生产端。
     tx: Sender<(String, BytesMut)>,
+    /// 唯一命令任务持有的消费端。
     rx: Arc<Mutex<Receiver<(String, BytesMut)>>>,
+    /// false 表示数据先于命令到达，只能在短 TTL 和总内存上限内暂存。
     registered: bool,
     created_at: Instant,
+    /// 未注册阶段累计的 payload 大小，认领后归零。
     pre_registered_bytes: usize,
 }
 
 #[derive(Clone)]
+/// 一条 Kik 主连接及其多条 KikData 连接。
 pub struct Kik {
+    /// 主连接；清理时先从 Option 移出，再在锁外关闭。
     pub conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
+    /// 连接自身随机 ID 到写半连接的映射。
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
+    /// 多连接发送的轮询游标，不参与授权。
     next_data_conn: Arc<AtomicUsize>,
 }
 
@@ -127,6 +145,7 @@ impl Context {
         self.kik_op.lock().await.clone()
     }
 
+    /// 投递一帧上传数据；不存在路由时创建严格受限的预登记收件箱。
     pub async fn send_data(&self, op: (String, BytesMut)) -> anyhow::Result<()> {
         let (sender, cleanup) = {
             let mut routes = self.data_routes.lock().await;
@@ -197,6 +216,7 @@ impl Context {
         Ok(())
     }
 
+    /// 从已认领的数据 ID 收件箱读取下一帧，供小文件或大文件循环消费。
     pub async fn read_data(&self, key: &str) -> anyhow::Result<BytesMut> {
         let receiver = self
             .data_routes
@@ -221,6 +241,7 @@ impl Context {
 
     /// 命令通道与数据通道是独立 TCP 流，公网中数据帧可能合法地先到达。此处把短期预到达
     /// 路由升级为已登记路由；预到达数量、总字节数和存活时间均有硬上限。
+    /// 命令到达时认领或创建数据 ID；重复活动命令使用同一 ID 会被拒绝。
     pub async fn register_data_route(&self, key: &str) -> anyhow::Result<()> {
         let mut routes = self.data_routes.lock().await;
         if let Some(route) = routes.get_mut(key) {
@@ -278,6 +299,7 @@ impl Context {
         }
     }
 
+    /// 将下载 payload 编成完整帧，并在数据连接快照内轮询/失败换路。
     pub async fn send_data_with_id(&self, data_id: &str, data: &[u8]) -> anyhow::Result<()> {
         let encoded = encode_data_frame(data_id, data)?;
         let kik = self

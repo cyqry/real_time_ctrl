@@ -1,3 +1,7 @@
+//! Exec 命令适配器。
+//!
+//! 这里只负责构造线上命令和解释响应；是否允许 Exec 由开放 API 策略与 ctrl_server 策略两层决定。
+
 use crate::context::{id, Context};
 use crate::input_command::{RemoteResp, RemoteSuccessResp};
 use common::command::Command;

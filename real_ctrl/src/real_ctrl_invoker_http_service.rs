@@ -1,5 +1,9 @@
 #![windows_subsystem = "windows"]
 
+//! 同时提供本地 HTTP 与 Windows 命名管道 API 的进程入口。
+//!
+//! 两种入口共享同一个 `Context` 和 `RealCtrlApi`，因此并发门禁、Exec 策略、连接状态与错误映射一致。
+
 use anyhow::Result;
 use chrono::Local;
 use log::error;

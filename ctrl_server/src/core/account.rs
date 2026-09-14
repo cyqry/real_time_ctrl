@@ -1,3 +1,8 @@
+//! 多账号配置、Kik ACL 和账号级并发策略。
+//!
+//! 配置只在启动时解析为不可变 `AccountRegistry`。账号间不共享 secret 或命令许可；克隆策略只克隆
+//! `Arc`，因此同账号的所有会话共同受到账号级信号量约束。
+
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,9 +15,11 @@ const MAX_ACCOUNTS: usize = 256;
 const MAX_ALLOWED_KIKS: usize = 1024;
 
 #[derive(Clone)]
+/// 启动后只读的账号索引。
 pub struct AccountRegistry(Arc<HashMap<String, AccountPolicy>>);
 
 #[derive(Clone)]
+/// 一个账号的认证材料、ACL 和资源配额。
 pub struct AccountPolicy {
     pub secret: Arc<str>,
     pub max_instances: usize,
@@ -150,5 +157,29 @@ mod tests {
         let policy = registry.get("tenant_a").unwrap();
         assert!(policy.allows_kik(&kik));
         assert!(!policy.allows_kik(&uuid::Uuid::new_v4().to_string()));
+    }
+
+    #[test]
+    fn hostile_account_configuration_is_rejected_fail_closed() {
+        let cases = [
+            // 未知字段不能被静默忽略，否则运维拼错安全配置时会以意外默认值启动。
+            r#"[{"account_id":"a","secret":"01234567890123456789012345678901","unknown":true}]"#,
+            r#"[{"account_id":"a","secret":"too-short"}]"#,
+            r#"[{"account_id":"../a","secret":"01234567890123456789012345678901"}]"#,
+            r#"[{"account_id":"a","secret":"01234567890123456789012345678901","max_instances":0}]"#,
+            r#"[{"account_id":"a","secret":"01234567890123456789012345678901","max_commands_per_instance":65}]"#,
+            r#"[{"account_id":"a","secret":"01234567890123456789012345678901","allowed_kiks":["not-a-uuid"]}]"#,
+            r#"[
+                {"account_id":"a","secret":"01234567890123456789012345678901"},
+                {"account_id":"a","secret":"abcdefghijabcdefghijabcdefghijab"}
+            ]"#,
+        ];
+
+        for json in cases {
+            assert!(
+                AccountRegistry::from_json_or_default(Some(json), String::new()).is_err(),
+                "不安全的账号配置被接受: {json}"
+            );
+        }
     }
 }

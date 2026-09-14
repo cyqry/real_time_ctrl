@@ -1,3 +1,8 @@
+//! TCP 字节流上的长度前缀解码器。
+//!
+//! TCP 可能拆包或粘包，`decode` 因此会记住已经读到的 body 长度，直到完整帧到齐才返回。
+//! 解码器只负责划分帧和限制内存，不负责 TLS/Noise 解密或业务消息解析。
+
 use bytes::{Buf, BytesMut};
 use std::io::{Error, ErrorKind};
 use tokio_util::codec::Decoder;
@@ -14,6 +19,7 @@ pub const DATA_MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024 + 64 * 1024;
 /// 未识别连接在握手后会切换到明确上限；默认值仅供尚未分型的通用调用点使用。
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = DATA_MAX_FRAME_LENGTH;
 
+/// 可在握手完成后切换最大帧长度的有状态解码器。
 pub struct LengthFieldBasedFrameDecoder {
     pub current_len: Option<usize>,
     max_frame_len: usize,

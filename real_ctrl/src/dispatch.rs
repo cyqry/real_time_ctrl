@@ -1,9 +1,15 @@
+//! 控制台和开放 API 共用的业务命令分派。
+//!
+//! `distribution` 把结果格式化成人类可读文本；`distribution_other` 保留结构化 `RemoteResp` 给 HTTP/管道。
+//! 两者最终调用相同 executor，避免三种入口出现不同的远程行为。
+
 use crate::context::Context;
 use crate::input_command::{InputCommand, RemoteResp, RemoteSuccessResp};
 use crate::{ctrl_executor, direct_executor, local_executor, server_executor};
 use common::message::kik_cmd_resp_info;
 use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
 
+/// CLI 分派入口：串行执行并把结构化结果格式化为终端文本。
 pub async fn distribution(context: &Context, command: InputCommand) -> anyhow::Result<String> {
     match command {
         InputCommand::Sys(sys) => match server_executor::execute(context, sys).await? {
@@ -150,6 +156,7 @@ fn format_ls(data: &Vec<kik_cmd_resp_info::Ls>) -> String {
     res
 }
 
+/// 开放 API 分派入口：保留结构化响应和原始小二进制数据。
 pub async fn distribution_other(
     context: &Context,
     command: InputCommand,

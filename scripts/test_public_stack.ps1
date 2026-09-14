@@ -6,6 +6,7 @@
 )
 
 $ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Net.Http
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ChannelName = $Channel.ToLowerInvariant()
@@ -148,6 +149,126 @@ function Invoke-ApiCommand {
         -Headers @{ Authorization = "Bearer $Token" } -ContentType "application/json" -Body $body
 }
 
+function Invoke-ParallelApiCommands {
+    param(
+        [hashtable[]]$Commands,
+        [string]$Token,
+        [string]$RequestIdPrefix,
+        [int]$TimeoutMilliseconds = 20000
+    )
+    $client = [Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Authorization =
+        [Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $Token)
+    $tasks = [Collections.Generic.List[Threading.Tasks.Task[Net.Http.HttpResponseMessage]]]::new()
+    try {
+        for ($index = 0; $index -lt $Commands.Count; $index++) {
+            $body = @{
+                version = 1
+                request_id = "$RequestIdPrefix-$index"
+                command = $Commands[$index]
+            } | ConvertTo-Json -Depth 12 -Compress
+            $content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, "application/json")
+            $tasks.Add($client.PostAsync("http://127.0.0.1:$HttpPort/api/v1/commands", $content))
+        }
+        if (-not [Threading.Tasks.Task]::WaitAll(
+            [Threading.Tasks.Task[]]$tasks.ToArray(),
+            $TimeoutMilliseconds
+        )) {
+            throw "公网并发 API 请求超时"
+        }
+        @($tasks | ForEach-Object {
+            $response = $_.Result
+            $body = $response.Content.ReadAsStringAsync().Result
+            if (-not $response.IsSuccessStatusCode) {
+                throw "公网并发 API 返回 HTTP $([int]$response.StatusCode): $body"
+            }
+            $body | ConvertFrom-Json
+        })
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Invoke-RawHttpRequest {
+    param(
+        [string]$Method,
+        [string]$Path,
+        [string]$Body = $null,
+        [hashtable]$Headers = @{},
+        [switch]$AllowTransportRejection
+    )
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(15)
+    $request = [Net.Http.HttpRequestMessage]::new(
+        [Net.Http.HttpMethod]::new($Method),
+        "http://127.0.0.1:$HttpPort$Path"
+    )
+    try {
+        foreach ($entry in $Headers.GetEnumerator()) {
+            $request.Headers.TryAddWithoutValidation($entry.Key, [string]$entry.Value) | Out-Null
+        }
+        if ($null -ne $Body) {
+            $request.Content = [Net.Http.StringContent]::new(
+                $Body,
+                [Text.Encoding]::UTF8,
+                "application/json"
+            )
+        }
+        try {
+            $response = $client.SendAsync($request).GetAwaiter().GetResult()
+            $rawResult = [pscustomobject]@{
+                Status = [int]$response.StatusCode
+                Body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                RejectedByDisconnect = $false
+            }
+            $response.Dispose()
+            $rawResult
+        } catch {
+            $cursor = $_.Exception
+            $transportFailure = $false
+            while ($cursor) {
+                if ($cursor -is [Net.Http.HttpRequestException] -or
+                    $cursor -is [Net.Sockets.SocketException]) {
+                    $transportFailure = $true
+                }
+                $cursor = $cursor.InnerException
+            }
+            if (-not $AllowTransportRejection -or -not $transportFailure) {
+                throw
+            }
+            # PayloadLimit 可在接收完整 body 前直接复位连接，避免继续消耗带宽和解析 CPU。
+            # 这与 413 都是安全拒绝；调用方随后仍必须验证健康探针。
+            [pscustomobject]@{
+                Status = 0
+                Body = ""
+                RejectedByDisconnect = $true
+            }
+        }
+    } finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Send-RawTcpProbe {
+    param([string]$HostName, [int]$Port, [byte[]]$Payload)
+    $client = [Net.Sockets.TcpClient]::new()
+    try {
+        $task = $client.ConnectAsync($HostName, $Port)
+        if (-not $task.Wait(3000) -or -not $client.Connected) {
+            throw "连接公网探针端口 ${HostName}:$Port 失败"
+        }
+        $stream = $client.GetStream()
+        $stream.Write($Payload, 0, $Payload.Length)
+        $stream.Flush()
+    } finally {
+        $client.Dispose()
+    }
+}
+
 function Convert-Environment {
     param($Object)
     $map = @{}
@@ -274,6 +395,34 @@ try {
     Wait-TcpPort $environment["REAL_CTRL_SERVER_HOST"] $ExpectedControlTlsPort 15
     $result.assertions += "Kik Noise 与 real_ctrl TLS 双公网端口可达"
 
+    [byte[]]$plainProbe = [Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.1`r`nHost: probe`r`n`r`n")
+    [byte[]]$noiseProbe = @(0x7F, 0xFF, 0xFF, 0xFF, 0x52, 0x54, 0x43, 0x54)
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        Send-RawTcpProbe $environment["REAL_CTRL_SERVER_HOST"] $ExpectedControlTlsPort $plainProbe
+        Send-RawTcpProbe $environment["REAL_CTRL_SERVER_HOST"] $ExpectedKikNoisePort $noiseProbe
+    }
+    Start-Sleep -Milliseconds 500
+    Wait-TcpPort $environment["REAL_CTRL_SERVER_HOST"] $ExpectedControlTlsPort 10
+    Wait-TcpPort $environment["REAL_CTRL_SERVER_HOST"] $ExpectedKikNoisePort 10
+    $result.assertions += "公网端口拒绝有界明文/畸形握手后保持可用"
+
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $tls12Output = "" | & openssl s_client `
+            -tls1_2 `
+            -connect "$($environment["REAL_CTRL_SERVER_HOST"]):$ExpectedControlTlsPort" `
+            -servername $environment["REAL_CTRL_TLS_SERVER_NAME"] `
+            -brief `
+            2>&1
+        $tls12ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+    $tls12Output | Set-Content -LiteralPath (Join-Path $LogDir "public-tls12-rejection.log") -Encoding UTF8
+    if ($tls12ExitCode -eq 0) { throw "公网管理端口意外接受 TLS 1.2" }
+    $result.assertions += "公网控制面仅协商 TLS 1.3"
+
     # 先验证控制端确实执行 pin 校验，再启动长期 HTTP 实例。
     Test-WrongPinRejected
     $result.assertions += "错误 SPKI pin 被拒绝"
@@ -296,7 +445,45 @@ try {
         $unauthorized = ([int]$_.Exception.Response.StatusCode -eq 401)
     }
     if (-not $unauthorized) { throw "HTTP API 未拒绝无 token 请求" }
+    $unauthorizedMalformed = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body '{"version":1,"command":'
+    if ($unauthorizedMalformed.Status -ne 401) {
+        throw "发布态 HTTP 未在解析畸形 JSON 前完成鉴权"
+    }
     $result.assertions += "HTTP API token 门禁通过"
+
+    $authorizedHeaders = @{ Authorization = "Bearer $apiToken" }
+    $malformedBodies = @(
+        '{"version":1,"command":',
+        '{"version":1,"request_id":"unknown","command":{"kind":"not_a_command"}}',
+        '{"version":1,"request_id":"unknown-field","command":{"kind":"sys_now","typo":true}}'
+    )
+    foreach ($malformed in $malformedBodies) {
+        $malformedResponse = Invoke-RawHttpRequest `
+            -Method "POST" `
+            -Path "/api/v1/commands" `
+            -Headers $authorizedHeaders `
+            -Body $malformed
+        if ($malformedResponse.Status -lt 400 -or $malformedResponse.Status -ge 500) {
+            throw "发布态 HTTP 畸形输入未返回有界 4xx: $($malformedResponse.Status)"
+        }
+    }
+    $oversizedBody = '{"version":1,"request_id":"oversized","command":{"kind":"sys_now"},"padding":"' +
+        ("x" * (1MB + 4096)) + '"}'
+    $oversizedResponse = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Headers $authorizedHeaders `
+        -Body $oversizedBody `
+        -AllowTransportRejection
+    if ($oversizedResponse.Status -ne 413 -and -not $oversizedResponse.RejectedByDisconnect) {
+        throw "发布态 HTTP 超限 body 未被 413 或连接级快速拒绝"
+    }
+    $healthAfterMalformed = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:$HttpPort/api/health"
+    if ($healthAfterMalformed -ne "OK") { throw "发布态 HTTP 畸形输入后未恢复" }
+    $result.assertions += "发布态 HTTP 畸形 JSON、未知字段和超限 body 均 fail-closed，服务随后健康"
 
     $baseline = Invoke-ApiCommand @{ kind = "sys_list" } "baseline" $apiToken
     $baselineIds = @{}
@@ -362,6 +549,38 @@ try {
     $exec = Invoke-ApiCommand @{ kind = "exec"; command = "echo public-e2e-ok" } "exec" $apiToken
     if (-not ($exec.ok -and $exec.data.message -match "public-e2e-ok")) { throw "exec 失败" }
     $result.assertions += "Exec 双层授权与执行通过"
+
+    # 灰度公网只做一次有界突发：24 个请求超过单实例/Kik 的 16 许可，但远低于全局上限。
+    # 成功请求应并行完成，超额部分应快速返回结构化拒绝而不是在公网链路上长期排队。
+    $burstCommands = @(0..23 | ForEach-Object {
+        @{ kind = "exec"; command = "ping -n 4 127.0.0.1 >NUL && echo public-burst-ok" }
+    })
+    $burstWatch = [Diagnostics.Stopwatch]::StartNew()
+    $burstResponses = Invoke-ParallelApiCommands `
+        -Commands $burstCommands `
+        -Token $apiToken `
+        -RequestIdPrefix "public-burst" `
+        -TimeoutMilliseconds 20000
+    $burstWatch.Stop()
+    if ($burstResponses.Count -ne 24) { throw "公网突发响应数量不完整" }
+    for ($index = 0; $index -lt $burstResponses.Count; $index++) {
+        if ($burstResponses[$index].request_id -ne "public-burst-$index") {
+            throw "公网突发响应 request_id 串线: $index"
+        }
+    }
+    $burstSucceeded = @($burstResponses | Where-Object { $_.ok -and $_.data.message -match "public-burst-ok" }).Count
+    $burstRejected = @($burstResponses | Where-Object { -not $_.ok -and $null -ne $_.error.code }).Count
+    if ($burstSucceeded -lt 8 -or $burstSucceeded -gt 16 -or $burstSucceeded + $burstRejected -ne 24) {
+        throw "公网突发配额行为异常: success=$burstSucceeded rejected=$burstRejected"
+    }
+    if ($burstWatch.ElapsedMilliseconds -ge 12000) {
+        throw "公网突发命令发生无界排队: $($burstWatch.ElapsedMilliseconds) ms"
+    }
+    $result.performance.burst_commands = 24
+    $result.performance.burst_succeeded = $burstSucceeded
+    $result.performance.burst_rejected = $burstRejected
+    $result.performance.burst_milliseconds = $burstWatch.ElapsedMilliseconds
+    $result.assertions += "公网 24 请求突发按配额快速收敛且 request_id 无串线"
 
     $smallSource = Join-Path $RunDir "small-source.bin"
     $smallRemote = Join-Path $RunDir "small-remote.bin"

@@ -1,3 +1,7 @@
+//! 简单的耗时测量工具。
+//!
+//! `Timer` 使用单调时钟 `Instant`，只适合统计持续时间，不参与线上时间戳或最近上下线时间计算。
+
 use std::time::Instant;
 
 pub struct Timer {

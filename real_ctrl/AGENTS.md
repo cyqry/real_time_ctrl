@@ -59,6 +59,8 @@
 - `GetBigFile` 的 `data_id`、总长度和 SHA-256 必须从控制响应取得，数据队列只消费 `FilePart`/`Err`；不得等待数据面元数据首帧。
 - API token 先做 SHA-256 固定长度摘要，再使用 `subtle` 常量时间原语比较；不要恢复手写比较循环。
 - `RUST_LOG` 已配置时必须尊重运维值；未配置时才使用编译 profile 的默认级别，hardened 默认 INFO。
+- 调试日志只能记录命令类型、帧类型、长度和关联状态；不得使用 `Debug` 输出完整 API 请求、认证帧、
+  文件内容、Exec 命令、proof、nonce、session ID、token 或 secret。
 
 ## 测试要求
 

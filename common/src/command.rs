@@ -1,3 +1,8 @@
+//! 三端线上命令的语义模型及二进制编解码。
+//!
+//! `Command` 只表示会跨网络发送的动作。控制端本地退出、控制端本地保存路径等信息不得混入这里，
+//! 它们由 `real_ctrl::input_command` 单独维护。各变体中字符串的具体含义见根目录 `协议说明.md`。
+
 use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetBigFile, SetFile};
 use crate::command::SysCommand::{History, List, Use};
 use crate::protocol::BufSerializable;
@@ -9,6 +14,7 @@ const MAX_KIK_ID_BYTES: usize = 128;
 const MAX_HASH_BYTES: usize = 64;
 
 #[derive(Debug, Clone)]
+/// 线上命令的顶层分类。
 pub enum Command {
     Sys(SysCommand),
     Ctrl(CtrlCommand),
@@ -16,11 +22,16 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// 只在调用端进程内生效的生命周期命令，不参与 `BufSerializable`。
 pub enum LocalCommand {
     LocalExit,
 }
 
 #[derive(Debug, Clone)]
+/// 需要由 Kik 执行的文件、目录和屏幕命令。
+///
+/// 文件传输变体中的第二个字符串并不总是“路径”：下载时它是数据 ID，上传时第一个字符串是数据 ID。
+/// 这种历史元组布局容易误读，新增代码应优先在调用点用清晰变量名解构。
 pub enum CtrlCommand {
     GetFile(String, String),
     GetBigFile(String, String),

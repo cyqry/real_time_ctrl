@@ -1,3 +1,7 @@
+//! ctrl_server 的滚动文件与控制台日志初始化。
+//!
+//! 日志配置属于运维可观测性，不得记录认证 proof、nonce、session、secret 或数据帧内容。
+
 use chrono::{DateTime, FixedOffset, Utc};
 use log::Level;
 use std::sync::OnceLock;

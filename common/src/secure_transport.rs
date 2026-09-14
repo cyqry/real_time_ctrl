@@ -1,3 +1,8 @@
+//! `real_ctrl` 管理面使用的 pinned TLS 1.3 传输。
+//!
+//! TLS 先验证证书链与 DNS 名称，再额外验证叶子证书 SPKI pin。服务端不要求客户端证书，控制端身份
+//! 由 TLS 内的 HMAC 挑战应答完成；因此 TLS 身份校验和应用层账号认证两步都不能省略。
+
 use crate::config::{Config, SecurityConfig};
 use crate::hidden;
 use anyhow::{anyhow, Context};
@@ -27,6 +32,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send>>;
 pub type BoxedAsyncWrite = Pin<Box<dyn AsyncWrite + Send>>;
 
+/// 把已完成安全握手的双向流拆成业务层可独立持有的读、写半边。
 pub struct TransportParts {
     pub reader: BoxedAsyncRead,
     pub writer: BoxedAsyncWrite,

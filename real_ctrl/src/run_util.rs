@@ -1,3 +1,7 @@
+//! 多个 real_ctrl 二进制共用的进程启动工具。
+//!
+//! 包含遵循 `RUST_LOG` 优先级的日志过滤器，以及通过持有文件句柄维持的单实例锁。
+
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};

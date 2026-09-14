@@ -1,10 +1,15 @@
+//! 大文件数据帧内部的分片与传输错误消息。
+//!
+//! 每个 `FilePart` 自带闭区间地址，因此多个数据连接可以乱序交付。这里仅验证单帧内部一致性；
+//! 跨分片重叠、完整性摘要和最终提交由 `file_util::FileRangeTracker` 及接收流程负责。
+
 use crate::hidden;
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 
 pub const MAX_FILE_PART_BYTES: usize = 16 * 1024 * 1024;
 
-//数据交换格式结构体
+/// 数据 payload：一个文件范围，或发送/写入阶段的失败通知。
 pub enum Dok {
     FilePart(u64, u64, BytesMut),
     Err(ErrCode),

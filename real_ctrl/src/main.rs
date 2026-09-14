@@ -1,3 +1,7 @@
+//! 交互式控制台进程入口。
+//!
+//! 控制台故意逐条读取、执行和打印结果，因此保持串行语义；需要并发调用时应使用 HTTP 或命名管道入口。
+
 use chrono::Local;
 use real_ctrl::dispatch;
 use real_ctrl::input_command::InputCommand;
@@ -14,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
         writeln!(
             buf,
             "{} [{}] - {}",
-            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), // 添加毫秒
+            // 毫秒有助于定位并发请求和多连接事件的先后顺序。
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
             record.level(),
             record.args()
         )

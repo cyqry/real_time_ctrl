@@ -1,3 +1,8 @@
+//! Kik 主通道和数据通道使用的业务帧。
+//!
+//! 主通道承载命令、响应和心跳，数据通道承载带数据 ID 的 payload。服务端生成内部关联 ID，确保
+//! 并行命令的响应只唤醒自己的等待者；大 payload 使用专用连续编码函数减少一次复制。
+
 use crate::command::Command;
 use crate::message::kik_frame::KikFrame::*;
 use crate::message::kik_resp::KikResp;
@@ -9,7 +14,7 @@ const MAX_DATA_ID_BYTES: usize = protocol::MAX_CORRELATION_ID_BYTES;
 
 #[derive(Debug, Clone)]
 pub enum KikFrame {
-    //这个目前不使用了，使用ReqCmd替代
+    // 历史编码占位；当前生产发送端只构造带选项和关联 ID 的 ReqCmd。
     CmdExtra(Command, String),
     RespExtra(KikResp, String),
     Cmd(ReqCmd),

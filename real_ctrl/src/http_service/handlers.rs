@@ -1,3 +1,7 @@
+//! HTTP handler：执行 token 校验并把 Axum 请求/响应适配到 `RealCtrlApi`。
+//!
+//! 普通命令返回 JSON；截图便捷路由返回原始 PNG。日志不得输出 token、完整命令、路径或二进制内容。
+
 use crate::api_contract::{ApiRequest, ApiResponse, MAX_API_BINARY_BYTES};
 use crate::api_service::RealCtrlApi;
 use crate::http_service::error::app_err::AppError;
@@ -57,7 +61,7 @@ pub(crate) async fn screen(
         .map_err(|e| AppError::Internal(anyhow!(e)))
 }
 
-fn authorize(headers: &HeaderMap) -> Result<(), AppError> {
+pub(crate) fn authorize(headers: &HeaderMap) -> Result<(), AppError> {
     let Some(expected) = configured_api_token() else {
         return Ok(());
     };

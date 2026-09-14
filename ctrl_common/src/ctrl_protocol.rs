@@ -1,3 +1,8 @@
+//! 控制侧常用消息的封帧便捷函数。
+//!
+//! 这些函数把业务结构包装成 `Frame` 并添加网络长度前缀，减少调用点手写层级。它们不执行 TLS、
+//! 会话鉴权或网络发送，最终仍应交给已认证的 `Channel`。
+
 use crate::ctrl_frame::Frame;
 use crate::ctrl_resp::Resp::{Kik, Server};
 use crate::ctrl_resp::{CmdResp, ServerResp, ServerSuccessResp};

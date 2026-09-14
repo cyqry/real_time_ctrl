@@ -1,3 +1,7 @@
+//! 内部服务错误到 HTTP 状态码和稳定 JSON 错误体的映射。
+//!
+//! 只有可公开的错误消息进入响应；内部 `anyhow::Error` 仅写服务端日志并对调用者返回通用错误。
+
 use crate::api_contract::ApiErrorBody;
 use crate::api_service::ApiServiceError;
 use serde_json::json;

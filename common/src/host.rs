@@ -1,3 +1,8 @@
+//! 服务端地址选择工具。
+//!
+//! 不同进程对运行时覆盖的安全策略不同：控制端可以按部署需要覆盖，而受保护 Kik 默认只使用
+//! 构建期地址。调用方应选择与自身 AGENTS.md 安全边界一致的入口。
+
 use crate::generated::encrypted_strings::HOST;
 use std::collections::HashMap;
 use std::env;

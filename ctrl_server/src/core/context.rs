@@ -1,3 +1,8 @@
+//! 服务端跨连接共享的会话、Kik、数据路由和并发配额。
+//!
+//! 这是服务端状态机的中心：Ctrl 主连接创建会话，CtrlData 绑定会话，Kik/KikData 登记被控端，
+//! 命令执行临时建立数据 ID 映射。集合锁内只做内存操作，网络关闭与写入必须在锁外等待。
+
 use crate::core::account::{AccountPolicy, AccountRegistry};
 use crate::core::connection_meta::{CTRL_SESSION_ID, KIK_ID};
 use common::channel::Channel;
@@ -22,37 +27,60 @@ const MAX_EARLY_CTRL_DATA_FRAMES: usize = 32;
 const EARLY_CTRL_DATA_WAIT: Duration = Duration::from_secs(5);
 const MAX_KIK_PRESENCE_RECORDS: usize = 256;
 
+/// 网络任务共享一个写半连接时的标准所有权形式。
 type SharedChannel = Arc<Mutex<Channel>>;
 
+/// 一条已通过 HMAC 挑战的控制主会话。
+///
+/// `selected_kik_id` 是会话私有选择；`data_connections`、nonce 集合和实例级命令许可也不能跨会话复用。
 struct CtrlSession {
+    /// 决定认证 secret、Kik ACL 和账号级并发上限。
     account_id: String,
+    /// 区分同一账号的多个控制进程；只有同账号同实例的重连会替换旧会话。
     instance_id: String,
+    /// Ctrl 主连接，负责命令和响应。
     connection: SharedChannel,
+    /// 已用 session proof 绑定的 CtrlData 连接，键为连接随机 ID。
     data_connections: HashMap<String, SharedChannel>,
+    /// 选择下一条数据连接的轮询游标。
     next_data_connection: Arc<AtomicUsize>,
+    /// 当前命令默认发往的 Kik；为空时由自动选择逻辑补充。
     selected_kik_id: Option<String>,
+    /// 用于限制会话最长寿命，避免永久 session。
     created_at: SystemTime,
+    /// 已消费的数据通道 nonce，防止同一 proof 被重放建立更多连接。
     used_data_nonces: HashSet<String>,
+    /// 当前实例独享的命令许可池。
     command_limit: Arc<Semaphore>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// 数据路由方向也是授权条件，防止同一个字符串 ID 被反向利用。
 pub enum DataDirection {
     CtrlToKik,
     KikToCtrl,
 }
 
 #[derive(Clone)]
+/// 一条控制数据 ID 到服务端内部 wire ID 的临时绑定。
 struct DataRoute {
+    /// 路由所属控制会话，是跨账号隔离的第一层键。
     session_id: String,
+    /// 本次命令锁定的 Kik，后续切换当前目标不会改变在途文件去向。
     kik_id: String,
+    /// 服务端发给 Kik 的随机 ID，不直接暴露控制端提供的 ID。
     wire_data_id: String,
+    /// 相同字符串只能按登记方向使用。
     direction: DataDirection,
+    /// 小文件/截图只有一帧，转发完成即可自动回收；大文件等待显式完成或超时。
     single_frame: bool,
+    /// 最终兜底清理时间，防止断线异常留下永久路由。
     expires_at: Instant,
 }
 
 /// 同一账号的多个实例共享 ACL，但会话选择、命令许可和数据通道完全隔离。
+///
+/// `Context` 的克隆成本很低，只复制共享状态句柄，适合移动进每个连接和命令任务。
 #[derive(Clone)]
 pub struct Context {
     accounts: AccountRegistry,
@@ -95,6 +123,9 @@ impl Context {
         self.accounts.get(account_id)
     }
 
+    /// 原子注册控制会话，并按 `(account_id, instance_id)` 替换同实例旧会话。
+    ///
+    /// 新实例先检查账号实例配额；替换完成后在锁外关闭旧连接，避免网络 I/O 阻塞全局索引。
     pub async fn register_ctrl_session(
         &self,
         channel: SharedChannel,
@@ -155,6 +186,7 @@ impl Context {
         self.account(&account_id).map(|policy| policy.secret)
     }
 
+    /// 消费一次 CtrlData nonce。返回 false 表示会话过期、nonce 重放或记录已达上限。
     pub async fn validate_ctrl_data_session(&self, session_id: &str, channel_nonce: &str) -> bool {
         let Some(session) = self.sessions.read().await.get(session_id).cloned() else {
             return false;
@@ -276,6 +308,9 @@ impl Context {
             .collect()
     }
 
+    /// 同时取得全局、账号和实例三级许可；Kik 级许可在选定目标后取得。
+    ///
+    /// 返回的三个 RAII permit 必须由命令任务持有到响应和必要的数据处理结束。
     pub async fn try_acquire_command(
         &self,
         session_id: &str,
@@ -586,6 +621,7 @@ impl Context {
         Ok(())
     }
 
+    /// 把控制端上传使用的外部数据 ID 解析为目标 Kik 和内部 wire ID。
     pub async fn ctrl_data_target(
         &self,
         session_id: &str,
@@ -630,6 +666,7 @@ impl Context {
         }
     }
 
+    /// 校验 Kik 下载帧的发送者与 wire ID，并恢复目标控制会话。
     pub async fn kik_data_target(
         &self,
         kik_id: &str,
@@ -921,6 +958,108 @@ mod tests {
 
         assert_eq!(context.instances.lock().await.len(), 1);
         assert_eq!(context.sessions.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn instance_and_account_command_quotas_are_isolated_and_recover_after_release() {
+        let registry = AccountRegistry::from_json_or_default(
+            Some(
+                r#"[
+                    {"account_id":"tenant_a","secret":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","allowed_kiks":["*"],"max_instances":2,"max_commands_per_instance":2,"max_commands_per_account":1},
+                    {"account_id":"tenant_b","secret":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","allowed_kiks":["*"],"max_instances":1,"max_commands_per_instance":1,"max_commands_per_account":1}
+                ]"#,
+            ),
+            String::new(),
+        )
+        .unwrap();
+        let context = Context::init_with_accounts(registry);
+        let (a1, _) = session(&context, "tenant_a", "one").await;
+        let (a2, _) = session(&context, "tenant_a", "two").await;
+        let (b1, _) = session(&context, "tenant_b", "one").await;
+
+        let a1_permits = context.try_acquire_command(&a1).await.unwrap();
+        assert!(context.try_acquire_command(&a2).await.is_err());
+
+        // tenant_a 占满账号配额不能消耗 tenant_b 的账号或实例许可。
+        let b1_permits = context.try_acquire_command(&b1).await.unwrap();
+        drop(b1_permits);
+        drop(a1_permits);
+
+        // 拒绝路径和正常完成路径都必须用 RAII 立即归还全局、账号和实例许可。
+        assert!(context.try_acquire_command(&a2).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn account_instance_limit_rejects_only_new_instances() {
+        let registry = AccountRegistry::from_json_or_default(
+            Some(
+                r#"[{"account_id":"limited","secret":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","allowed_kiks":["*"],"max_instances":1}]"#,
+            ),
+            String::new(),
+        )
+        .unwrap();
+        let context = Context::init_with_accounts(registry);
+        let (first, _) = session(&context, "limited", "one").await;
+
+        let second_id = Uuid::new_v4().to_string();
+        let second_channel = channel(&second_id, ChannelType::Ctrl);
+        assert!(context
+            .register_ctrl_session(second_channel, second_id, "limited".into(), "two".into(),)
+            .await
+            .is_err());
+        assert!(context.session_auth_secret(&first).await.is_some());
+
+        // 同一 instance 重连是替换而非新增，不应被 max_instances 拒绝。
+        let (replacement, _) = session(&context, "limited", "one").await;
+        assert!(context.session_auth_secret(&first).await.is_none());
+        assert!(context.session_auth_secret(&replacement).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn per_session_data_route_limit_is_hard_and_recovers_after_cleanup() {
+        let context = Context::init();
+        let (session_id, _) = session(&context, "default", "routes").await;
+        let kik_id = Uuid::new_v4().to_string();
+        let mut external_ids = Vec::with_capacity(MAX_SESSION_DATA_ROUTES);
+
+        for _ in 0..MAX_SESSION_DATA_ROUTES {
+            let external_id = Uuid::new_v4().to_string();
+            context
+                .prepare_data_route(
+                    &session_id,
+                    &kik_id,
+                    Command::Ctrl(CtrlCommand::SetFile(external_id.clone(), "target".into())),
+                )
+                .await
+                .unwrap();
+            external_ids.push(external_id);
+        }
+        assert!(context
+            .prepare_data_route(
+                &session_id,
+                &kik_id,
+                Command::Ctrl(CtrlCommand::SetFile(
+                    Uuid::new_v4().to_string(),
+                    "overflow".into(),
+                )),
+            )
+            .await
+            .is_err());
+
+        context
+            .finish_upload_route(&session_id, external_ids.first().map(String::as_str))
+            .await;
+        assert!(context
+            .prepare_data_route(
+                &session_id,
+                &kik_id,
+                Command::Ctrl(CtrlCommand::SetFile(
+                    Uuid::new_v4().to_string(),
+                    "recovered".into(),
+                )),
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

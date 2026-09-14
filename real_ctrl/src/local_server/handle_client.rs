@@ -1,3 +1,8 @@
+//! 单个命名管道连接的请求循环。
+//!
+//! 一条连接可以顺序发送多次请求；多个连接可并行。每条消息先读取受限长度，再解析版本标识和 JSON，
+//! 然后调用共享 `RealCtrlApi`，因此管道入口不会绕过 API 策略。
+
 use crate::api_contract::{ApiErrorBody, ApiResponse};
 use crate::api_service::RealCtrlApi;
 use crate::context::Context;
@@ -62,7 +67,12 @@ pub async fn handle_client(
 
         match deserialize_pipe_request(data.as_ref()) {
             Ok(api_request) => {
-                debug!("api_request: {:?}", api_request);
+                // 请求体可能包含命令、路径等业务敏感信息；日志只保留可观测的类型和大小。
+                debug!(
+                    "已解析管道请求: command={}, bytes={}",
+                    api_request.command.kind(),
+                    msg_len
+                );
                 let response = api.execute_request(api_request).await;
                 write_api_response(&mut stream, &response).await?;
             }

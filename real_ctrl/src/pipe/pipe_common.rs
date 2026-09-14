@@ -1,3 +1,8 @@
+//! 命名管道协议的名称、版本标识、大小上限和 JSON 序列化。
+//!
+//! 外层长度由客户端/服务端 I/O 代码处理；本模块只添加并校验版本 magic，确保旧 postcard 请求不会
+//! 被误当作新 JSON 契约解析。
+
 use crate::api_contract::{ApiRequest, ApiResponse};
 use std::time::Duration;
 
@@ -46,7 +51,7 @@ mod tests {
 
     #[test]
     fn api_pipe_request_requires_magic() {
-        let req = ApiRequest::new(ApiCommand::SysNow);
+        let req = ApiRequest::new(ApiCommand::SysNow {});
         let bytes = serialize_api_request(&req).unwrap();
         let decoded = deserialize_pipe_request(&bytes).unwrap();
         assert_eq!(decoded.version, 1);

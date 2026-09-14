@@ -1,3 +1,8 @@
+//! 文件、目录和截图命令在控制端的执行编排。
+//!
+//! 本模块把“控制端本地路径”转换为只含远端必要信息的线上命令，并协调控制响应与独立数据连接。
+//! 上传任务必须等控制帧写成功后启动；下载在临时文件校验完成后才提交目标路径。
+
 use crate::context::{id, Context};
 use crate::input_command::{InputCtrlCommand, RemoteResp, RemoteSuccessResp};
 use anyhow::{anyhow, Context as AnyhowContext};
@@ -17,6 +22,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+/// 执行一条被控命令，并把控制响应与可能独立到达的数据合并成 `RemoteResp`。
+///
+/// `origin_data=true` 表示开放 API 希望获得原始小数据；CLI 则通常把数据保存到本地路径后返回文字结果。
 pub async fn execute(
     context: &Context,
     input_ctrl_cmd: InputCtrlCommand,
@@ -115,12 +123,15 @@ pub async fn execute(
     }
 }
 
+/// 尚未获准开始的上传任务。
+///
+/// `start` 只在控制帧成功写出后触发；`task` 让命令失败路径可以取消后台生产者。
 struct PendingTransfer {
     start: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
-//根据请求类型反序列化响应info
+/// 根据原始命令解释 Kik 文本成功响应；目录列表需要额外恢复为结构体。
 fn to_remote_resp(cmd: InputCtrlCommand, info: String) -> anyhow::Result<RemoteSuccessResp> {
     let res = match cmd {
         InputCtrlCommand::GetFile(_, _)
@@ -159,7 +170,7 @@ async fn process_cmd(
     Ok(prepared)
 }
 
-//自动处理逻辑
+/// 处理返回数据 ID 的小文件下载和截图，并写入控制端本地目标。
 async fn process_ctrl_cmd_data_id_resp(
     context: &Context,
     input_ctrl_cmd: InputCtrlCommand,
@@ -269,7 +280,7 @@ async fn do_set_big_file(
             }
         }
     });
-    // 发送hash
+    // 总长度和摘要属于轻量控制元数据；真实分片只从独立数据连接发送。
     Ok((
         CtrlCommand::SetBigFile(data_id, file_size, hash, target_path),
         cmd_options,

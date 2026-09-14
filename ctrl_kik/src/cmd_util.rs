@@ -1,3 +1,8 @@
+//! Windows 用户/设备展示名和受限命令行执行工具。
+//!
+//! Exec 同时读取 stdout/stderr 并持续排空，分别限制保留大小；任务被取消时 `kill_on_drop` 终止子进程，
+//! 防止输出过多或超时命令遗留后台进程。
+
 use common::hidden;
 use encoding_rs::GBK;
 use std::process::Stdio;
@@ -6,6 +11,7 @@ use tokio::process::Command;
 
 const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
 
+/// 生成用于服务端列表展示的设备和用户名称；它不是认证身份。
 pub fn whoami() -> String {
     hidden!(
         whoami::devicename(),
@@ -16,6 +22,7 @@ pub fn whoami() -> String {
     )
 }
 
+/// 通过 `cmd.exe /C` 执行命令，并按指定编码合并受限的 stdout/stderr。
 pub async fn cmd_exec_line(cmd_line: &str, open_window: bool, gbk: bool) -> anyhow::Result<String> {
     if cmd_line.trim().is_empty() {
         return Err(anyhow::Error::msg(hidden!("命令不能为空")));

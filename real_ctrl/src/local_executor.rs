@@ -1,3 +1,7 @@
+//! 只影响当前控制端进程的本地命令。
+//!
+//! 此类命令不能进入远程线协议，也不允许经 HTTP/命名管道绕过服务层执行。
+
 use crate::context::Context;
 use common::command::LocalCommand;
 

@@ -1,3 +1,8 @@
+//! 本地 HTTP 与 Windows 命名管道共用的版本化 JSON 契约。
+//!
+//! 该契约面向调用者，独立于内部二进制线协议。所有输入先做版本、未知字段、长度和 NUL 检查，再转换为
+//! `InputCommand`；内部错误只映射为稳定错误码，不把实现细节当作长期 API。
+
 use crate::input_command::{InputCommand, InputCtrlCommand, RemoteResp, RemoteSuccessResp};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -11,18 +16,27 @@ pub const MAX_EXEC_COMMAND_BYTES: usize = 32 * 1024;
 pub const MAX_API_BINARY_BYTES: usize = 48 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// 一次开放 API 调用的稳定信封。
 pub struct ApiRequest {
+    /// 调用者声明的契约版本，必须等于当前 `API_VERSION`。
     pub version: u16,
+    /// 调用者自定义的追踪 ID；服务端只校验并原样回显，不把它当成内部命令 ID。
     #[serde(default)]
     pub request_id: Option<String>,
     pub command: ApiCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+/// API 支持的命令及其显式参数。
+///
+/// `local_path` 始终属于运行 real_ctrl 的机器，`remote_path` 始终属于 Kik；两者不能互换。
 pub enum ApiCommand {
-    SysList,
-    SysNow,
+    // 使用零字段结构体变体而不是 unit 变体：Serde 对内部标签 unit 变体会忽略额外字段，
+    // 结构体变体才能让 deny_unknown_fields 在开放 API 边界真正 fail-closed。
+    SysList {},
+    SysNow {},
     SysHistory {
         #[serde(default)]
         kik_id: Option<String>,
@@ -61,6 +75,7 @@ pub enum ApiCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// 统一响应信封。正常情况下 `ok=true` 只带 `data`，失败只带 `error`。
 pub struct ApiResponse {
     pub version: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +89,7 @@ pub struct ApiResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// 成功结果的结构化类型，调用方应按 `kind` 分派而不是解析展示字符串。
 pub enum ApiResponseData {
     Info {
         message: String,
@@ -99,6 +115,7 @@ pub enum ApiResponseData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 对外稳定错误：`code` 供程序判断，`message` 只供人阅读。
 pub struct ApiErrorBody {
     pub code: String,
     pub message: String,
@@ -114,14 +131,8 @@ impl ApiRequest {
     }
 
     pub fn validate(&self) -> Result<(), ApiErrorBody> {
-        if self
-            .request_id
-            .as_ref()
-            .is_some_and(|value| value.is_empty() || value.len() > MAX_REQUEST_ID_BYTES)
-        {
-            return Err(ApiErrorBody::bad_request(format!(
-                "request_id 必须为 1..={MAX_REQUEST_ID_BYTES} bytes"
-            )));
+        if let Some(request_id) = &self.request_id {
+            validate_text(request_id, "request_id", MAX_REQUEST_ID_BYTES)?;
         }
         self.command.validate()
     }
@@ -200,8 +211,8 @@ impl ApiErrorBody {
 impl ApiCommand {
     pub fn kind(&self) -> &'static str {
         match self {
-            ApiCommand::SysList => "sys_list",
-            ApiCommand::SysNow => "sys_now",
+            ApiCommand::SysList {} => "sys_list",
+            ApiCommand::SysNow {} => "sys_now",
             ApiCommand::SysHistory { .. } => "sys_history",
             ApiCommand::SysUse { .. } => "sys_use",
             ApiCommand::CtrlLs { .. } => "ctrl_ls",
@@ -216,7 +227,7 @@ impl ApiCommand {
 
     fn validate(&self) -> Result<(), ApiErrorBody> {
         match self {
-            ApiCommand::SysList | ApiCommand::SysNow => Ok(()),
+            ApiCommand::SysList {} | ApiCommand::SysNow {} => Ok(()),
             ApiCommand::SysHistory { kik_id } => {
                 if let Some(kik_id) = kik_id {
                     validate_text(kik_id, "kik_id", MAX_KIK_ID_BYTES)?;
@@ -272,8 +283,8 @@ impl ApiCommand {
 
     pub fn into_input_command(self) -> InputCommand {
         match self {
-            ApiCommand::SysList => InputCommand::Sys(common::command::SysCommand::List),
-            ApiCommand::SysNow => InputCommand::Sys(common::command::SysCommand::Now),
+            ApiCommand::SysList {} => InputCommand::Sys(common::command::SysCommand::List),
+            ApiCommand::SysNow {} => InputCommand::Sys(common::command::SysCommand::Now),
             ApiCommand::SysHistory { kik_id } => {
                 InputCommand::Sys(common::command::SysCommand::History(kik_id))
             }
@@ -416,6 +427,21 @@ mod tests {
             path: "C:\\Temp\0hidden".to_string(),
         });
         assert!(nul_path.validate().is_err());
+
+        let mut nul_request_id = ApiRequest::new(ApiCommand::SysNow {});
+        nul_request_id.request_id = Some("safe\0forged".to_string());
+        assert!(nul_request_id.validate().is_err());
+    }
+
+    #[test]
+    fn api_json_rejects_unknown_fields_in_envelope_and_command() {
+        let envelope = r#"{"version":1,"command":{"kind":"sys_now"},"unexpected":true}"#;
+        let command = r#"{"version":1,"command":{"kind":"ctrl_ls","path":"C:\\Temp","typo":true}}"#;
+        let unit_like_command = r#"{"version":1,"command":{"kind":"sys_now","typo":true}}"#;
+
+        assert!(serde_json::from_str::<ApiRequest>(envelope).is_err());
+        assert!(serde_json::from_str::<ApiRequest>(command).is_err());
+        assert!(serde_json::from_str::<ApiRequest>(unit_like_command).is_err());
     }
 
     #[test]

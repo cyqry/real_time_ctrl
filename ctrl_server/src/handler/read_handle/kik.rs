@@ -1,9 +1,14 @@
+//! 已认证 Kik 主连接的响应路由。
+//!
+//! 服务端只接受当前主连接返回的响应，并按内部命令 ID 唤醒唯一等待者。旧重连、未知 ID 或已超时响应
+//! 会被丢弃，不能误投递给其他控制会话。
+
 use crate::core::context::Context;
 use bytes::BytesMut;
 use common::channel::Channel;
 use common::message::kik_frame::KikFrame;
 use common::protocol::BufSerializable;
-use log::{debug, warn};
+use log::debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -29,13 +34,13 @@ pub async fn handle_kik(
                 .await
                 .ok_or_else(|| anyhow::anyhow!("Kik 响应来自非活动连接"))?;
             if !kik.is_kik_conn(&channel).await {
-                warn!("丢弃已被替换的旧 Kik 连接响应: kik_id={}", kik_id);
+                debug!("丢弃已被替换的旧 Kik 连接响应: kik_id={}", kik_id);
                 return Ok(());
             }
             debug!("收到 Kik 响应: kik_id={}, cmd_id={}", kik_id, command_id);
             if !kik.complete_command(&command_id, response).await {
                 // 超时或伪造关联 ID 不会影响其他请求，只记录并丢弃。
-                warn!(
+                debug!(
                     "丢弃无等待者的 Kik 响应: kik_id={}, cmd_id={}",
                     kik_id, command_id
                 );

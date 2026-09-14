@@ -1,3 +1,8 @@
+//! Ctrl 主连接的 pinned TLS、HMAC 认证、读循环与心跳。
+//!
+//! 建连返回前必须拿到服务端 session；之后读循环只接收控制响应并按命令 ID 投递。认证阶段使用小帧
+//! 上限，成功后切换控制帧上限，断线时清空所有等待者，让调用者得到“结果未知”而不是自动重放。
+
 use crate::context::ResponseRouter;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
@@ -29,12 +34,16 @@ use tokio_util::codec::FramedRead;
 const AUTH_OK_PREFIX: &str = "##authtrue:";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Ctrl 主连接的应用层认证进度。
+///
+/// TLS 已在进入该状态机前完成；这里继续完成账号/实例 HMAC 挑战，拿到 session 后才允许业务帧。
 enum AuthPhase {
     AwaitingChallenge,
     AwaitingSession,
     Authenticated,
 }
 
+/// 只由单个 Ctrl 读任务持有的认证状态和响应路由器。
 struct ControlReadContext {
     auth_secret: String,
     account_id: String,
@@ -44,6 +53,9 @@ struct ControlReadContext {
     responses: ResponseRouter,
 }
 
+/// 建立 Ctrl 主连接并等待认证完成。
+///
+/// 返回的 `Channel` 已可发送业务命令，`session_id` 供后续 CtrlData 连接绑定；读循环在后台持续运行。
 pub(crate) async fn ctrl_conn(
     config: &Config,
     responses: ResponseRouter,
@@ -256,13 +268,39 @@ async fn handle_read(
             }
             Frame::Ping | Frame::Pong => {}
             f => {
-                debug!("控制连接收到不支持的业务帧,{:?}", f);
+                debug!("控制连接收到不支持的业务帧: kind={}", frame_kind(&f));
                 return None;
             }
         };
     }
 
     Some(())
+}
+
+pub(crate) fn init_frame_kind(frame: &InitFrame) -> &'static str {
+    match frame {
+        InitFrame::KikReq(_) => "kik_req",
+        InitFrame::KikId(_) => "kik_id",
+        InitFrame::KikDataConnReq(_) => "kik_data_req",
+        InitFrame::KikDataConn(_) => "kik_data_reply",
+        InitFrame::CtrlAuthStart { .. } => "ctrl_auth_start",
+        InitFrame::CtrlAuthChallenge(_) => "ctrl_auth_challenge",
+        InitFrame::CtrlAuthProof { .. } => "ctrl_auth_proof",
+        InitFrame::CtrlAuthSession(_) => "ctrl_auth_session",
+        InitFrame::CtrlDataSessionReq { .. } => "ctrl_data_session_req",
+        InitFrame::CtrlDataSessionReply(_) => "ctrl_data_session_reply",
+    }
+}
+
+pub(crate) fn frame_kind(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::Cmd(_) => "command",
+        Frame::Resp(_) => "response",
+        Frame::Data(_, _) => "data",
+        Frame::DataAck(_) => "data_ack",
+        Frame::Ping => "ping",
+        Frame::Pong => "pong",
+    }
 }
 
 fn e2e_trace(message: &str) {

@@ -201,6 +201,8 @@ function Build-E2eBinaries {
         $env:RTC_CTRL_KIK_BUILD_PORT = "$KikNoisePort"
         & cargo build --locked -p ctrl_server -p ctrl_kik -p real_ctrl --bins
         Assert-CommandOk $LASTEXITCODE "Failed to build E2E binaries"
+        & cargo build --locked -p real_ctrl --example pipe_concurrency_probe
+        Assert-CommandOk $LASTEXITCODE "Failed to build named-pipe concurrency probe"
     } finally {
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $previousKey
         $env:RTC_CTRL_KIK_BUILD_HOST = $previousHost
@@ -312,7 +314,12 @@ function Invoke-ApiCommand {
 }
 
 function Invoke-ParallelApiCommands {
-    param([hashtable[]]$Commands)
+    param(
+        [hashtable[]]$Commands,
+        [int]$Port = $HttpPort,
+        [string]$RequestIdPrefix = "parallel",
+        [int]$TimeoutMilliseconds = 20000
+    )
     $client = [System.Net.Http.HttpClient]::new()
     $client.DefaultRequestHeaders.Authorization =
         [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $ApiToken)
@@ -321,7 +328,7 @@ function Invoke-ParallelApiCommands {
         for ($i = 0; $i -lt $Commands.Count; $i++) {
             $body = @{
                 version = 1
-                request_id = "parallel-$i"
+                request_id = "$RequestIdPrefix-$i"
                 command = $Commands[$i]
             } | ConvertTo-Json -Depth 12 -Compress
             $content = [System.Net.Http.StringContent]::new(
@@ -329,9 +336,12 @@ function Invoke-ParallelApiCommands {
                 [System.Text.Encoding]::UTF8,
                 "application/json"
             )
-            $tasks.Add($client.PostAsync("http://127.0.0.1:$HttpPort/api/v1/commands", $content))
+            $tasks.Add($client.PostAsync("http://127.0.0.1:$Port/api/v1/commands", $content))
         }
-        if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$tasks.ToArray(), 20000)) {
+        if (-not [System.Threading.Tasks.Task]::WaitAll(
+            [System.Threading.Tasks.Task[]]$tasks.ToArray(),
+            $TimeoutMilliseconds
+        )) {
             throw "Parallel HTTP commands timed out"
         }
         @($tasks | ForEach-Object {
@@ -344,6 +354,253 @@ function Invoke-ParallelApiCommands {
         })
     } finally {
         $client.Dispose()
+    }
+}
+
+function Invoke-ParallelApiTargets {
+    param([object[]]$Targets, [int]$TimeoutMilliseconds = 20000)
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Authorization =
+        [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $ApiToken)
+    $requests = [System.Collections.Generic.List[System.Net.Http.HttpRequestMessage]]::new()
+    $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]]::new()
+    try {
+        foreach ($target in $Targets) {
+            $body = @{
+                version = 1
+                request_id = [string]$target.RequestId
+                command = $target.Command
+            } | ConvertTo-Json -Depth 12 -Compress
+            $request = [System.Net.Http.HttpRequestMessage]::new(
+                [System.Net.Http.HttpMethod]::Post,
+                "http://127.0.0.1:$([int]$target.Port)/api/v1/commands"
+            )
+            $request.Content = [System.Net.Http.StringContent]::new(
+                $body,
+                [System.Text.Encoding]::UTF8,
+                "application/json"
+            )
+            $requests.Add($request)
+            $tasks.Add($client.SendAsync($request))
+        }
+        if (-not [System.Threading.Tasks.Task]::WaitAll(
+            [System.Threading.Tasks.Task[]]$tasks.ToArray(),
+            $TimeoutMilliseconds
+        )) {
+            throw "Parallel multi-instance HTTP commands timed out"
+        }
+        @($tasks | ForEach-Object {
+            $response = $_.Result
+            try {
+                $body = $response.Content.ReadAsStringAsync().Result
+                if (-not $response.IsSuccessStatusCode) {
+                    throw "Parallel multi-instance HTTP command failed with $([int]$response.StatusCode): $body"
+                }
+                $body | ConvertFrom-Json
+            } finally {
+                $response.Dispose()
+            }
+        })
+    } finally {
+        foreach ($request in $requests) {
+            $request.Dispose()
+        }
+        $client.Dispose()
+    }
+}
+
+function Invoke-RawHttpRequest {
+    param(
+        [string]$Method,
+        [string]$Path,
+        [string]$Body = $null,
+        [hashtable]$Headers = @{},
+        [string]$ContentType = "application/json",
+        [int]$Port = $HttpPort,
+        [switch]$AllowTransportRejection
+    )
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(15)
+    $request = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::new($Method),
+        "http://127.0.0.1:$Port$Path"
+    )
+    try {
+        foreach ($entry in $Headers.GetEnumerator()) {
+            $request.Headers.TryAddWithoutValidation($entry.Key, [string]$entry.Value) | Out-Null
+        }
+        if ($null -ne $Body) {
+            $request.Content = [System.Net.Http.StringContent]::new(
+                $Body,
+                [System.Text.Encoding]::UTF8,
+                $ContentType
+            )
+        }
+        try {
+            $response = $client.SendAsync($request).GetAwaiter().GetResult()
+            $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            $responseHeaders = @{}
+            foreach ($header in $response.Headers) {
+                $responseHeaders[$header.Key.ToLowerInvariant()] = $header.Value -join ","
+            }
+            foreach ($header in $response.Content.Headers) {
+                $responseHeaders[$header.Key.ToLowerInvariant()] = $header.Value -join ","
+            }
+            $rawResult = [pscustomobject]@{
+                Status  = [int]$response.StatusCode
+                Body    = $responseBody
+                Headers = $responseHeaders
+                RejectedByDisconnect = $false
+            }
+            $response.Dispose()
+            $rawResult
+        } catch {
+            $cursor = $_.Exception
+            $transportFailure = $false
+            while ($cursor) {
+                if ($cursor -is [System.Net.Http.HttpRequestException] -or
+                    $cursor -is [System.Net.Sockets.SocketException]) {
+                    $transportFailure = $true
+                }
+                $cursor = $cursor.InnerException
+            }
+            if (-not $AllowTransportRejection -or -not $transportFailure) {
+                throw
+            }
+            [pscustomobject]@{
+                Status = 0
+                Body = ""
+                Headers = @{}
+                RejectedByDisconnect = $true
+            }
+        }
+    } finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Read-ExactBytes {
+    param([System.IO.Stream]$Stream, [int]$Length)
+    $buffer = New-Object byte[] $Length
+    $offset = 0
+    while ($offset -lt $Length) {
+        $read = $Stream.Read($buffer, $offset, $Length - $offset)
+        if ($read -le 0) {
+            throw "Named pipe closed before a complete response was received"
+        }
+        $offset += $read
+    }
+    $buffer
+}
+
+function Invoke-PipePayload {
+    param([byte[]]$Payload, [long]$DeclaredLength = -1)
+    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
+        ".",
+        "real_ctrl_service_pipe",
+        [System.IO.Pipes.PipeDirection]::InOut,
+        [System.IO.Pipes.PipeOptions]::None
+    )
+    try {
+        $pipe.Connect(5000)
+        $length = if ($DeclaredLength -ge 0) { [uint32]$DeclaredLength } else { [uint32]$Payload.Length }
+        $lengthBytes = [BitConverter]::GetBytes($length)
+        if ([BitConverter]::IsLittleEndian) {
+            [Array]::Reverse($lengthBytes)
+        }
+        $pipe.Write($lengthBytes, 0, $lengthBytes.Length)
+        if ($Payload.Length -gt 0) {
+            $pipe.Write($Payload, 0, $Payload.Length)
+        }
+        $pipe.Flush()
+
+        [byte[]]$responseLengthBytes = Read-ExactBytes -Stream $pipe -Length 4
+        if ([BitConverter]::IsLittleEndian) {
+            [Array]::Reverse($responseLengthBytes)
+        }
+        $responseLength = [BitConverter]::ToUInt32($responseLengthBytes, 0)
+        if ($responseLength -gt 64MB) {
+            throw "Named pipe returned an oversized test response: $responseLength bytes"
+        }
+        [byte[]]$responseBytes = Read-ExactBytes -Stream $pipe -Length ([int]$responseLength)
+        [byte[]]$magic = [Text.Encoding]::ASCII.GetBytes("RTCAPI1`0")
+        if ($responseBytes.Length -lt $magic.Length) {
+            throw "Named pipe response is shorter than the API magic"
+        }
+        for ($i = 0; $i -lt $magic.Length; $i++) {
+            if ($responseBytes[$i] -ne $magic[$i]) {
+                throw "Named pipe response has an invalid API magic"
+            }
+        }
+        $json = [Text.Encoding]::UTF8.GetString(
+            $responseBytes,
+            $magic.Length,
+            $responseBytes.Length - $magic.Length
+        )
+        $json | ConvertFrom-Json
+    } finally {
+        $pipe.Dispose()
+    }
+}
+
+function Send-RawTcpProbe {
+    param([int]$Port, [byte[]]$Payload)
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $connect = $client.ConnectAsync("127.0.0.1", $Port)
+        if (-not $connect.Wait(2000) -or -not $client.Connected) {
+            throw "Raw TCP probe could not connect to port $Port"
+        }
+        if ($Payload.Length -gt 0) {
+            $stream = $client.GetStream()
+            $stream.Write($Payload, 0, $Payload.Length)
+            $stream.Flush()
+        }
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Assert-KikSaturationDoesNotBlockTls {
+    param(
+        [int]$KikPort,
+        [int]$ControlPort,
+        [string]$ServerName,
+        [string]$CaCert
+    )
+    $clients = [Collections.Generic.List[Net.Sockets.TcpClient]]::new()
+    try {
+        # 520 略高于 Kik 端口的 512 硬上限。连接不发送握手并仅保持到 TLS 探测结束，
+        # 在本地受控环境复现慢连接饱和而不会触达公网。
+        for ($index = 0; $index -lt 520; $index++) {
+            $client = [Net.Sockets.TcpClient]::new()
+            $task = $client.ConnectAsync("127.0.0.1", $KikPort)
+            if ($task.Wait(2000) -and $client.Connected) {
+                $clients.Add($client)
+            } else {
+                $client.Dispose()
+            }
+        }
+        if ($clients.Count -lt 500) {
+            throw "Could not establish enough local Kik saturation probes: $($clients.Count)"
+        }
+        Start-Sleep -Milliseconds 250
+        Wait-TlsEndpoint `
+            -HostName "127.0.0.1" `
+            -Port $ControlPort `
+            -ServerName $ServerName `
+            -CaCert $CaCert `
+            -TimeoutSeconds 10
+        $clients.Count
+    } finally {
+        foreach ($client in $clients) {
+            $client.Dispose()
+        }
+        Start-Sleep -Milliseconds 250
     }
 }
 
@@ -422,6 +679,54 @@ try {
     Wait-TlsEndpoint -HostName "127.0.0.1" -Port $TlsPort -ServerName "real-ctrl-server" -CaCert $cert.Cert -TimeoutSeconds 20
     $result.assertions += "ctrl_server Kik Noise/TLS dedicated ports listening"
 
+    # 在任何合法客户端接入前发送明文、随机和截断握手。探针连接均立即关闭，
+    # 用于验证协议识别失败可回收，不制造持续的慢连接拒绝服务。
+    [byte[]]$plainHttp = [Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.1`r`nHost: localhost`r`n`r`n")
+    [byte[]]$invalidNoise = @(0x7F, 0xFF, 0xFF, 0xFF, 0x52, 0x54, 0x43, 0x54)
+    for ($i = 0; $i -lt 32; $i++) {
+        Send-RawTcpProbe -Port $TlsPort -Payload $plainHttp
+        Send-RawTcpProbe -Port $KikNoisePort -Payload $invalidNoise
+    }
+    Start-Sleep -Milliseconds 500
+    if ($server.Proc.HasExited) {
+        throw "ctrl_server exited after malformed transport probes"
+    }
+    Wait-TlsEndpoint -HostName "127.0.0.1" -Port $TlsPort -ServerName "real-ctrl-server" -CaCert $cert.Cert -TimeoutSeconds 10
+    $result.assertions += "malformed plaintext and Noise probes are rejected without service loss"
+
+    # 控制面明确只启用 TLS 1.3；即使证书可信，TLS 1.2 也不能协商成功。
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $tls12Output = "" | & openssl s_client `
+            -tls1_2 `
+            -connect "127.0.0.1:$TlsPort" `
+            -servername "real-ctrl-server" `
+            -CAfile $cert.Cert `
+            -verify_return_error `
+            -brief `
+            2>&1
+        $tls12ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+    $tls12Output | Set-Content -LiteralPath (Join-Path $LogDir "openssl_tls12_rejection.log") -Encoding UTF8
+    if ($tls12ExitCode -eq 0) {
+        throw "TLS 1.2 unexpectedly negotiated on the TLS 1.3-only control port"
+    }
+    $result.assertions += "control port rejects TLS 1.2"
+
+    $saturationConnections = Assert-KikSaturationDoesNotBlockTls `
+        -KikPort $KikNoisePort `
+        -ControlPort $TlsPort `
+        -ServerName "real-ctrl-server" `
+        -CaCert $cert.Cert
+    if ($server.Proc.HasExited) {
+        throw "ctrl_server exited during Kik connection saturation"
+    }
+    $result.kik_saturation_connections = $saturationConnections
+    $result.assertions += "Kik connection saturation cannot consume TLS management permits"
+
     $wrongPinEnv = $realCtrlEnv.Clone()
     $wrongPinEnv["REAL_CTRL_TLS_SERVER_SPKI_SHA256"] = "0" * 64
     $wrongPinEnv["REAL_CTRL_E2E_TRACE_PATH"] = (Join-Path $E2eDir "wrong_pin_trace.log")
@@ -471,6 +776,120 @@ try {
     }
     $result.assertions += "http api token required"
 
+    $validListBody = @{
+        version = 1
+        request_id = "http-security-valid"
+        command = @{ kind = "sys_list" }
+    } | ConvertTo-Json -Depth 8 -Compress
+    $wrongToken = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body $validListBody `
+        -Headers @{ Authorization = "Bearer definitely-wrong" }
+    $wrongScheme = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body $validListBody `
+        -Headers @{ Authorization = "Basic Zm9vOmJhcg==" }
+    $headerToken = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body $validListBody `
+        -Headers @{ "X-Real-Ctrl-Token" = $ApiToken }
+    if ($wrongToken.Status -ne 401 -or $wrongScheme.Status -ne 401 -or $headerToken.Status -ne 200) {
+        throw "HTTP token variants did not fail closed: wrong=$($wrongToken.Status), scheme=$($wrongScheme.Status), header=$($headerToken.Status)"
+    }
+    $unauthorizedMalformed = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body '{"version":1,"command":'
+    if ($unauthorizedMalformed.Status -ne 401) {
+        throw "HTTP authentication did not run before JSON body parsing"
+    }
+    $result.assertions += "wrong token and auth scheme are rejected while the dedicated token header works"
+
+    $authorizedHeaders = @{ Authorization = "Bearer $ApiToken" }
+    $malformedJson = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body '{"version":1,"command":' `
+        -Headers $authorizedHeaders
+    $unknownKind = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body '{"version":1,"request_id":"unknown-kind","command":{"kind":"not_a_command"}}' `
+        -Headers $authorizedHeaders
+    $unknownField = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body '{"version":1,"request_id":"unknown-field","command":{"kind":"sys_now","typo":true}}' `
+        -Headers $authorizedHeaders
+    $wrongMethod = Invoke-RawHttpRequest `
+        -Method "GET" `
+        -Path "/api/v1/commands" `
+        -Headers $authorizedHeaders
+    foreach ($probe in @($malformedJson, $unknownKind, $unknownField, $wrongMethod)) {
+        if ($probe.Status -lt 400 -or $probe.Status -ge 500) {
+            throw "Malformed HTTP input did not produce a bounded 4xx response: $($probe.Status) $($probe.Body)"
+        }
+    }
+
+    $unsupportedVersionBody = @{
+        version = 65535
+        request_id = "unsupported-version"
+        command = @{ kind = "sys_now" }
+    } | ConvertTo-Json -Compress
+    $unsupportedVersion = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body $unsupportedVersionBody `
+        -Headers $authorizedHeaders
+    $unsupportedVersionEnvelope = $unsupportedVersion.Body | ConvertFrom-Json
+    if ($unsupportedVersion.Status -ne 200 -or
+        $unsupportedVersionEnvelope.ok -or
+        $unsupportedVersionEnvelope.error.code -ne "unsupported_version") {
+        throw "Unsupported API version did not return the stable error envelope: $($unsupportedVersion.Body)"
+    }
+
+    $nulRequestId = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body '{"version":1,"request_id":"safe\u0000forged","command":{"kind":"sys_now"}}' `
+        -Headers $authorizedHeaders
+    $nulEnvelope = $nulRequestId.Body | ConvertFrom-Json
+    if ($nulRequestId.Status -ne 200 -or $nulEnvelope.ok -or $nulEnvelope.error.code -ne "bad_request") {
+        throw "NUL request_id did not fail validation: $($nulRequestId.Body)"
+    }
+
+    $oversizedBody = '{"version":1,"request_id":"oversized","command":{"kind":"sys_now"},"padding":"' +
+        ("x" * (1MB + 4096)) + '"}'
+    $oversized = Invoke-RawHttpRequest `
+        -Method "POST" `
+        -Path "/api/v1/commands" `
+        -Body $oversizedBody `
+        -Headers $authorizedHeaders `
+        -AllowTransportRejection
+    if ($oversized.Status -ne 413 -and -not $oversized.RejectedByDisconnect) {
+        throw "HTTP payload above 1 MiB was not rejected by status or transport close"
+    }
+
+    $evilOrigin = "https://attacker.invalid"
+    $cors = Invoke-RawHttpRequest `
+        -Method "OPTIONS" `
+        -Path "/api/v1/commands" `
+        -Headers @{
+            Origin = $evilOrigin
+            "Access-Control-Request-Method" = "POST"
+        }
+    if ($cors.Headers["access-control-allow-origin"] -eq $evilOrigin) {
+        throw "CORS reflected an untrusted Origin"
+    }
+    $healthAfterHttpProbes = Invoke-RawHttpRequest -Method "GET" -Path "/api/health"
+    if ($healthAfterHttpProbes.Status -ne 200 -or $healthAfterHttpProbes.Body -ne "OK") {
+        throw "HTTP service did not recover after malformed input probes"
+    }
+    $result.assertions += "malformed JSON, schema drift, NUL, oversized body, wrong method and hostile CORS fail closed"
+
     $sysList = $null
     for ($i = 0; $i -lt 20; $i++) {
         $sysList = Invoke-ApiCommand -Command @{ kind = "sys_list" } -RequestId "sys-list-$i"
@@ -511,6 +930,47 @@ try {
         throw "sys_now failed: $($sysNow | ConvertTo-Json -Depth 12 -Compress)"
     }
     $result.assertions += "sys_now ok"
+
+    # 命名管道与 HTTP 共用 ApiRequest/ApiResponse 契约。畸形 magic 和声明超限长度必须
+    # 返回结构化错误；随后同一管道入口仍应能执行合法请求。
+    [byte[]]$invalidPipePayload = [Text.Encoding]::UTF8.GetBytes('{"version":1}')
+    $invalidPipe = Invoke-PipePayload -Payload $invalidPipePayload
+    if ($invalidPipe.ok -or $invalidPipe.error.code -ne "bad_request") {
+        throw "Named pipe accepted a request without RTCAPI1 magic"
+    }
+    $oversizedPipe = Invoke-PipePayload -Payload ([byte[]]@()) -DeclaredLength (1MB + 1)
+    if ($oversizedPipe.ok -or $oversizedPipe.error.code -ne "payload_too_large") {
+        throw "Named pipe did not reject an oversized declared request"
+    }
+    $pipeJson = @{
+        version = 1
+        request_id = "pipe-valid-after-attacks"
+        command = @{ kind = "sys_now" }
+    } | ConvertTo-Json -Depth 8 -Compress
+    [byte[]]$validPipePayload = [Text.Encoding]::UTF8.GetBytes("RTCAPI1`0$pipeJson")
+    $validPipe = Invoke-PipePayload -Payload $validPipePayload
+    if (-not $validPipe.ok -or $validPipe.request_id -ne "pipe-valid-after-attacks") {
+        throw "Named pipe did not recover after malformed requests"
+    }
+    $result.assertions += "named pipe rejects bad magic and oversized frames, then recovers"
+
+    $pipeConcurrency = Start-E2eProcess `
+        -Name "pipe_concurrency_probe" `
+        -ExePath (Join-Path $Root "target\debug\examples\pipe_concurrency_probe.exe") `
+        -EnvMap @{}
+    if (-not $pipeConcurrency.Proc.WaitForExit(12000)) {
+        throw "Named-pipe concurrency probe timed out"
+    }
+    if ($pipeConcurrency.Proc.ExitCode -ne 0) {
+        throw "Named-pipe concurrency probe failed"
+    }
+    $pipeConcurrencyResult = $pipeConcurrency.StdOutTask.Result.Trim() | ConvertFrom-Json
+    if ($pipeConcurrencyResult.completed -ne 12 -or $pipeConcurrencyResult.elapsed_ms -ge 8000) {
+        throw "Named-pipe concurrency probe returned an invalid report"
+    }
+    $result.parallel_pipe_commands = [int]$pipeConcurrencyResult.completed
+    $result.parallel_pipe_ms = [int]$pipeConcurrencyResult.elapsed_ms
+    $result.assertions += "twelve named-pipe clients execute concurrently without response crossover"
 
     $sameAccountEnv = $realCtrlEnv.Clone()
     $sameAccountEnv["REAL_CTRL_HTTP_PORT"] = "$SameAccountHttpPort"
@@ -560,6 +1020,43 @@ try {
     }
     $result.assertions += "multiple accounts independently auto-select an authorized Kik"
 
+    # 三个真实控制实例同时运行耗时命令，覆盖同账号多实例和多账号多实例的服务端隔离。
+    # 12 个请求均小于 Kik 级 16 许可；若任何层仍是全局串行，耗时会接近 24 秒。
+    $multiInstanceTargets = @()
+    foreach ($target in @(
+        @{ Prefix = "tenant-a-primary"; Port = $HttpPort },
+        @{ Prefix = "tenant-a-secondary"; Port = $SameAccountHttpPort },
+        @{ Prefix = "tenant-b-primary"; Port = $SecondAccountHttpPort }
+    )) {
+        for ($i = 0; $i -lt 4; $i++) {
+            $requestId = "$($target.Prefix)-concurrent-$i"
+            $multiInstanceTargets += [pscustomobject]@{
+                Port = $target.Port
+                RequestId = $requestId
+                Command = @{
+                    kind = "exec"
+                    command = "ping -n 3 127.0.0.1 >NUL && echo $requestId"
+                }
+            }
+        }
+    }
+    $multiInstanceWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $multiInstanceResponses = Invoke-ParallelApiTargets -Targets $multiInstanceTargets
+    $multiInstanceWatch.Stop()
+    for ($i = 0; $i -lt $multiInstanceTargets.Count; $i++) {
+        $expected = [string]$multiInstanceTargets[$i].RequestId
+        $actual = $multiInstanceResponses[$i]
+        if (-not $actual.ok -or $actual.request_id -ne $expected -or $actual.data.message -notmatch [regex]::Escape($expected)) {
+            throw "Multi-instance response isolation failed for $expected"
+        }
+    }
+    if ($multiInstanceWatch.ElapsedMilliseconds -ge 8000) {
+        throw "Multi-account/instance commands appear serialized: $($multiInstanceWatch.ElapsedMilliseconds) ms"
+    }
+    $result.multi_instance_parallel_commands = $multiInstanceTargets.Count
+    $result.multi_instance_parallel_ms = $multiInstanceWatch.ElapsedMilliseconds
+    $result.assertions += "same-account and cross-account instances execute concurrently without response crossover"
+
     $missingRemote = Join-Path $E2eDir "missing-download-source.bin"
     $missingLocal = Join-Path $E2eDir "missing-download-target.bin"
     Remove-Item -LiteralPath $missingRemote, $missingLocal -Force -ErrorAction SilentlyContinue
@@ -593,12 +1090,118 @@ try {
         @($parallelResponses | Where-Object { -not $_.ok -or $_.data.message -notmatch "parallel-ok" }).Count -ne 0) {
         throw "Parallel HTTP command responses were incomplete or mismatched"
     }
+    for ($i = 0; $i -lt $parallelResponses.Count; $i++) {
+        if ($parallelResponses[$i].request_id -ne "parallel-$i") {
+            throw "Parallel HTTP response request_id crossed over at index $i"
+        }
+    }
     if ($parallelWatch.ElapsedMilliseconds -ge 8000) {
         throw "HTTP commands appear serialized: $($parallelWatch.ElapsedMilliseconds) ms"
     }
     $result.parallel_http_commands = 6
     $result.parallel_http_ms = $parallelWatch.ElapsedMilliseconds
     $result.assertions += "six HTTP commands execute independently in parallel"
+
+    # 突发数同时超过本地 command gate 32 和服务端单实例/Kik 16。系统应快速拒绝超额请求，
+    # 而不是无界排队、超时或把响应投递给错误的调用方。
+    $burstCommands = @(0..47 | ForEach-Object {
+        @{ kind = "exec"; command = "ping -n 4 127.0.0.1 >NUL && echo burst-ok" }
+    })
+    $burstWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $burstResponses = Invoke-ParallelApiCommands `
+        -Commands $burstCommands `
+        -RequestIdPrefix "burst" `
+        -TimeoutMilliseconds 15000
+    $burstWatch.Stop()
+    if ($burstResponses.Count -ne 48) {
+        throw "Burst test returned $($burstResponses.Count) of 48 responses"
+    }
+    for ($i = 0; $i -lt $burstResponses.Count; $i++) {
+        if ($burstResponses[$i].request_id -ne "burst-$i") {
+            throw "Burst response request_id crossed over at index $i"
+        }
+    }
+    $burstSucceeded = @($burstResponses | Where-Object { $_.ok -and $_.data.message -match "burst-ok" }).Count
+    $burstRejected = @($burstResponses | Where-Object { -not $_.ok -and $null -ne $_.error.code }).Count
+    if ($burstSucceeded -lt 8 -or $burstSucceeded -gt 16 -or $burstSucceeded + $burstRejected -ne 48) {
+        throw "Burst quota result is outside the expected bounded behavior: success=$burstSucceeded rejected=$burstRejected"
+    }
+    if ($burstWatch.ElapsedMilliseconds -ge 10000) {
+        throw "Burst requests were queued instead of bounded: $($burstWatch.ElapsedMilliseconds) ms"
+    }
+    $afterBurst = Invoke-ApiCommand -Command @{ kind = "sys_now" } -RequestId "after-burst"
+    if (-not $afterBurst.ok) {
+        throw "HTTP control path did not recover after quota saturation"
+    }
+    $result.burst_commands = 48
+    $result.burst_succeeded = $burstSucceeded
+    $result.burst_rejected = $burstRejected
+    $result.burst_ms = $burstWatch.ElapsedMilliseconds
+    $result.assertions += "48-request burst is bounded by permits and recovers without correlation loss"
+
+    # 分批发出 100 个轻量命令，检查长期使用中的许可归还和 request_id 路由。
+    $stabilityCompleted = 0
+    for ($batch = 0; $batch -lt 10; $batch++) {
+        $batchResponses = Invoke-ParallelApiCommands `
+            -Commands @(0..9 | ForEach-Object { @{ kind = "sys_now" } }) `
+            -RequestIdPrefix "stability-$batch" `
+            -TimeoutMilliseconds 10000
+        for ($i = 0; $i -lt $batchResponses.Count; $i++) {
+            if (-not $batchResponses[$i].ok -or
+                $batchResponses[$i].request_id -ne "stability-$batch-$i") {
+                throw "Stability command failed or crossed responses at batch=$batch index=$i"
+            }
+            $stabilityCompleted++
+        }
+    }
+    if ($stabilityCompleted -ne 100) {
+        throw "Stability loop completed only $stabilityCompleted commands"
+    }
+    $result.stability_commands = $stabilityCompleted
+    $result.assertions += "100-command stability loop releases permits and preserves request correlation"
+
+    # 六个独立文件并行上传再并行下载，验证数据连接轮转、内部 wire ID 改写和乱序落盘隔离。
+    $smallFileDir = Join-Path $E2eDir "parallel-files"
+    New-Item -ItemType Directory -Force -Path $smallFileDir | Out-Null
+    $smallFiles = @()
+    for ($i = 0; $i -lt 6; $i++) {
+        $source = Join-Path $smallFileDir "source-$i.bin"
+        $remote = Join-Path $smallFileDir "remote-$i.bin"
+        $download = Join-Path $smallFileDir "download-$i.bin"
+        [byte[]]$content = New-Object byte[] (256KB)
+        [System.Random]::new(7000 + $i).NextBytes($content)
+        [IO.File]::WriteAllBytes($source, $content)
+        Remove-Item -LiteralPath $remote, $download -Force -ErrorAction SilentlyContinue
+        $smallFiles += [pscustomobject]@{ Source = $source; Remote = $remote; Download = $download }
+    }
+    $uploadResponses = Invoke-ParallelApiCommands `
+        -Commands @($smallFiles | ForEach-Object {
+            @{ kind = "ctrl_set_file"; local_path = $_.Source; remote_path = $_.Remote }
+        }) `
+        -RequestIdPrefix "parallel-upload" `
+        -TimeoutMilliseconds 20000
+    if (@($uploadResponses | Where-Object { -not $_.ok }).Count -ne 0) {
+        throw "One or more parallel small-file uploads failed"
+    }
+    $downloadResponses = Invoke-ParallelApiCommands `
+        -Commands @($smallFiles | ForEach-Object {
+            @{ kind = "ctrl_get_file"; remote_path = $_.Remote; local_path = $_.Download }
+        }) `
+        -RequestIdPrefix "parallel-download" `
+        -TimeoutMilliseconds 20000
+    if (@($downloadResponses | Where-Object { -not $_.ok }).Count -ne 0) {
+        throw "One or more parallel small-file downloads failed"
+    }
+    foreach ($fileSet in $smallFiles) {
+        $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $fileSet.Source).Hash
+        $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $fileSet.Remote).Hash
+        $downloadHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $fileSet.Download).Hash
+        if ($sourceHash -ne $remoteHash -or $sourceHash -ne $downloadHash) {
+            throw "Parallel file SHA-256 mismatch for $($fileSet.Source)"
+        }
+    }
+    $result.parallel_file_roundtrips = $smallFiles.Count
+    $result.assertions += "six concurrent file roundtrips preserve per-request SHA-256"
 
     # 12 MiB 覆盖多个 4 MiB 分片，同时保持 CI 运行时间可控。上传和下载都必须经过
     # real_ctrl -> ctrl_server -> ctrl_kik 数据通道，不能用同机文件存在替代协议验收。

@@ -1,3 +1,8 @@
+//! 三端共享的运行配置数据结构。
+//!
+//! 本模块只定义经过校验后供连接层使用的配置，不负责决定配置来源。`real_ctrl`、`ctrl_server` 和
+//! `ctrl_kik` 各自在启动层合并编译期默认值与允许运行时覆盖的环境变量。
+
 use crate::hidden;
 use anyhow::{anyhow, Context};
 use std::env;

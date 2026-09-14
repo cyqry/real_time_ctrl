@@ -1,3 +1,8 @@
+//! 服务端监听、传输握手、帧读取和连接清理主循环。
+//!
+//! 两个公网端口先分别完成 TLS 或 Noise，再统一包装为 `Channel + FramedRead`。初始化处理器确定角色后，
+//! 读循环才放宽帧上限并分派到 control/data/kik 处理器；任何退出路径最终进入 `handle_inactive` 清理状态。
+
 use crate::core::connection_meta::KIK_ID;
 use crate::core::context::Context;
 use crate::handler::read_handle;
@@ -16,7 +21,7 @@ use common::secure_transport::{
     CTRL_TLS_PREFIX,
 };
 use ctrl_common::ctrl_protocol::ctrl_ping;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,8 +34,13 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 
 pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
-    // 连接许可在握手前获取，避免 TLS/半帧慢连接无限创建任务并占满内存。
-    let connection_limit = Arc::new(Semaphore::new(512));
+    // `run` 只在这里创建 listener；后续每个 accept 和连接读循环都在独立任务中运行。
+    // 两个公网端口分别限流。Kik 是匿名 Noise 发起方，若与管理面共享许可，攻击者可仅靠
+    // 占满 Kik 慢握手使合法 TLS 控制端无法接入；独立上限同时保证隔离和总资源可计算。
+    const MAX_TLS_CONNECTIONS: usize = 512;
+    const MAX_KIK_CONNECTIONS: usize = 512;
+    let tls_connection_limit = Arc::new(Semaphore::new(MAX_TLS_CONNECTIONS));
+    let kik_connection_limit = Arc::new(Semaphore::new(MAX_KIK_CONNECTIONS));
     let tls_acceptor = build_server_tls_acceptor(&config.security)?;
     let kik_noise_acceptor =
         build_kik_noise_acceptor(config.security.kik_noise_private_key.as_deref())?;
@@ -51,13 +61,14 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     );
     let tls_context = context.clone();
     let tls_config = config.clone();
-    let tls_connection_limit = connection_limit.clone();
+    let tls_connection_limit = tls_connection_limit.clone();
     tokio::spawn(async move {
         loop {
             match tls_listener.accept().await {
                 Ok((stream, addr)) => {
                     let Ok(permit) = tls_connection_limit.clone().try_acquire_owned() else {
-                        warn!("活动连接达到上限，拒绝 TLS 连接: {}", addr);
+                        // 远端可控事件不能逐条写 production 日志，否则连接风暴会放大为磁盘 DoS。
+                        debug!("TLS 活动连接达到上限，拒绝连接: {}", addr);
                         continue;
                     };
                     let acceptor = tls_acceptor.clone();
@@ -77,7 +88,7 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
                                 .await;
                             }
                             Err(error) => {
-                                error!("TLS 握手失败，远程地址:{}，error:{}", addr, error);
+                                debug!("TLS 握手失败，远程地址:{}，error:{}", addr, error);
                             }
                         }
                     });
@@ -95,8 +106,8 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
     );
     loop {
         let (stream, addr) = kik_listener.accept().await?;
-        let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
-            warn!("活动连接达到上限，拒绝 Kik Noise 连接: {}", addr);
+        let Ok(permit) = kik_connection_limit.clone().try_acquire_owned() else {
+            debug!("Kik Noise 活动连接达到上限，拒绝连接: {}", addr);
             continue;
         };
         let acceptor = kik_noise_acceptor.clone();
@@ -109,7 +120,7 @@ pub async fn run(context: Context, config: Config) -> anyhow::Result<()> {
                     handle_transport_parts(context, config, parts, addr, TransportPolicy::NoiseKik)
                         .await;
                 }
-                Err(error) => error!("Kik Noise 握手失败，远程地址:{}，error:{}", addr, error),
+                Err(error) => debug!("Kik Noise 握手失败，远程地址:{}，error:{}", addr, error),
             }
         });
     }
@@ -250,16 +261,16 @@ async fn handle_error(chan: Arc<Mutex<Channel>>, error: Error) {
         .map(|addr| addr.to_string())
         .unwrap_or("未知远程地址".to_string());
     if error.is::<io::Error>() {
-        println!("io错误，远程地址:{}，error:{}", remote_addr, error);
+        debug!("连接 I/O 结束，远程地址:{}，error:{}", remote_addr, error);
     } else if error.is::<time::error::Elapsed>() {
-        println!("读取超时，远程地址:{}", remote_addr);
+        debug!("连接读取超时，远程地址:{}", remote_addr);
     } else {
-        error!("处理连接错误，远程地址:{}，error:{}", remote_addr, error);
+        debug!("拒绝无效连接，远程地址:{}，error:{}", remote_addr, error);
     }
 }
 
 async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
-    //统一close
+    // 所有退出原因共用同一清理入口；先关闭写半边，阻止其他任务继续复用该流。
     channel.lock().await.try_write_half_close().await;
 
     let ip = channel
@@ -275,24 +286,21 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
             context.delete_ctrl_conn_if(&channel).await;
         }
         ChannelType::CtrlData => {
-            //清理
             context.delete_ctrl_data_conn(channel).await;
         }
         ChannelType::Kik => {
-            // kik连接的id直接是kikid
+            // Kik 主连接的 Channel ID 就是 Kik ID；指针检查避免旧连接回调删掉重连后的新连接。
             let Some(id) = channel.lock().await.id().map(str::to_owned) else {
                 warn!("Kik 连接关闭时尚未分配 ID");
                 return;
             };
-            // context.set_kik_state();
-            // 因为Kik连接断开了，所以万一在被控制，需要清理
             let _ = context.delete_kik_conn_if(id.as_str(), &channel).await;
+            // 只有主连接和全部数据连接都消失，才把 Kik 记为完整下线。
             if let Some(kik) = context.delete_kik_if_not_online(id.as_str()).await {
                 info!("【{}】下线，ip:{}", kik.kik_client_info.kik_info.name, ip);
             }
         }
         ChannelType::KikData => {
-            //清理
             context.delete_kik_data_conn(channel.clone()).await;
             let kik_id = channel.lock().await.attribute(&KIK_ID).cloned();
             if let Some(kik_id) = kik_id {
@@ -301,15 +309,14 @@ async fn handle_inactive(context: Context, channel: Arc<Mutex<Channel>>) {
                 }
             }
         }
-        ChannelType::Unknown => {
-            //清理？？？？
-        }
+        // 初始化失败的连接尚未进入任何全局会话表，关闭网络流即可。
+        ChannelType::Unknown => {}
     };
 }
 
 async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
-        //延迟发ping
+        // 初始化阶段不能发送业务帧；先等待角色确定，再按该角色选择心跳编码。
         time::sleep(Duration::from_secs(5)).await;
         if channel.lock().await.is_closed() {
             return;
@@ -322,7 +329,7 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
         };
         let Some(ping) = ping else { continue };
 
-        //服务端要保证得到状态之后延迟一点发，因为要等对方接收确认
+        // 角色刚切换时再留一个间隔，让初始化确认先到达客户端，避免确认与心跳交错。
         time::sleep(Duration::from_secs(5)).await;
         match channel.lock().await.write_and_flush(&ping).await {
             Ok(_) => {}
@@ -341,7 +348,10 @@ fn max_frame_len_for_channel_type(channel_type: &ChannelType) -> usize {
     }
 }
 
-//由于初始化验证消息和业务消息是分开的，所以初始化过程中不能ping pong和发业务消息，所以服务端要么 确认 客户端接收到服务端确认 才能 ping pong， 要么 向客户端发送服务端确认之后 延迟发ping pong；这里采用后者方案
+/// 根据已经确定的连接角色分派一条完整帧。
+///
+/// `Unknown` 阶段只允许初始化消息；端口传输策略进一步限制 TLS 只能声明 Ctrl/CtrlData、Noise 只能
+/// 声明 Kik/KikData。角色切换在初始化处理器返回前完成，因此下一帧会稳定进入业务处理器。
 async fn handle_read(
     config: Config,
     context: Context,
@@ -359,7 +369,6 @@ async fn handle_read(
         ChannelType::Kik => read_handle::handle_kik(context, channel, msg).await,
         ChannelType::KikData => read_handle::handle_kik_data(context, channel, msg).await,
         ChannelType::Unknown => {
-            //未识别的连接连ping pong 都不让发； unknow到其他消息状态的转换最好是同步的，不然有问题
             let allow_ctrl = matches!(transport_policy, TransportPolicy::TlsControl);
             let allow_kik = matches!(transport_policy, TransportPolicy::NoiseKik);
             read_handle::handle_init_message(config, context, channel, msg, allow_ctrl, allow_kik)

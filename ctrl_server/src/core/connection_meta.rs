@@ -1,3 +1,8 @@
+//! 初始化状态临时附着到 `Channel` 时使用的类型安全键。
+//!
+//! 认证分多帧完成，前一帧中的随机数和身份需要保存到同一连接。固定键避免字符串拼写错误和手写
+//! `Any` downcast；这些值只属于当前连接，不能当成全局会话表。
+
 use common::channel::ChannelAttributeKey;
 pub const CTRL_AUTH_CLIENT_NONCE: ChannelAttributeKey<String> =
     ChannelAttributeKey::new(0x6374_726c_636e_6f6e);

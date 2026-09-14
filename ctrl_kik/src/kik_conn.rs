@@ -1,3 +1,8 @@
+//! Kik 主连接的 Noise 握手、注册、读循环、心跳和命令工作队列。
+//!
+//! 建连函数只有收到服务端 Kik ID 后才返回成功。读循环只解析和投递命令，最多 16 个命令任务并行执行，
+//! 因而文件或 Exec 不会阻塞 Ping/Pong；主连接断开会结束本轮所有关联状态。
+
 use crate::context::{Context, Kik, COMMAND_SENDER};
 use crate::{cmd_util, read_handle};
 use anyhow::Error;
@@ -25,6 +30,7 @@ use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 
+/// 建立并注册一条 Kik 主连接，返回负责其余生命周期的后台读任务。
 pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
     let transport = connect_kik_noise(
         &config.server_host,
@@ -51,12 +57,12 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
         .await
         .set_write_timeout(config.write_timeout);
 
-    //active逻辑
+    // 主动发送注册帧；此时角色仍是 Unknown，收到 KikId 后才切换为 Kik。
     let name = cmd_util::whoami();
     let channel = channel_arc.clone();
     handle_active(context.clone(), name.clone(), channel.clone()).await?;
 
-    //tx在连接处理线程结束后被关闭
+    // 容量 1 的初始化通道只传一次 Kik ID，使调用方在返回前确认注册已完成。
     let (mut tx, mut rx) = mpsc::channel::<String>(1);
 
     let context_clone = context.clone();
@@ -65,7 +71,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     let handle = tokio::spawn(async move {
         let context = context_clone;
         let channel = channel_clone;
-        //执行心跳逻辑
+        // 心跳独立运行，命令任务变慢时仍能及时发现半开连接。
         let chan = channel.clone();
         tokio::spawn(async move {
             heartbeat(chan).await;
@@ -79,11 +85,11 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
             };
 
             match read_result {
-                //timeout返回 Ok说明读取未超时
+                // 外层 timeout 区分“没有帧到达”和“解码/连接本身失败”。
                 Ok(res) => {
                     match res {
                         Some(Ok(msg)) => {
-                            //read逻辑
+                            // 解析器会把命令放入有界工作队列，不在网络读任务中执行。
                             let channel = channel.clone();
                             if let Err(error) =
                                 handle_read(&context, channel.clone(), msg, &mut tx).await
@@ -104,7 +110,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
                             dev_debug!("连接异常:{}", e);
                             break Some(anyhow::Error::new(e));
                         }
-                        //对方正常关闭
+                        // `None` 表示对端正常关闭字节流，仍需进入统一 inactive 清理。
                         None => {
                             //不在这里对正常关闭进行特殊处理
                             break None;
@@ -124,7 +130,7 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
         handle_inactive(context.clone(), channel.clone()).await;
     });
 
-    //这次为第一次rx接收数据,用于阻塞校验
+    // 等待初始化通道中的唯一 Kik ID，确保调用者随后创建的数据连接绑定正确会话。
     match timeout(read_timeout, rx.recv()).await {
         Ok(recv) => match recv {
             None => {

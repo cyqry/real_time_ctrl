@@ -1,3 +1,8 @@
+//! CtrlData 与 KikData 之间的数据帧转发。
+//!
+//! 每帧先查 `Context` 中绑定会话、Kik 和方向的路由，再把外部 ID 与内部 ID 相互改写。转发会等待
+//! 下游写入形成背压；一条连接失败时只在当前有界连接快照内重试，不创建无界任务。
+
 use crate::core::connection_meta::{CTRL_SESSION_ID, KIK_ID};
 use crate::core::context::Context;
 use bytes::BytesMut;
@@ -5,7 +10,7 @@ use common::channel::Channel;
 use common::message::kik_frame::{encode_data_frame as encode_kik_data_frame, KikFrame};
 use common::protocol::BufSerializable;
 use ctrl_common::ctrl_frame::{encode_data_frame as encode_ctrl_data_frame, Frame};
-use log::warn;
+use log::debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -63,7 +68,7 @@ pub async fn handle_kik_data(
             let Some((session_id, external_id, single_frame)) =
                 context.kik_data_target(&kik_id, &wire_id).await
             else {
-                warn!(
+                debug!(
                     "丢弃未注册或跨 Kik 的数据帧: kik_id={}, data_id={}",
                     kik_id, wire_id
                 );

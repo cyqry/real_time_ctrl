@@ -1,3 +1,8 @@
+//! `ctrl_kik` 与服务端之间的 Noise NK 加密字节流。
+//!
+//! 握手完成后，`NoiseReader` / `NoiseWriter` 把多个有长度的 AEAD 记录重新表现为普通
+//! `AsyncRead` / `AsyncWrite`。上层仍按自己的应用帧读写，不需要知道一次应用帧跨了多少 Noise 记录。
+
 use crate::hidden;
 use crate::secure_transport::TransportParts;
 use anyhow::Context;

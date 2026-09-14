@@ -1,3 +1,8 @@
+//! 远程协议的公共信封、序列化约定和外层封帧函数。
+//!
+//! 编码顺序是：业务对象先实现 `BufSerializable` 得到帧 body，再由 `transfer_encode*` 添加长度前缀。
+//! 长度前缀只用于 TCP 分帧，不提供加密或认证；生产字节流必须先位于 TLS 或 Noise 内。
+
 use crate::command::Command;
 use crate::generated::encrypted_strings::{CMD_OPTIONS_TIMEOUT_FALSE, CMD_OPTIONS_TIMEOUT_TRUE};
 use crate::message::kik_frame::KikFrame;
@@ -6,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::hidden;
 
+/// 项目内部二进制消息的最小编解码接口。
+///
+/// `from_buf(None)` 表示输入不是一条完整、合法且没有多余字段的消息。因为输入来自网络，解析器必须
+/// 先检查长度再读取，不能用 panic 表示格式错误。
 pub trait BufSerializable {
     fn to_buf(&self) -> BytesMut;
     fn from_buf(bys: BytesMut) -> Option<Self>
@@ -17,11 +26,13 @@ pub const MAX_CORRELATION_ID_BYTES: usize = 128;
 const MAX_COMMAND_OPTIONS_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// 命令执行选项。`timeout=false` 表示使用有限的长任务时限，并非永久等待。
 pub struct CmdOptions {
     timeout: bool,
 }
 
 #[derive(Debug, Clone)]
+/// 命令信封：关联 ID 负责并发响应路由，选项决定超时档位，正文描述实际动作。
 pub struct ReqCmd {
     id: String,
     cmd_options: CmdOptions,
@@ -128,7 +139,10 @@ impl BufSerializable for ReqCmd {
     }
 }
 
-//对应 ltc解码器 data长度 data内容的格式
+/// 给普通业务帧添加网络长度前缀。
+///
+/// 返回值可以直接交给 `Channel::write_and_flush`；接收端的
+/// `LengthFieldBasedFrameDecoder` 会移除该前缀，只把 body 交给业务解析器。
 pub fn transfer_encode(bts: BytesMut) -> BytesMut {
     if bts.len() > u32::MAX as usize {
         panic!("{}", hidden!("要传输的数据太大"))
@@ -139,6 +153,7 @@ pub fn transfer_encode(bts: BytesMut) -> BytesMut {
     bytes_mut
 }
 
+/// 给输入切片的指定半开区间添加网络长度前缀，主要供本地管道复用统一封帧方式。
 pub fn transfer_b_encode(bts: &[u8], start: usize, end: usize) -> BytesMut {
     let len = end - start;
     if len > u32::MAX as usize {

@@ -1,3 +1,8 @@
+//! Kik 端实际执行文件、目录、截图和 Exec 命令的业务层。
+//!
+//! `RunOutcome` 把控制响应和可选的“大文件发送放行器”绑定在一起：只有响应成功写回主连接，后台分片
+//! 任务才启动。接收大文件则始终先写随机 `.temp`，完成范围与 SHA-256 校验后再提交目标路径。
+
 use crate::context::Context;
 use crate::{cmd_util, screen};
 use common::command::{Command, CtrlCommand};
@@ -17,6 +22,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
+/// 命令结果以及响应写成功后需要启动的延迟数据任务。
 pub struct RunOutcome {
     response: KikResp,
     transfer_start: Option<oneshot::Sender<()>>,
@@ -42,6 +48,7 @@ impl RunOutcome {
     }
 }
 
+/// 执行一条已经通过服务端授权并路由到本 Kik 的命令。
 pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
     match cmd {
         Command::Ctrl(c) => {
@@ -71,10 +78,10 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
                     }
                 }
                 CtrlCommand::SetFile(data_id, save_path) => {
-                    //recv data
+                    // 控制命令已经预先认领该 data ID；这里消费数据连接上可能更早到达的单帧内容。
                     match context.read_data(&data_id).await {
                         Ok(data) => {
-                            //save_path
+                            // 小文件仍走统一受控写盘函数，确保 flush/sync 语义与错误处理一致。
                             match file_util::save_file(save_path.as_str(), &data).await {
                                 Ok(_) => {
                                     kik_success_info(hidden!("保存文件至Kik:", save_path, "成功"))

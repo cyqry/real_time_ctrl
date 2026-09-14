@@ -1,3 +1,8 @@
+//! ctrl_kik 的初始化帧、命令帧和数据帧分派。
+//!
+//! 网络读任务只做解析与有界投递。命令进入工作队列后由独立任务执行，上传数据按 data ID 进入私有队列；
+//! 这保证慢磁盘、Exec 和乱序文件帧不会阻塞连接心跳。
+
 use crate::cmd_runner;
 use crate::context::{Context, COMMAND_SENDER};
 use bytes::BytesMut;
@@ -27,7 +32,7 @@ pub async fn handle_kik(
 ) -> anyhow::Result<()> {
     let frame = KikFrame::from_buf(msg).ok_or_else(|| anyhow::Error::msg(hidden!("帧格式错误")))?;
     match frame {
-        //控制过程应由单独线程处理，不阻塞连接主线程,与ping pong分开
+        // 命令只进入工作队列，不在读循环执行；这样慢命令不会阻塞 Ping/Pong。
         KikFrame::Cmd(req_cmd) => {
             let command = req_cmd.split();
             let upload_data_id = match &command.2 {
@@ -64,6 +69,7 @@ pub async fn handle_kik(
     Ok(())
 }
 
+/// 在独立命令任务中执行请求并写回带内部命令 ID 的响应。
 pub async fn handle_kik_cmd(
     context: Context,
     channel: &Arc<Mutex<Channel>>,
@@ -101,7 +107,7 @@ pub async fn handle_kik_cmd(
             resp, cmd_id,
         )))
         .await;
-    //当发送失败
+    // 响应写失败说明主连接已不可信；写成功后才允许大文件生产者开始发送分片。
     if suc.is_err() {
         channel.lock().await.try_write_half_close().await;
     } else if let Some(start) = transfer_start {
@@ -139,7 +145,7 @@ pub async fn handle_init_message(
     msg: BytesMut,
     tx: &mut Sender<String>,
 ) -> anyhow::Result<()> {
-    //由于服务端延迟发ping 所以还未初始化完成的kik连接 一般不会收到服务器的 KikFrame::Ping
+    // 服务端会让初始化确认先于心跳发送；即使网络重排，Unknown 阶段也只接受 InitFrame。
     let frame =
         InitFrame::from_buf(msg).ok_or_else(|| anyhow::Error::msg(hidden!("帧格式错误")))?;
     match frame {

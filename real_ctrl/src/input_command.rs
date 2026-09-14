@@ -1,3 +1,8 @@
+//! 控制端本地命令模型和控制台文本解析。
+//!
+//! `InputCtrlCommand` 同时保存远端路径与控制端本地路径；转为 `common::CtrlCommand` 时会剥离本地信息。
+//! HTTP/管道直接构造这些类型，不受控制台按空白切分的表达能力限制。
+
 use anyhow::anyhow;
 use common::command::LocalCommand::LocalExit;
 use common::command::SysCommand::*;
@@ -114,7 +119,7 @@ impl FromStr for InputCommand {
                     match args.len() {
                         0 => Ok(InputCommand::Ctrl(InputCtrlCommand::Ls(dir))),
                         _ => {
-                            //先不做特殊处理
+                            // 保留 `$ls path -r` 的历史文本语义，具体参数由 Kik 端目录命令解析。
                             let v: Vec<&str> = std::iter::once(dir.as_str())
                                 .chain(args.iter().cloned())
                                 .collect();

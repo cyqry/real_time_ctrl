@@ -1,3 +1,8 @@
+//! TLS 内控制会话与数据通道的 HMAC 挑战应答工具。
+//!
+//! 域标签、账号/实例和随机数一起进入 HMAC，防止同一个部署秘密在不同用途或不同身份之间产生可重放证明。
+//! 本模块只计算和验证证明；随机数去重、会话过期和连接绑定由 `ctrl_server::Context` 管理。
+
 use crate::hidden;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -19,6 +24,7 @@ pub fn hmac_sha256_hex(secret: &str, parts: &[&str]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .expect(&hidden!("HMAC-SHA256 接受任意长度密钥"));
     for part in parts {
+        // NUL 分隔避免 ["ab", "c"] 与 ["a", "bc"] 拼接为相同消息。
         mac.update(part.as_bytes());
         mac.update(&[0]);
     }

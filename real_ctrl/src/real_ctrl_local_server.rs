@@ -1,3 +1,5 @@
+//! 仅提供 Windows 命名管道 API 的进程入口。
+
 use chrono::Local;
 use real_ctrl::local_server::server::start_pipe_server;
 use real_ctrl::run_util::apply_log_filter;

@@ -1,3 +1,8 @@
+//! real_ctrl 三种进程形态共用的配置装配。
+//!
+//! 每项先读取允许的运行环境变量，缺失时使用 build.rs 注入并经 `hidden!` 解密的默认值。这里负责
+//! 生成经过业务校验的 `common::Config`，调用方不应再次拼接另一套端口或身份来源。
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use common::config::{Config, Id, SecurityConfig};

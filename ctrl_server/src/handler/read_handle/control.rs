@@ -1,3 +1,8 @@
+//! 已认证 Ctrl 主连接上的命令与响应编排。
+//!
+//! 读循环只做解析、策略检查和取得并发许可，然后为每条命令启动独立任务。系统命令在服务端完成；
+//! 远程命令会选择当前 Kik、改写命令/数据关联 ID，并等待该 Kik 的专属 oneshot 响应。
+
 use crate::core::connection_meta::CTRL_SESSION_ID;
 use crate::core::context::Context;
 use bytes::BytesMut;
@@ -59,7 +64,8 @@ pub async fn handle_ctrl(
             };
             tokio::spawn(async move {
                 let _permits = permits;
-                debug!("处理控制命令: session={}, cmd_id={}", session_id, cmd_id);
+                // session ID 属于数据通道绑定材料；日志只保留服务端随机命令 ID。
+                debug!("处理控制命令: cmd_id={}", cmd_id);
                 if let Err(error) = execute_command(
                     context,
                     channel.clone(),
@@ -201,7 +207,7 @@ async fn execute_remote(
     let _kik_permit = match kik.try_acquire_command() {
         Ok(permit) => permit,
         Err(_) => {
-            return write_error(channel, external_cmd_id, "该 Kik 的命令并发达到上限".into()).await
+            return write_error(channel, external_cmd_id, "该 Kik 的命令并发达到上限".into()).await;
         }
     };
 

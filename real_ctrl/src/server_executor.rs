@@ -1,3 +1,7 @@
+//! 由 ctrl_server 自身处理的系统命令适配器。
+//!
+//! 在线列表、当前目标和上下线历史不会发送给 Kik；服务端返回的结构化 JSON 在这里恢复为控制端业务类型。
+
 use crate::context::{id, Context};
 use crate::input_command::{RemoteResp, RemoteSuccessResp};
 use common::command::{Command, SysCommand};

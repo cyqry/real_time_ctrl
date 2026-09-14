@@ -1,3 +1,8 @@
+//! 服务端视角的单个在线 Kik 会话。
+//!
+//! 一个 Kik 有一条主连接、多条数据连接、一个有界命令许可池和按内部命令 ID 索引的 oneshot 等待者。
+//! 结构体可克隆，但克隆只复制 `Arc`，所有任务仍观察同一份连接和路由状态。
+
 use crate::entity::KikClientInfo;
 use common::channel::Channel;
 use common::kik_info::KikInfo;
@@ -13,16 +18,20 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireErro
 /// 克隆 `Kik` 只克隆共享状态句柄，不会复制底层连接。
 #[derive(Clone)]
 pub struct Kik {
-    // Kik 创建完成后 id 一定存在；None 仅用于首次注册请求。
+    /// Kik 创建完成后 ID 一定存在；`None` 只会出现在尚未注册的 `KikInfo` 输入中。
     pub kik_client_info: KikClientInfo,
+    /// 当前主连接。重连会原子替换它，旧连接的清理回调必须用指针身份确认后再删除。
     conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
-    //data conn 的getid是 random id,  attr 一个 kik id;这里的key为 data conn的get_id
+    /// 数据连接以连接自身的随机 ID 为键；每条连接属性中另外保存所属 Kik ID。
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
+    /// 只用于负载轮询，不参与安全判断，因此使用 Relaxed 原子序即可。
     next_data_conn: Arc<AtomicUsize>,
 
-    //是否已上线(只在初始化时修改一次)
+    /// 初始化完成标志；只有置为 true 后才允许出现在控制端的在线列表中。
     initialized: Arc<AtomicBool>,
+    /// 服务端内部命令 ID 到独立响应发送端的映射，防止并发响应串单。
     pending_commands: Arc<Mutex<HashMap<String, oneshot::Sender<KikResp>>>>,
+    /// 单个 Kik 的命令并发上限，许可随命令任务的 RAII 生命周期释放。
     command_limit: Arc<Semaphore>,
 }
 

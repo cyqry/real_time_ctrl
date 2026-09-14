@@ -1,3 +1,8 @@
+//! HTTP 与命名管道共用的稳定业务服务层。
+//!
+//! 适配器先验证 API 契约和能力策略，再取得进程级有界并发许可，最后进入统一分派。许可覆盖控制响应和
+//! 关联数据处理的完整生命周期，防止大文件命令脱离并发统计。
+
 use crate::api_contract::{
     remote_resp_to_api_data, ApiErrorBody, ApiRequest, ApiResponse, API_VERSION,
 };
@@ -6,6 +11,7 @@ use crate::dispatch;
 use crate::input_command::{InputCommand, RemoteResp};
 
 #[derive(Debug, thiserror::Error)]
+/// 服务层内部错误；进入 HTTP/管道响应前还会映射为稳定 `ApiErrorBody`。
 pub enum ApiServiceError {
     #[error("控制命令并发达到上限")]
     Busy,
@@ -16,12 +22,14 @@ pub enum ApiServiceError {
 }
 
 #[derive(Clone)]
+/// 所有本地入口共用的命令服务门面。
 pub struct RealCtrlApi {
     context: Context,
     policy: ApiPolicy,
 }
 
 #[derive(Clone)]
+/// 本地入口能力策略，当前单独控制高危 Exec 是否开放。
 pub struct ApiPolicy {
     allow_exec: bool,
 }

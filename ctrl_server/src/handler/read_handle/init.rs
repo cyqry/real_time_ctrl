@@ -1,3 +1,8 @@
+//! 四类连接的初始化与认证状态机。
+//!
+//! Ctrl 使用账号/实例 HMAC 挑战取得 session，CtrlData 用 session + 新 nonce 绑定已有会话；Kik
+//! 注册主连接，KikData 绑定已在线 Kik。调用方传入端口策略，错误角色即使消息本身合法也会被拒绝。
+
 use crate::core::connection_meta::{
     CTRL_ACCOUNT_ID, CTRL_AUTH_CLIENT_NONCE, CTRL_AUTH_SERVER_NONCE, CTRL_INSTANCE_ID, KIK_ID,
 };
@@ -12,7 +17,7 @@ use common::session_auth::{
     is_valid_nonce_hex, random_nonce_hex, verify_ctrl_auth_proof, verify_ctrl_data_proof,
 };
 use ctrl_common::kik::Kik;
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
@@ -31,6 +36,7 @@ pub async fn handle_init_message(
     allow_ctrl: bool,
     allow_kik: bool,
 ) -> anyhow::Result<()> {
+    // 此函数会被同一连接调用多次：CtrlAuthStart 和 CtrlAuthProof 是两个独立网络帧。
     let frame = InitFrame::from_buf(msg).ok_or(anyhow::Error::msg("帧格式错误"))?;
     let is_ctrl_frame = matches!(
         &frame,
@@ -40,7 +46,7 @@ pub async fn handle_init_message(
     );
     let is_kik_frame = matches!(&frame, InitFrame::KikReq(_) | InitFrame::KikDataConnReq(_));
     if (is_ctrl_frame && !allow_ctrl) || (is_kik_frame && !allow_kik) {
-        warn!("连接在不允许的传输端口声明角色，已拒绝");
+        debug!("连接在不允许的传输端口声明角色，已拒绝");
         return Err(anyhow::Error::msg("当前传输端口不允许该连接角色"));
     }
     // challenge/proof 会分两帧进入这里，连接 ID 只在第一帧生成一次，避免握手中途身份漂移。
@@ -50,7 +56,8 @@ pub async fn handle_init_message(
     }
     drop(channel_guard);
     //初始化id
-    debug!("init frame:{:?}", frame);
+    // 初始化帧可能携带 proof、nonce 和 session ID。诊断日志只记录类型，绝不打印帧内容。
+    debug!("收到初始化帧: kind={}", init_frame_kind(&frame));
     match frame {
         InitFrame::CtrlAuthStart {
             account_id,
@@ -399,6 +406,21 @@ fn valid_identity(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn init_frame_kind(frame: &InitFrame) -> &'static str {
+    match frame {
+        InitFrame::KikReq(_) => "kik_req",
+        InitFrame::KikId(_) => "kik_id",
+        InitFrame::KikDataConnReq(_) => "kik_data_req",
+        InitFrame::KikDataConn(_) => "kik_data_reply",
+        InitFrame::CtrlAuthStart { .. } => "ctrl_auth_start",
+        InitFrame::CtrlAuthChallenge(_) => "ctrl_auth_challenge",
+        InitFrame::CtrlAuthProof { .. } => "ctrl_auth_proof",
+        InitFrame::CtrlAuthSession(_) => "ctrl_auth_session",
+        InitFrame::CtrlDataSessionReq { .. } => "ctrl_data_session_req",
+        InitFrame::CtrlDataSessionReply(_) => "ctrl_data_session_reply",
+    }
 }
 
 fn e2e_trace(message: &str) {

@@ -1,14 +1,21 @@
+//! 控制命令响应的来源、结果和关联 ID。
+//!
+//! 服务端本地处理结果与 Kik 远端结果使用不同变体，但都包在同一个 `CmdResp` 中返回。控制端依据
+//! `cmd_id` 定向唤醒等待者，不依赖响应到达顺序。
+
 use bytes::{Buf, BufMut, BytesMut};
 use common::message::kik_resp::KikResp;
 use common::protocol::{BufSerializable, MAX_CORRELATION_ID_BYTES};
 
 #[derive(Debug, Clone)]
+/// 响应的实际产生方。
 pub enum Resp {
     Server(ServerResp),
     Kik(KikResp),
 }
 
 #[derive(Clone, Debug)]
+/// 一条可并发路由的控制响应。
 pub struct CmdResp {
     cmd_id: String,
     resp: Resp,

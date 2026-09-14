@@ -1,3 +1,8 @@
+//! 已建立连接的统一写端抽象。
+//!
+//! TLS、Noise 和普通测试流最终都被包装为 `Channel`。它保存连接角色、路由 ID、初始化属性以及
+//! 带超时的写半连接；读取由各业务 crate 的 `FramedRead` 负责，因此这里没有读方法。
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::io;
@@ -11,6 +16,9 @@ use crate::hidden;
 use crate::secure_transport::BoxedAsyncWrite;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 连接通过初始化消息认证后得到的角色。
+///
+/// `Unknown` 只允许出现在握手阶段；业务读循环必须在角色确定后切换到对应帧上限。
 pub enum ChannelType {
     Ctrl,
     CtrlData,
@@ -40,6 +48,10 @@ impl<T> ChannelAttributeKey<T> {
     }
 }
 
+/// 可在异步任务间共享的连接写端及其初始化状态。
+///
+/// 通常以 `Arc<Mutex<Channel>>` 持有。锁只保护短状态更新或一次有界网络写入，调用方不得在持锁时
+/// 再获取全局会话表锁，以免形成跨连接死锁。
 pub struct Channel {
     pub channel_type: ChannelType,
     id: Option<String>,

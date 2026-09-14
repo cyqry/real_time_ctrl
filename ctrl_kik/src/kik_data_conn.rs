@@ -1,3 +1,8 @@
+//! KikData 连接的 Noise 握手、Kik 绑定、数据读循环和心跳。
+//!
+//! 每条数据连接独立加密并拥有随机连接 ID，但都绑定当前主连接取得的同一 Kik ID。认证成功后加入连接池，
+//! 文件帧可在多条连接间轮询发送；单条断线只降低吞吐，不立即结束主连接。
+
 use crate::context::Context;
 use crate::read_handle;
 use anyhow::Error;
@@ -23,6 +28,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use uuid::Uuid;
 
+/// 建立一条 KikData 连接，等待服务端确认后加入当前 Kik 的连接池。
 pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
     let transport = connect_kik_noise(
         &config.server_host,
@@ -50,18 +56,18 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
         .await
         .set_write_timeout(config.write_timeout);
 
-    //active逻辑
+    // 发送 KikData 绑定请求；收到确认前保持 Unknown 和握手帧上限。
     let channel = channel_arc.clone();
     handle_active(&context, channel.clone()).await?;
 
-    //tx在连接处理线程结束后被关闭
+    // 初始化通道只传一次服务端确认，用于阻止未认证连接提前进入数据池。
     let (mut tx, mut rx) = mpsc::channel::<String>(1);
 
     let context_clone = context.clone();
     let read_timeout = config.read_timeout;
     let handle = tokio::spawn(async move {
         let context = context_clone;
-        //心跳逻辑
+        // 每条数据连接都有独立心跳，坏连接会单独从池中移除。
         let chan = channel.clone();
         tokio::spawn(async move {
             hearbeat(chan).await;
@@ -75,11 +81,11 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
             };
 
             match read_result {
-                //timeout返回 Ok说明读取未超时
+                // 外层 timeout 同时约束静默对端和慢速帧攻击。
                 Ok(res) => {
                     match res {
                         Some(Ok(msg)) => {
-                            //read逻辑
+                            // 数据解析后按 data ID 投递，不在此处执行文件写入。
                             let channel = channel.clone();
                             if let Err(error) =
                                 handle_read(&context, channel.clone(), msg, &mut tx).await
@@ -99,7 +105,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
                             dev_debug!("连接异常:{}", e);
                             break Some(anyhow::Error::new(e));
                         }
-                        //对方正常关闭
+                        // 对端正常关闭也进入统一 inactive 清理。
                         None => {
                             //不在这里对正常关闭进行特殊处理
                             break None;
@@ -122,7 +128,7 @@ pub async fn kik_data_conn(context: Context, config: &Config) -> anyhow::Result<
         handle_inactive(&context, channel).await;
     });
 
-    //这次为第一次rx接收数据,用于阻塞校验
+    // 等待唯一初始化确认；成功后才分配本地连接 ID 并加入轮询池。
     match timeout(config.read_timeout, rx.recv())
         .await
         .map_err(|_| anyhow::Error::msg(hidden!("等待数据连接初始化响应超时")))?

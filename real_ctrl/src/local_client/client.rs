@@ -1,3 +1,8 @@
+//! Windows 命名管道 API 客户端。
+//!
+//! 每次调用建立独立双工管道连接，发送版本化 JSON 请求并读取一条有长度边界的响应；这使多个调用任务
+//! 可以自然并行，而无需共享一个响应 Receiver。
+
 use crate::api_contract::{ApiRequest, ApiResponse};
 use crate::pipe::pipe_common::{
     deserialize_api_response, serialize_api_request, MAX_PIPE_REQUEST_BYTES,

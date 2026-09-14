@@ -1,3 +1,8 @@
+//! 安全传输建立后的连接初始化消息。
+//!
+//! 同一 TLS 端口承载 Ctrl/CtrlData，同一 Noise 端口承载 Kik/KikData；服务端通过本模块的消息完成
+//! 角色分型和会话绑定。初始化成功前只能使用较小的握手帧上限。
+
 use crate::kik_info::KikInfo;
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
@@ -17,6 +22,10 @@ const CTRL_DATA_SESSION_REQ: u8 = 8;
 const CTRL_DATA_SESSION_REPLY: u8 = 9;
 
 #[derive(Debug, Clone)]
+/// v4 初始化状态机允许出现的消息。
+///
+/// `CtrlAuth*` 完成账号/实例认证，`CtrlDataSession*` 把数据连接绑定到既有控制会话；Kik 侧只交换
+/// 路由所需的最小 ID 和名称，不在客户端引入账号凭据。
 pub enum InitFrame {
     // 被控端上线和数据连接帧。Kik 传输只允许 Noise NK。
     KikReq(KikInfo),

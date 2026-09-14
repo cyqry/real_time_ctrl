@@ -1,3 +1,7 @@
+//! Windows 命名管道 listener、DACL 和连接并发限制。
+//!
+//! listener 只接受本机连接，并把每个客户端交给独立任务；所有任务共享同一个远程 `Context`。
+
 use crate::context::{Agent, Context};
 use crate::local_server::handle_client::handle_client;
 use crate::pipe::pipe_common::PIPE_NAME;

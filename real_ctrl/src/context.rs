@@ -1,3 +1,8 @@
+//! 控制端连接、响应路由、数据队列和自动重连的共享状态。
+//!
+//! `Agent` 拥有 Ctrl 主连接，`Context` 在其外层管理多条 CtrlData 连接。每个命令 ID 对应独立 oneshot，
+//! 每个数据 ID 对应独立有界队列，因此 HTTP 请求可以乱序完成而不会争抢同一个 Receiver。
+
 use crate::ctrl_conn::ctrl_conn;
 use crate::ctrl_data_conn::ctrl_data_conn;
 use bytes::BytesMut;
@@ -65,15 +70,23 @@ impl ResponseRouter {
     }
 }
 
+/// 一个数据 ID 的本地有界收件箱。
+///
+/// 数据可能早于控制响应到达，此时先创建 `claimed=false` 的预登记路由；命令处理开始等待后再认领。
 struct DataRoute {
+    /// 由数据连接读循环投递帧。
     tx: Sender<DataMessage>,
+    /// 由拥有该数据 ID 的命令独占消费。
     rx: Arc<Mutex<Receiver<DataMessage>>>,
+    /// 是否已有命令声明拥有该 ID；未认领路由受更严格的数量、字节和 TTL 限制。
     claimed: bool,
     created_at: Instant,
+    /// 未认领阶段累计的 payload 大小，用于限制乱序缓冲内存。
     pre_registered_bytes: usize,
 }
 
 #[derive(Clone)]
+/// 所有 `RealCtrlApi` 克隆共享的进程级命令并发门禁。
 struct CommandGate(Arc<Semaphore>);
 
 impl CommandGate {
@@ -87,16 +100,25 @@ impl CommandGate {
 }
 
 #[derive(Clone)]
+/// 控制端所有入口共享的运行上下文。
+///
+/// 克隆只复制 `Arc`，不会创建新的远程会话或绕过并发门禁。
 pub struct Context {
+    /// 当前 Ctrl 主连接及其认证 session；重连时原地替换。
     pub agent: Arc<RwLock<Agent>>,
+    /// 多条 CtrlData 连接，以连接随机 ID 为键。
     data_conns: Arc<RwLock<HashMap<String, Arc<Mutex<Channel>>>>>,
+    /// 数据发送轮询游标，不参与安全判断。
     next_data_conn: Arc<AtomicUsize>,
+    /// 数据 ID 到私有收件箱的映射。
     data_routes: Arc<Mutex<HashMap<String, DataRoute>>>,
     command_gate: CommandGate,
+    /// 连接故障时保证只有一个请求执行重连。
     reconnect_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
+/// 一条已认证 Ctrl 主连接及其响应路由器。
 pub struct Agent {
     pub config: Config,
     pub session_id: Option<String>,
@@ -136,6 +158,7 @@ impl Context {
         }
     }
 
+    /// 把 CtrlData 收到的帧投递给所属命令；允许在命令认领路由前有界暂存。
     pub async fn enqueue_data(&self, message: DataMessage) -> anyhow::Result<()> {
         let (sender, cleanup) = {
             let mut routes = self.data_routes.lock().await;
@@ -208,6 +231,7 @@ impl Context {
         Ok(id)
     }
 
+    /// 在数据连接池中轮询发送完整帧；首选连接失败时尝试其余健康连接。
     pub async fn send_data_with_id(&self, data_id: &str, data: &[u8]) -> anyhow::Result<()> {
         let encoded = encode_data_frame(data_id, data)?;
         let mut last_error = None;
@@ -224,6 +248,7 @@ impl Context {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("应用数据传输通道未初始化")))
     }
 
+    /// 认领指定数据 ID 并等待下一帧；同一命令可重复调用以消费大文件分片。
     pub async fn wait_data(&self, data_id: &str) -> anyhow::Result<BytesMut> {
         let receiver = self.claim_data_route(data_id).await?;
         tokio::time::timeout(Duration::from_secs(6 * 60), async {
@@ -267,6 +292,7 @@ impl Context {
         Ok(rx)
     }
 
+    /// 删除本地收件箱并通知服务端释放对应下载路由。
     pub async fn finish_data_route(&self, data_id: &str) {
         self.data_routes.lock().await.remove(data_id);
         let agent = self.agent.read().await.clone();
@@ -298,6 +324,7 @@ impl Context {
             .collect()
     }
 
+    /// 并行建立期望数量的 CtrlData 连接；至少一条成功即可降级运行。
     pub async fn data_init(&self) -> anyhow::Result<()> {
         let config = self.agent.read().await.config.clone();
         let mut attempts = JoinSet::new();
@@ -329,6 +356,9 @@ impl Context {
         self.request_after_send(cmd, None).await
     }
 
+    /// 发出命令，并在控制帧写成功后可选地放行关联上传任务。
+    ///
+    /// 连接故障会尝试恢复未来请求所需的连接，但绝不会自动重放本次已可能执行的命令。
     pub async fn request_after_send(
         &self,
         cmd: &ReqCmd,
@@ -377,6 +407,7 @@ impl Context {
 }
 
 impl Agent {
+    /// 建立 pinned TLS 主连接并完成 HMAC 认证，返回可供多个请求共享的 Agent。
     pub async fn create(config: &Config) -> anyhow::Result<Self> {
         let responses = ResponseRouter::default();
         let (conn, session_id) = ctrl_conn(config, responses.clone()).await?;
@@ -414,6 +445,9 @@ impl Agent {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("控制连接重试次数必须大于 0")))
     }
 
+    /// 注册响应等待者、写出控制帧并等待匹配 ID 的响应。
+    ///
+    /// 必须先注册再写帧，否则极快响应可能在等待者出现前到达而被丢弃。
     pub async fn req(
         &self,
         cmd: &ReqCmd,

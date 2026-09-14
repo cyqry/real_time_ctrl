@@ -1,3 +1,8 @@
+//! Linux 中继服务的进程入口。
+//!
+//! 这里仅负责合并构建默认值和运行环境变量、初始化日志与账号策略，然后把两个监听端口交给
+//! `core::server`。连接认证、会话和数据路由都不应堆回 `main`。
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use common::config::{Config, Id, SecurityConfig};
@@ -12,7 +17,7 @@ mod core;
 mod handler;
 mod logger;
 
-//编译期获取环境变量，写死在程序
+// build.rs 保证发布二进制自带可直启默认值；同名运行环境变量仍可用于部署轮换。
 const LOG_LEVEL: &str = env!("LOG_LEVEL");
 const DEFAULT_BIND_HOST: &str = env!("CTRL_SERVER_DEFAULT_BIND_HOST");
 const DEFAULT_SERVER_PORT: &str = env!("CTRL_SERVER_DEFAULT_PORT");
@@ -38,13 +43,7 @@ async fn main() -> anyhow::Result<()> {
     };
     logger::init_logging_with_config(config)?;
     color_backtrace::install();
-    // 进程级别钩子
-    // panic::set_hook(Box::new(|panic_info| {
-    //     // 获取 backtrace
-    //     let backtrace = Backtrace::capture();
-    //     error!("panic_info:{:?}", panic_info);
-    //
-    // }));
+    // 安全材料优先使用运行时路径/变量；缺失时再解密 build.rs 注入的单文件默认值。
     let mut security = SecurityConfig::kik();
     security.tls_port = env_or_default("CTRL_SERVER_TLS_PORT", DEFAULT_TLS_PORT);
     security.server_cert_path = env_optional("CTRL_SERVER_TLS_CERT");

@@ -1,4 +1,10 @@
+//! CtrlData 连接的建立、会话绑定和数据读循环。
+//!
+//! 每条数据连接重新完成 pinned TLS，再用主连接取得的 session 和一次性 nonce 做 HMAC 绑定。认证成功后
+//! 才加入 `Context` 连接池并切换数据帧上限；断线只移除本连接，不影响同会话其他数据连接。
+
 use crate::context::Context;
+use crate::ctrl_conn::{frame_kind, init_frame_kind};
 use anyhow::Error;
 use bytes::BytesMut;
 use common::channel::{Channel, ChannelType};
@@ -27,6 +33,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use uuid::Uuid;
 
+/// 建立一条 CtrlData 连接，等待服务端确认绑定后加入共享连接池。
 pub async fn ctrl_data_conn(context: Context, config: &Config) -> anyhow::Result<()> {
     let parts = connect_real_ctrl(config).await?;
     // 数据通道承载文件和截图，鉴权完成后切换到数据帧上限。
@@ -157,7 +164,10 @@ async fn handle_read(
                 return Err(anyhow::anyhow!("数据通道会话校验失败"));
             }
             f => {
-                debug!("数据控制连接收到错误的初始化帧,{:?}", f);
+                debug!(
+                    "数据控制连接收到错误的初始化帧: kind={}",
+                    init_frame_kind(&f)
+                );
                 return Err(anyhow::anyhow!("控制端不支持该初始化帧"));
             }
         }
@@ -171,7 +181,7 @@ async fn handle_read(
             }
             Frame::Ping | Frame::Pong => {}
             f => {
-                debug!("数据控制连接收到错误的业务帧,{:?}", f);
+                debug!("数据控制连接收到错误的业务帧: kind={}", frame_kind(&f));
                 return Err(anyhow::anyhow!("控制端不支持该数据帧"));
             }
         };

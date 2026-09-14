@@ -1,3 +1,7 @@
+//! 构建期字符串混淆的运行时解密支撑。
+//!
+//! 该能力只降低发布二进制被静态搜索的可读性，密钥最终仍在进程内，不能用于保存认证秘密或替代 TLS/Noise。
+
 #[path = "../string_obfuscation_key.rs"]
 mod key_material;
 

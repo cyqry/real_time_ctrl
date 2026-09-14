@@ -1,4 +1,9 @@
-#![windows_subsystem = "windows"] //此宏不打开窗口，同时print也失效
+#![windows_subsystem = "windows"] // 后台子系统：双击运行不创建控制台窗口，标准输出也不会显示。
+
+//! ctrl_kik 的进程入口和断线重连外循环。
+//!
+//! 每轮先建立一条 Noise Kik 主连接，认证成功后并行建立三条 KikData 连接；主连接退出即取消尚在握手的
+//! 数据连接、清空本轮状态并重试。命令执行和帧解析分别位于 `cmd_runner` 与 `read_handle`。
 
 use crate::context::Context;
 use common::config::{Config, Id, SecurityConfig};
@@ -83,7 +88,7 @@ fn main() {
 }
 
 async fn run_client() -> anyhow::Result<()> {
-    //此lock在程序结束时会被操作系统回收，所以无需担心是否释放
+    // 文件句柄存活期间持有独占锁；进程退出时操作系统自动释放，不需要删除锁文件来“解锁”。
     let _single_lock = single(LOCK_FILE_PATH()).await?;
     let context = Context::new();
     let config = Config {
@@ -96,11 +101,11 @@ async fn run_client() -> anyhow::Result<()> {
     };
 
     loop {
+        // 短间隔尝试三次主连接；连续失败后进入较长退避，避免服务端离线时形成连接风暴。
         for _ in 0..3 {
-            //校验成功了就返回
             match kik_conn::kik_conn(context.clone(), &config).await {
                 Ok(h) => {
-                    //加入服务器成功后发起数据连接
+                    // 主连接已经取得 Kik ID，此时三条数据连接才能安全绑定到本轮 Kik 会话。
                     let (data_context, data_config) = (context.clone(), config.clone());
                     let data_init_task = tokio::spawn(async move {
                         let mut attempts = JoinSet::new();

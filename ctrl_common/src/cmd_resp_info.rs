@@ -1,3 +1,7 @@
+//! 控制端可展示或通过开放 API 返回的结构化服务端数据。
+//!
+//! 这些类型是业务模型，不直接处理帧、认证或网络 I/O。
+
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 

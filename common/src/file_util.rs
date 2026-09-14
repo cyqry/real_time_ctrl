@@ -1,3 +1,8 @@
+//! 文件命令共用的受限 I/O 与大文件分片工具。
+//!
+//! 小文件使用有上限的内存缓冲；大文件复用同一打开句柄计算摘要并产生分片。接收端通过
+//! `FileRangeTracker` 校验乱序范围，先写系统临时目录的随机 `.temp` 文件，校验后才提交目标路径。
+
 use std::ffi::OsStr;
 
 use async_recursion::async_recursion;
@@ -89,6 +94,9 @@ pub struct PreparedBigFile {
 }
 
 /// 记录乱序到达的文件区间，统一执行越界、重叠和分片数量校验。
+///
+/// `ranges` 以起始偏移有序保存已接收闭区间，因而只需检查当前位置相邻的前后区间。`received`
+/// 统计唯一分片字节数；重复分片不会重复累加。
 pub struct FileRangeTracker {
     total: u64,
     received: u64,
@@ -96,6 +104,7 @@ pub struct FileRangeTracker {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 分片登记结果；调用方仅在 `New` 时真正写盘。
 pub enum FileRangeRegistration {
     New,
     Duplicate,
@@ -212,7 +221,8 @@ pub async fn ls<P: AsRef<Path>>(
             path.push(hidden!("\\"));
         }
     }
-    let mut entries = fs::read_dir(path).await?; //路径不存在在这里返回
+    // 在入口处打开目录，让不存在、无权限等错误立即返回，而不是产生部分列表。
+    let mut entries = fs::read_dir(path).await?;
     let mut v = vec![];
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();

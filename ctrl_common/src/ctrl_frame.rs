@@ -1,3 +1,8 @@
+//! `real_ctrl` 与 `ctrl_server` 之间的活动帧。
+//!
+//! Ctrl 主连接使用命令、响应和心跳；CtrlData 使用数据帧。`DataAck` 由控制端发送，用于通知服务端
+//! 释放下载路由，它不是文件内容校验成功的证明。
+
 use crate::ctrl_resp::CmdResp;
 use bytes::{Buf, BufMut, BytesMut};
 use common::protocol::{self, BufSerializable, ReqCmd};
@@ -6,11 +11,13 @@ pub const DATA_FRAME_CODE: u8 = 13;
 const MAX_DATA_ID_BYTES: usize = protocol::MAX_CORRELATION_ID_BYTES;
 
 #[derive(Debug, Clone)]
+/// 管理面 TLS 内允许的帧类型。
 pub enum Frame {
     Cmd(ReqCmd),
     Resp(CmdResp),
 
-    Data(String, BytesMut), //数据传输的data帧
+    /// 数据 ID 与原始 payload，只允许在已绑定会话的 CtrlData 连接上传输。
+    Data(String, BytesMut),
     /// 控制端确认下载数据已经消费完成，服务端据此尽早释放长传输路由。
     DataAck(String),
 

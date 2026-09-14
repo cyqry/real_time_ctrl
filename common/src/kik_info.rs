@@ -1,3 +1,8 @@
+//! Kik 注册阶段使用的最小身份信息。
+//!
+//! ID 用于重连和路由，名称用于展示；两者都不是安全凭据。Kik 的强安全边界是固定服务端公钥的
+//! Noise 链路，控制权限则由服务端账号 ACL 决定。
+
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 const MAX_KIK_ID_BYTES: usize = 128;
@@ -41,10 +46,11 @@ impl BufSerializable for KikInfo {
                 if bys.is_empty() || bys.remaining() > MAX_KIK_NAME_BYTES {
                     return None;
                 }
-                Some(KikInfo {
-                    id: None,
-                    name: String::from_utf8(bys.to_vec()).ok()?,
-                })
+                let name = String::from_utf8(bys.to_vec()).ok()?;
+                if !valid_kik_name(&name) {
+                    return None;
+                }
+                Some(KikInfo { id: None, name })
             }
             1 => {
                 if bys.remaining() < 4 {
@@ -59,14 +65,22 @@ impl BufSerializable for KikInfo {
                 {
                     return None;
                 }
-                Some(KikInfo {
-                    id: Some(String::from_utf8(bys.split_to(id_len as usize).to_vec()).ok()?),
-                    name: String::from_utf8(bys.to_vec()).ok()?,
-                })
+                let id = String::from_utf8(bys.split_to(id_len as usize).to_vec()).ok()?;
+                let name = String::from_utf8(bys.to_vec()).ok()?;
+                if !valid_kik_name(&name) {
+                    return None;
+                }
+                Some(KikInfo { id: Some(id), name })
             }
             _ => None,
         }
     }
+}
+
+/// Kik 名称会进入服务端日志和管理面 JSON；禁止控制字符可阻断换行伪造日志，
+/// 同时保留中文、空格等正常 Windows 计算机名显示所需字符。
+fn valid_kik_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_KIK_NAME_BYTES && !name.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -79,5 +93,25 @@ mod tests {
         assert!(KikInfo::from_buf(BytesMut::from(&[1, 0, 0][..])).is_none());
         assert!(KikInfo::from_buf(BytesMut::from(&[0][..])).is_none());
         assert!(KikInfo::from_buf(BytesMut::from(&[1, 0, 0, 0, 0, b'x'][..])).is_none());
+    }
+
+    #[test]
+    fn kik_name_rejects_log_control_characters() {
+        for name in ["forged\nentry", "forged\rentry", "forged\tentry", "\0"] {
+            assert!(KikInfo::from_buf(
+                KikInfo {
+                    id: None,
+                    name: name.to_string(),
+                }
+                .to_buf()
+            )
+            .is_none());
+        }
+
+        let valid = KikInfo {
+            id: None,
+            name: "生产 被控端-01".to_string(),
+        };
+        assert!(KikInfo::from_buf(valid.to_buf()).is_some());
     }
 }
