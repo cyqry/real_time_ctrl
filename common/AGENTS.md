@@ -37,6 +37,8 @@
   凭据或 API token；用户要求单文件直启时，秘密只允许由确实需要它的 `real_ctrl` / `ctrl_server`
   以各自 `hidden!(env!(...))` 默认值持有，并由发布脚本审计原始明文。
 - 需要集中复用或调整的非秘密字符串统一维护在 `config.json`；nonce 必须绑定字段名和字段值，生成函数使用 `OnceLock` 缓存解密结果。
+- `RTC_CTRL_KIK_BUILD_LOCK_PATH` 只允许在构建时覆盖 `LOCK_FILE_PATH`，用于让仓库内 E2E 与用户
+  正在运行的 Kik 使用不同锁文件；ctrl_kik 运行时仍不得从环境变量替换锁路径。
 - `common` 会被受保护 Kik 静态链接：除 `#[cfg(test)]` 测试数据和编译期路径外，运行时字符串都必须来自 `config.json` 或 `common::hidden!`；静态片段不得重新放回 `format!`、`anyhow!`、断言消息或 `io::Error` 明文字面量。
 - 字符串混淆 key 会进入二进制，只用于提高静态搜索成本，禁止复用于 TLS、认证、文件加密或业务数据保护。
 - `Channel` 的写入、flush 和 shutdown 必须受超时控制；业务 crate 不应自行绕过这些方法裸写。

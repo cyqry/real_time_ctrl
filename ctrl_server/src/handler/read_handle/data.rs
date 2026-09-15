@@ -6,7 +6,7 @@
 use crate::core::connection_meta::{CTRL_SESSION_ID, KIK_ID};
 use crate::core::context::Context;
 use bytes::BytesMut;
-use common::channel::Channel;
+use common::channel::{Channel, DATA_CONNECTION_RECOVERY_TIMEOUT};
 use common::message::kik_frame::{encode_data_frame as encode_kik_data_frame, KikFrame};
 use common::protocol::BufSerializable;
 use ctrl_common::ctrl_frame::{encode_data_frame as encode_ctrl_data_frame, Frame};
@@ -39,7 +39,7 @@ pub async fn handle_ctrl_data(
                 anyhow::bail!("数据关联 ID 未授权或已过期");
             };
             let encoded = encode_kik_data_frame(&wire_id, &data)?;
-            write_to_available_connection(kik.data_connections_for_send().await, &encoded).await?;
+            forward_to_kik_with_recovery(&kik, &encoded).await?;
             if single_frame {
                 context
                     .complete_ctrl_single_frame_route(&session_id, &external_id)
@@ -74,12 +74,8 @@ pub async fn handle_kik_data(
                 );
                 return Ok(());
             };
-            let connections = context.ctrl_data_connections_for_send(&session_id).await;
-            if connections.is_empty() {
-                anyhow::bail!("目标控制会话没有可用数据通道");
-            }
             let encoded = encode_ctrl_data_frame(&external_id, &data)?;
-            write_to_available_connection(connections, &encoded).await?;
+            forward_to_ctrl_with_recovery(&context, &session_id, &encoded).await?;
             if single_frame {
                 context.complete_kik_single_frame_route(&wire_id).await;
             }
@@ -88,6 +84,59 @@ pub async fn handle_kik_data(
         _ => return Err(default_error()),
     }
     Ok(())
+}
+
+/// 把控制端上传分片转发给 Kik；连接池正在补建时保留本帧并等待恢复。
+async fn forward_to_kik_with_recovery(
+    kik: &ctrl_common::kik::Kik,
+    encoded: &[u8],
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + DATA_CONNECTION_RECOVERY_TIMEOUT;
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(last_error
+                .unwrap_or_else(|| anyhow::anyhow!("目标 Kik 数据通道在恢复时限内不可用")));
+        }
+        let connections = kik.wait_data_connections_for_send(remaining).await;
+        if connections.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| anyhow::anyhow!("目标 Kik 数据通道在恢复时限内不可用")));
+        }
+        match write_to_available_connection(connections, encoded).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+}
+
+/// 把 Kik 下载分片转发给原控制会话；会话消失或恢复超时才判定失败。
+async fn forward_to_ctrl_with_recovery(
+    context: &Context,
+    session_id: &str,
+    encoded: &[u8],
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + DATA_CONNECTION_RECOVERY_TIMEOUT;
+    let mut last_error = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(last_error
+                .unwrap_or_else(|| anyhow::anyhow!("目标控制会话数据通道在恢复时限内不可用")));
+        }
+        let connections = context
+            .wait_ctrl_data_connections_for_send(session_id, remaining)
+            .await;
+        if connections.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| anyhow::anyhow!("目标控制会话已离线或数据通道恢复超时")));
+        }
+        match write_to_available_connection(connections, encoded).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
 }
 
 /// 单帧写失败后尝试其余连接。接收端以区间为幂等键，所以完整帧重试是安全的。
@@ -103,7 +152,12 @@ async fn write_to_available_connection(
         }
         match connection.write_and_flush(encoded).await {
             Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                // write_all 被取消或只写出半帧后，该 TCP 流的帧边界已经不可恢复。主动 shutdown
+                // 能让对端的连接监督器尽快发现故障并补建，而不是再等一轮读超时。
+                connection.try_write_half_close().await;
+                last_error = Some(error);
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用的数据转发连接")))

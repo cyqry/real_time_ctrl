@@ -6,7 +6,7 @@
 use crate::ctrl_conn::ctrl_conn;
 use crate::ctrl_data_conn::ctrl_data_conn;
 use bytes::BytesMut;
-use common::channel::Channel;
+use common::channel::{Channel, DATA_CONNECTION_RECOVERY_TIMEOUT};
 use common::config::Config;
 use common::protocol::ReqCmd;
 use ctrl_common::ctrl_frame::encode_data_frame;
@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
-use tokio::task::JoinSet;
+use tokio::sync::{
+    oneshot, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError,
+};
+use tokio::task::JoinHandle;
 use tokio::time;
 use uuid::Uuid;
 
@@ -34,6 +36,8 @@ const MAX_ACTIVE_DATA_ROUTES: usize = 64;
 const MAX_PRE_REGISTERED_DATA_ROUTES: usize = 16;
 const MAX_PRE_REGISTERED_DATA_BYTES: usize = 64 * 1024 * 1024;
 const PRE_REGISTERED_DATA_TTL: Duration = Duration::from_secs(30);
+const DATA_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DATA_CONNECTION_STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// 控制响应按关联 ID 定向投递，避免并行请求争抢同一个 Receiver。
 #[derive(Clone, Default)]
@@ -108,6 +112,10 @@ pub struct Context {
     pub agent: Arc<RwLock<Agent>>,
     /// 多条 CtrlData 连接，以连接随机 ID 为键。
     data_conns: Arc<RwLock<HashMap<String, Arc<Mutex<Channel>>>>>,
+    /// 数据连接入池时唤醒等待发送或等待启动完成的任务。
+    data_connection_notify: Arc<Notify>,
+    /// 三个长期监督槽位；主会话换代时先取消旧槽位，再为新 session 创建槽位。
+    data_supervisors: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// 数据发送轮询游标，不参与安全判断。
     next_data_conn: Arc<AtomicUsize>,
     /// 数据 ID 到私有收件箱的映射。
@@ -131,6 +139,8 @@ impl Context {
         Self {
             agent,
             data_conns: Arc::new(RwLock::new(HashMap::new())),
+            data_connection_notify: Arc::new(Notify::new()),
+            data_supervisors: Arc::new(Mutex::new(Vec::new())),
             next_data_conn: Arc::new(AtomicUsize::new(0)),
             data_routes: Arc::new(Mutex::new(HashMap::new())),
             command_gate: CommandGate::new(),
@@ -144,11 +154,33 @@ impl Context {
 
     pub async fn insert_ctrl_data_conn(
         &self,
+        expected_session_id: &str,
         data_conn: Arc<Mutex<Channel>>,
     ) -> anyhow::Result<()> {
-        let id = data_conn.lock().await.require_id()?.to_string();
+        let id = {
+            let connection = data_conn.lock().await;
+            if connection.is_closed() {
+                anyhow::bail!("拒绝把已经关闭的数据连接加入连接池");
+            }
+            connection.require_id()?.to_string()
+        };
+        if !self.is_current_session(expected_session_id).await {
+            anyhow::bail!("数据连接属于已经结束的控制会话");
+        }
         self.data_conns.write().await.insert(id, data_conn);
+        // 数据池恢复时广播给所有并发 API 请求；每个请求醒来后仍会自行复查健康连接。
+        self.data_connection_notify.notify_waiters();
         Ok(())
+    }
+
+    /// session ID 由服务端随机生成，可用来阻止旧数据握手跨越主连接重连边界。
+    async fn is_current_session(&self, expected_session_id: &str) -> bool {
+        self.agent
+            .read()
+            .await
+            .session_id
+            .as_deref()
+            .is_some_and(|current| current == expected_session_id)
     }
 
     pub async fn delete_ctrl_data_conn(&self, data_conn: Arc<Mutex<Channel>>) {
@@ -234,18 +266,30 @@ impl Context {
     /// 在数据连接池中轮询发送完整帧；首选连接失败时尝试其余健康连接。
     pub async fn send_data_with_id(&self, data_id: &str, data: &[u8]) -> anyhow::Result<()> {
         let encoded = encode_data_frame(data_id, data)?;
+        let deadline = Instant::now() + DATA_CONNECTION_RECOVERY_TIMEOUT;
         let mut last_error = None;
-        for connection in self.data_connections_for_send().await {
-            let mut connection = connection.lock().await;
-            if connection.is_closed() {
-                continue;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            match connection.write_and_flush(&encoded).await {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
+            let connections = self.wait_data_connections_for_send(remaining).await;
+            if connections.is_empty() {
+                break;
+            }
+            for connection in connections {
+                let mut connection = connection.lock().await;
+                match connection.write_and_flush(&encoded).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        // 失败的 write_all 可能已经留下半帧，必须关闭本连接；完整帧可在新连接上重试。
+                        connection.try_write_half_close().await;
+                        last_error = Some(error);
+                    }
+                }
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("应用数据传输通道未初始化")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("应用数据传输通道在恢复时限内不可用")))
     }
 
     /// 认领指定数据 ID 并等待下一帧；同一命令可重复调用以消费大文件分片。
@@ -304,10 +348,6 @@ impl Context {
         }
     }
 
-    pub async fn find_ctrl_data(&self) -> Option<Arc<Mutex<Channel>>> {
-        self.data_connections_for_send().await.into_iter().next()
-    }
-
     async fn data_connections_for_send(&self) -> Vec<Arc<Mutex<Channel>>> {
         let data_map = self.data_conns.read().await;
         let count = data_map.len();
@@ -324,32 +364,92 @@ impl Context {
             .collect()
     }
 
-    /// 并行建立期望数量的 CtrlData 连接；至少一条成功即可降级运行。
-    pub async fn data_init(&self) -> anyhow::Result<()> {
-        let config = self.agent.read().await.config.clone();
-        let mut attempts = JoinSet::new();
-        for _ in 0..DESIRED_DATA_CONNECTIONS {
-            let (context, config) = (self.clone(), config.clone());
-            attempts.spawn(async move { ctrl_data_conn(context, &config).await });
-        }
-        let mut connected = 0;
-        let mut last_error = None;
-        while let Some(result) = attempts.join_next().await {
-            match result {
-                Ok(Ok(())) => connected += 1,
-                Ok(Err(error)) => last_error = Some(error),
-                Err(error) => last_error = Some(error.into()),
+    /// 等待自动补建任务恢复至少一条健康 CtrlData 连接。
+    ///
+    /// 先创建 `notified` 再检查连接池，避免连接恰好在两步之间入池而丢失通知。这里不持有连接池锁
+    /// 等待网络连接锁，因此不会阻塞其他连接的加入和清理。
+    pub async fn wait_data_connections_for_send(
+        &self,
+        wait_timeout: Duration,
+    ) -> Vec<Arc<Mutex<Channel>>> {
+        let deadline = Instant::now() + wait_timeout;
+        loop {
+            let notified = self.data_connection_notify.notified();
+            tokio::pin!(notified);
+            // 先把 future 注册进 Notify 的等待队列，再检查连接池，避免广播发生在检查与 await 之间。
+            notified.as_mut().enable();
+            let candidates = self.data_connections_for_send().await;
+            let mut healthy = Vec::with_capacity(candidates.len());
+            for connection in candidates {
+                if !connection.lock().await.is_closed() {
+                    healthy.push(connection);
+                }
+            }
+            if !healthy.is_empty() {
+                return healthy;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, notified.as_mut())
+                    .await
+                    .is_err()
+            {
+                return Vec::new();
             }
         }
-        if connected == 0 {
-            return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("数据通道初始化失败")));
+    }
+
+    /// 启动三个长期 CtrlData 监督槽位；至少一条首次连接成功即可降级运行。
+    ///
+    /// 旧实现只并行连接一次，后续单条数据连接退出便永久减少池容量。现在每个槽位都会等待自己的
+    /// 连接任务结束，然后指数退避补建；主 session 换代时由 `reset_data_connections` 整体取消旧槽位。
+    pub async fn data_init(&self) -> anyhow::Result<()> {
+        self.stop_data_supervisors().await;
+        let (config, session_id) = {
+            let agent = self.agent.read().await;
+            let session_id = agent
+                .session_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("控制会话尚未建立，无法初始化数据连接"))?;
+            (agent.config.clone(), session_id)
+        };
+        let (first_result_tx, mut first_result_rx) =
+            channel::<Result<(), String>>(DESIRED_DATA_CONNECTIONS);
+        let mut supervisors = Vec::with_capacity(DESIRED_DATA_CONNECTIONS);
+        for slot in 0..DESIRED_DATA_CONNECTIONS {
+            supervisors.push(tokio::spawn(supervise_ctrl_data_connection(
+                self.clone(),
+                config.clone(),
+                session_id.clone(),
+                slot,
+                first_result_tx.clone(),
+            )));
         }
-        if connected < DESIRED_DATA_CONNECTIONS {
-            log::warn!(
-                "仅建立 {connected}/{DESIRED_DATA_CONNECTIONS} 条数据连接，文件传输将降级运行"
-            );
+        drop(first_result_tx);
+
+        let mut completed_attempts = 0;
+        let mut last_error = None::<String>;
+        while let Some(result) = first_result_rx.recv().await {
+            completed_attempts += 1;
+            match result {
+                Ok(()) => {
+                    *self.data_supervisors.lock().await = supervisors;
+                    return Ok(());
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if completed_attempts == DESIRED_DATA_CONNECTIONS {
+                break;
+            }
         }
-        Ok(())
+        for supervisor in supervisors {
+            supervisor.abort();
+            let _ = supervisor.await;
+        }
+        Err(anyhow::anyhow!(last_error.unwrap_or_else(|| {
+            "数据通道初始化任务意外结束".to_string()
+        })))
     }
 
     pub async fn request(&self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
@@ -392,6 +492,7 @@ impl Context {
     }
 
     async fn reset_data_connections(&self) {
+        self.stop_data_supervisors().await;
         let old_connections = self
             .data_conns
             .write()
@@ -403,6 +504,68 @@ impl Context {
         for channel in old_connections {
             channel.lock().await.try_write_half_close().await;
         }
+    }
+
+    /// 取消并等待全部旧监督槽位退出，避免旧 session 在新主连接建立后继续补建数据连接。
+    async fn stop_data_supervisors(&self) {
+        let supervisors = std::mem::take(&mut *self.data_supervisors.lock().await);
+        for supervisor in &supervisors {
+            supervisor.abort();
+        }
+        for supervisor in supervisors {
+            let _ = supervisor.await;
+        }
+    }
+}
+
+/// 维护一个 CtrlData 连接槽位，直到主 session 被替换或监督任务被取消。
+async fn supervise_ctrl_data_connection(
+    context: Context,
+    config: Config,
+    session_id: String,
+    slot: usize,
+    first_result_tx: Sender<Result<(), String>>,
+) {
+    let mut first_result_tx = Some(first_result_tx);
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if !context.is_current_session(&session_id).await {
+            return;
+        }
+        let connected_at = Instant::now();
+        match ctrl_data_conn(context.clone(), &config, &session_id).await {
+            Ok(connection_task) => {
+                if let Some(sender) = first_result_tx.take() {
+                    let _ = sender.send(Ok(())).await;
+                }
+                let _ = connection_task.await;
+                if connected_at.elapsed() >= DATA_CONNECTION_STABLE_AFTER {
+                    backoff = Duration::from_secs(1);
+                }
+            }
+            Err(error) => {
+                let first_attempt = first_result_tx.is_some();
+                if let Some(sender) = first_result_tx.take() {
+                    let _ = sender.send(Err(error.to_string())).await;
+                }
+                if first_attempt {
+                    log::warn!("CtrlData 连接槽位 {slot} 首次建立失败: {error}");
+                } else {
+                    // 长期故障按最高 30 秒退避重试；后续事件降为 debug，避免离线期间持续刷生产日志。
+                    log::debug!("CtrlData 连接槽位 {slot} 补建失败: {error}");
+                }
+            }
+        }
+
+        if !context.is_current_session(&session_id).await {
+            return;
+        }
+        let stagger = Duration::from_millis((slot as u64) * 250);
+        time::sleep(backoff + stagger).await;
+        backoff = backoff
+            .checked_mul(2)
+            .unwrap_or(DATA_RECONNECT_MAX_BACKOFF)
+            .min(DATA_RECONNECT_MAX_BACKOFF);
     }
 }
 

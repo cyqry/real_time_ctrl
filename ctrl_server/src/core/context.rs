@@ -42,6 +42,8 @@ struct CtrlSession {
     connection: SharedChannel,
     /// 已用 session proof 绑定的 CtrlData 连接，键为连接随机 ID。
     data_connections: HashMap<String, SharedChannel>,
+    /// CtrlData 自动重连成功时唤醒等待转发的 Kik 数据帧。
+    data_connection_notify: Arc<Notify>,
     /// 选择下一条数据连接的轮询游标。
     next_data_connection: Arc<AtomicUsize>,
     /// 当前命令默认发往的 Kik；为空时由自动选择逻辑补充。
@@ -142,6 +144,7 @@ impl Context {
             instance_id,
             connection: channel.clone(),
             data_connections: HashMap::new(),
+            data_connection_notify: Arc::new(Notify::new()),
             next_data_connection: Arc::new(AtomicUsize::new(0)),
             selected_kik_id: None,
             created_at: SystemTime::now(),
@@ -212,15 +215,21 @@ impl Context {
         let Some(session) = self.sessions.read().await.get(session_id).cloned() else {
             return false;
         };
+        // 先写连接归属，再把连接发布到会话池。否则极快的断线回调可能在属性尚未设置时运行，
+        // 无法根据 session ID 从池中删除自己，留下一个永久的失效槽位。
+        data_conn
+            .lock()
+            .await
+            .insert_attribute(&CTRL_SESSION_ID, session_id.to_string());
         let mut session = session.lock().await;
         if session.data_connections.len() >= MAX_CTRL_DATA_CHANNELS {
             return false;
         }
         session.data_connections.insert(id, data_conn.clone());
-        data_conn
-            .lock()
-            .await
-            .insert_attribute(&CTRL_SESSION_ID, session_id.to_string());
+        let data_connection_notify = session.data_connection_notify.clone();
+        drop(session);
+        // 一个控制会话可能同时有多个下载任务等待数据池恢复，必须广播唤醒后统一复查。
+        data_connection_notify.notify_waiters();
         true
     }
 
@@ -306,6 +315,47 @@ impl Context {
             .take(count)
             .cloned()
             .collect()
+    }
+
+    /// 等待指定控制会话至少恢复一条健康 CtrlData 连接。
+    ///
+    /// 服务端已经从 KikData 读完的分片不能因为控制端正在短暂重连就直接丢弃。等待期间只持有当前
+    /// 分片缓冲，不持有会话表锁；会话删除或超过调用方时限时返回空集合，由上层关闭源连接并报错。
+    pub async fn wait_ctrl_data_connections_for_send(
+        &self,
+        session_id: &str,
+        wait_timeout: Duration,
+    ) -> Vec<SharedChannel> {
+        let deadline = Instant::now() + wait_timeout;
+        loop {
+            let Some(session) = self.sessions.read().await.get(session_id).cloned() else {
+                return Vec::new();
+            };
+            let data_connection_notify = session.lock().await.data_connection_notify.clone();
+            let notified = data_connection_notify.notified();
+            tokio::pin!(notified);
+            // 先登记等待者、再读取连接池，消除 notify_waiters 在检查与 await 之间丢失的竞态。
+            notified.as_mut().enable();
+            let candidates = self.ctrl_data_connections_for_send(session_id).await;
+            let mut healthy = Vec::with_capacity(candidates.len());
+            for connection in candidates {
+                if !connection.lock().await.is_closed() {
+                    healthy.push(connection);
+                }
+            }
+            if !healthy.is_empty() {
+                return healthy;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, notified.as_mut())
+                    .await
+                    .is_err()
+            {
+                return Vec::new();
+            }
+        }
     }
 
     /// 同时取得全局、账号和实例三级许可；Kik 级许可在选定目标后取得。
@@ -656,11 +706,18 @@ impl Context {
         loop {
             // 先登记通知等待者、再复查路由，避免插入恰好发生在检查与 await 之间时丢通知。
             let notified = self.data_route_notify.notified();
+            tokio::pin!(notified);
+            // 路由插入使用广播通知；必须先 enable，确保插入发生在下方复查期间时不会漏唤醒。
+            notified.as_mut().enable();
             if let Some(target) = self.ctrl_data_target(session_id, external_id).await {
                 return Some(target);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, notified.as_mut())
+                    .await
+                    .is_err()
+            {
                 return None;
             }
         }

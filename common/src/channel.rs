@@ -15,6 +15,18 @@ use tokio::net::tcp::OwnedWriteHalf;
 use crate::hidden;
 use crate::secure_transport::BoxedAsyncWrite;
 
+/// 数据通道完成一整帧读写所允许的最长时间。
+///
+/// 控制帧通常只有几 KiB，45 秒没有读到完整帧可以视为连接异常；文件分片却可能达到 4 MiB，
+/// 在慢公网、磁盘背压或 TLS/Noise 重加密期间不能套用同一阈值。六分钟仍是有界超时，既允许约
+/// 12 KiB/s 的低速链路完成单帧，也不会让只发送半帧的连接永久占用服务器资源。
+pub const DATA_CHANNEL_IO_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+
+/// 数据连接断开后，业务命令等待连接池自动补建的最长时间。
+///
+/// 补建任务采用最高 30 秒的指数退避，因此 45 秒足够覆盖一次最坏退避和一次正常握手。
+pub const DATA_CONNECTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// 连接通过初始化消息认证后得到的角色。
 ///
@@ -25,6 +37,19 @@ pub enum ChannelType {
     Kik,
     KikData,
     Unknown,
+}
+
+impl ChannelType {
+    /// 根据连接角色选择“读到一整帧”的超时。
+    ///
+    /// `Unknown` 尚处于认证阶段，必须继续使用较短的配置超时来抵抗慢握手；只有认证完成的数据
+    /// 通道才能获得大帧超时。调用处在角色切换后也应同步调整写超时。
+    pub fn frame_read_timeout(self, control_timeout: Duration) -> Duration {
+        match self {
+            Self::CtrlData | Self::KikData => DATA_CHANNEL_IO_TIMEOUT,
+            Self::Ctrl | Self::Kik | Self::Unknown => control_timeout,
+        }
+    }
 }
 
 /// 带静态类型的连接属性键。
@@ -229,5 +254,22 @@ mod tests {
 
         assert!(channel.write_and_flush(&[7_u8; 1024]).await.is_err());
         assert!(channel.is_closed());
+    }
+
+    #[test]
+    fn data_channels_have_a_separate_large_frame_timeout() {
+        let control_timeout = Duration::from_secs(45);
+        assert_eq!(
+            ChannelType::CtrlData.frame_read_timeout(control_timeout),
+            DATA_CHANNEL_IO_TIMEOUT
+        );
+        assert_eq!(
+            ChannelType::KikData.frame_read_timeout(control_timeout),
+            DATA_CHANNEL_IO_TIMEOUT
+        );
+        assert_eq!(
+            ChannelType::Unknown.frame_read_timeout(control_timeout),
+            control_timeout
+        );
     }
 }

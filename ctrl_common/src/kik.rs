@@ -10,8 +10,10 @@ use common::message::kik_resp::KikResp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::SystemTime;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError, oneshot};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{
+    Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError, oneshot,
+};
 
 /// 服务端持有的单个被控端会话。
 ///
@@ -24,6 +26,10 @@ pub struct Kik {
     conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
     /// 数据连接以连接自身的随机 ID 为键；每条连接属性中另外保存所属 Kik ID。
     data_conns: Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>,
+    /// 新数据连接入池时唤醒正在等待链路恢复的文件转发任务。
+    ///
+    /// `Notify` 不携带业务数据，仅表示“连接集合可能发生了变化”；等待者醒来后必须重新检查连接池。
+    data_connection_notify: Arc<Notify>,
     /// 只用于负载轮询，不参与安全判断，因此使用 Relaxed 原子序即可。
     next_data_conn: Arc<AtomicUsize>,
 
@@ -55,6 +61,7 @@ impl Kik {
             next_data_conn: Arc::new(AtomicUsize::new(0)),
             conn_op: Arc::new(RwLock::new(Some(conn))),
             data_conns: Arc::new(Mutex::new(HashMap::new())),
+            data_connection_notify: Arc::new(Notify::new()),
             initialized: Arc::new(AtomicBool::new(false)),
             pending_commands: Arc::new(Mutex::new(HashMap::new())),
             // 同一被控端允许有限并行，防止一个慢 Kik 被大量已认证请求耗尽服务端内存。
@@ -151,7 +158,46 @@ impl Kik {
             return false;
         }
         connections.insert(id, conn);
+        drop(connections);
+        // 同一个 Kik 可能承载多个并行文件任务；连接池恢复时全部唤醒，让它们重新竞争健康连接。
+        self.data_connection_notify.notify_waiters();
         true
+    }
+
+    /// 等待至少一条未被标记为关闭的数据连接，并返回轮询后的连接快照。
+    ///
+    /// 文件分片已经从源连接完整读入后，目标连接可能正处于自动补建窗口。短暂等待比立即丢弃该帧
+    /// 更可靠；总等待时间由调用方限制，因此失联客户端不会永久占住服务端任务。
+    pub async fn wait_data_connections_for_send(
+        &self,
+        wait_timeout: Duration,
+    ) -> Vec<Arc<Mutex<Channel>>> {
+        let deadline = Instant::now() + wait_timeout;
+        loop {
+            let notified = self.data_connection_notify.notified();
+            tokio::pin!(notified);
+            // `enable` 会在检查连接池前完成等待者登记，因此广播不会丢在检查与 await 的缝隙里。
+            notified.as_mut().enable();
+            let candidates = self.data_connections_for_send().await;
+            let mut healthy = Vec::with_capacity(candidates.len());
+            for connection in candidates {
+                if !connection.lock().await.is_closed() {
+                    healthy.push(connection);
+                }
+            }
+            if !healthy.is_empty() {
+                return healthy;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, notified.as_mut())
+                    .await
+                    .is_err()
+            {
+                return Vec::new();
+            }
+        }
     }
     pub async fn exist_data_channel(&self) -> bool {
         !self.data_conns.lock().await.is_empty()

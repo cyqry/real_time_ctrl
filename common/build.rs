@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_HOST");
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_PORT");
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_CHANNEL");
+    println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_LOCK_PATH");
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY");
 
     let config_content =
@@ -79,6 +80,12 @@ fn apply_build_overrides(strings: &mut BTreeMap<String, String>) {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         },
+    );
+    apply_override(
+        strings,
+        "RTC_CTRL_KIK_BUILD_LOCK_PATH",
+        "LOCK_FILE_PATH",
+        |value| value.len() <= 1024 && !value.contains('\0'),
     );
     apply_override(
         strings,

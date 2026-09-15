@@ -21,6 +21,9 @@ $SameAccountHttpPort = $HttpPort + 1
 $SecondAccountHttpPort = $HttpPort + 3
 
 New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir | Out-Null
+# Trace 使用追加写；每轮先删除旧文件，保证故障注入断言只统计本次运行产生的事件。
+Remove-Item -LiteralPath (Join-Path $E2eDir "ctrl_server_trace.log") -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $E2eDir "real_ctrl_trace.log") -Force -ErrorAction SilentlyContinue
 Set-Content -LiteralPath (Join-Path $E2eDir "ctrl_ls_marker.txt") -Encoding UTF8 -Value "real_time_ctrl e2e marker"
 
 if ($KikNoisePort -ne 9002) {
@@ -194,11 +197,14 @@ function Build-E2eBinaries {
     $previousKey = $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY
     $previousHost = $env:RTC_CTRL_KIK_BUILD_HOST
     $previousPort = $env:RTC_CTRL_KIK_BUILD_PORT
+    $previousLockPath = $env:RTC_CTRL_KIK_BUILD_LOCK_PATH
     try {
         # 公钥只在构建期进入 ctrl_kik；运行时不读取环境变量，也不接收服务端机器信息。
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $NoisePublicKey
         $env:RTC_CTRL_KIK_BUILD_HOST = "127.0.0.1"
         $env:RTC_CTRL_KIK_BUILD_PORT = "$KikNoisePort"
+        # E2E 使用仓库 target 下的独立锁文件，不能与用户正在运行的正式/灰度 Kik 互相排斥。
+        $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = Join-Path $E2eDir "ctrl_kik.lock"
         & cargo build --locked -p ctrl_server -p ctrl_kik -p real_ctrl --bins
         Assert-CommandOk $LASTEXITCODE "Failed to build E2E binaries"
         & cargo build --locked -p real_ctrl --example pipe_concurrency_probe
@@ -207,6 +213,7 @@ function Build-E2eBinaries {
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $previousKey
         $env:RTC_CTRL_KIK_BUILD_HOST = $previousHost
         $env:RTC_CTRL_KIK_BUILD_PORT = $previousPort
+        $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = $previousLockPath
     }
 }
 
@@ -431,7 +438,9 @@ function Invoke-RawHttpRequest {
         foreach ($entry in $Headers.GetEnumerator()) {
             $request.Headers.TryAddWithoutValidation($entry.Key, [string]$entry.Value) | Out-Null
         }
-        if ($null -ne $Body) {
+        # PowerShell 的 [string]$null 在部分 .NET 版本中会绑定为空串。只看 `$null` 会给 GET/OPTIONS
+        # 附加空 StringContent，而 HttpClient 会以 ProtocolViolationException 拒绝这种请求。
+        if ($PSBoundParameters.ContainsKey("Body") -and $null -ne $Body) {
             $request.Content = [System.Net.Http.StringContent]::new(
                 $Body,
                 [System.Text.Encoding]::UTF8,
@@ -653,6 +662,9 @@ try {
         "CTRL_SERVER_TLS_KEY" = $cert.Key
         "CTRL_SERVER_KIK_NOISE_PRIVATE_KEY" = $noise.Private
         "CTRL_SERVER_E2E_TRACE_PATH" = (Join-Path $E2eDir "ctrl_server_trace.log")
+        # 只在 debug 构建中断开最初三条 KikData，验证主连接不断时数据池也能自行补满。
+        "CTRL_SERVER_E2E_DROP_INITIAL_KIK_DATA" = "3"
+        "CTRL_SERVER_E2E_DROP_INITIAL_CTRL_DATA" = "3"
         "CTRL_SERVER_AUTH_SECRET" = $ControlAuthSecret
         "CTRL_SERVER_ACCOUNTS_JSON_BASE64" = $accountsBase64
         "RUST_BACKTRACE" = "1"
@@ -904,6 +916,33 @@ try {
     $kikId = [string]$sysList.data.items[0].id
     $result.kik_id = $kikId
     $result.assertions += "sys_list sees ctrl_kik"
+
+    $disconnectTrace = "server: intentionally dropped initial kik data connection"
+    $ctrlDisconnectTrace = "server: intentionally dropped initial ctrl data connection"
+    $traceDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        # 三个异步任务可能并发追加到同一 trace 行；按子串出现次数统计，不依赖换行原子性。
+        $traceText = Get-Content -LiteralPath (Join-Path $E2eDir "ctrl_server_trace.log") `
+            -Raw `
+            -ErrorAction SilentlyContinue
+        $dropCount = if ($traceText) {
+            ([regex]::Matches($traceText, [regex]::Escape($disconnectTrace))).Count
+        } else { 0 }
+        $ctrlDropCount = if ($traceText) {
+            ([regex]::Matches($traceText, [regex]::Escape($ctrlDisconnectTrace))).Count
+        } else { 0 }
+        if ($dropCount -ge 3 -and $ctrlDropCount -ge 3) { break }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $traceDeadline)
+    if ($dropCount -lt 3) {
+        throw "E2E did not inject all three KikData disconnects"
+    }
+    $result.assertions += "all initial KikData connections are forcibly disconnected while the main Kik session stays online"
+
+    if ($ctrlDropCount -lt 3) {
+        throw "E2E did not inject all three CtrlData disconnects"
+    }
+    $result.assertions += "all initial CtrlData connections are forcibly disconnected while the main control session stays online"
 
     $autoNow = Invoke-ApiCommand -Command @{ kind = "sys_now" } -RequestId "sys-now-auto"
     if (-not ($autoNow.ok -and
@@ -1252,6 +1291,8 @@ try {
     $result.big_file_upload_ms = $uploadWatch.ElapsedMilliseconds
     $result.big_file_download_ms = $downloadWatch.ElapsedMilliseconds
     $result.assertions += "12 MiB chunked upload/download preserves SHA-256"
+    $result.assertions += "KikData supervisors recover from a complete data-pool outage before large-file transfer"
+    $result.assertions += "CtrlData supervisors recover from a complete data-pool outage before large-file transfer"
 
     # 主连接和数据连接都退出后才应记为下线；轮询验证真实清理链路而非直接调用状态方法。
     try { $kik.Proc.Kill($true) } catch { $kik.Proc.Kill() }

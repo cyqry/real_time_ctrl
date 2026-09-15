@@ -8,7 +8,7 @@ use crate::core::context::Context;
 use crate::handler::read_handle;
 use anyhow::Error;
 use bytes::BytesMut;
-use common::channel::{Channel, ChannelType};
+use common::channel::{Channel, ChannelType, DATA_CHANNEL_IO_TIMEOUT};
 use common::config::Config;
 use common::ltc_codec::{
     LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH, DATA_MAX_FRAME_LENGTH,
@@ -192,10 +192,17 @@ async fn handle_transport_parts(
     });
 
     let e = loop {
+        // `FramedRead::next` 只有在整帧到齐后才返回。4 MiB 文件帧不能沿用控制通道的 45 秒
+        // 阈值，否则慢公网会把仍在接收的健康连接误判为静默连接。
+        let frame_read_timeout = channel
+            .lock()
+            .await
+            .channel_type
+            .frame_read_timeout(config.read_timeout);
         // 读锁必须在进入 match 前释放；否则后续调整 decoder 上限会再次锁同一个 FramedRead。
         let read_result = {
             let mut framed = framed_arc.lock().await;
-            timeout(config.read_timeout, framed.next()).await
+            timeout(frame_read_timeout, framed.next()).await
         };
 
         match read_result {
@@ -213,6 +220,13 @@ async fn handle_transport_parts(
                     {
                         Ok(_) => {
                             let channel_type = channel.lock().await.channel_type;
+                            if matches!(channel_type, ChannelType::CtrlData | ChannelType::KikData)
+                            {
+                                channel
+                                    .lock()
+                                    .await
+                                    .set_write_timeout(DATA_CHANNEL_IO_TIMEOUT);
+                            }
                             let max_frame_len = max_frame_len_for_channel_type(&channel_type);
                             framed_arc
                                 .lock()
@@ -331,9 +345,12 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
 
         // 角色刚切换时再留一个间隔，让初始化确认先到达客户端，避免确认与心跳交错。
         time::sleep(Duration::from_secs(5)).await;
-        match channel.lock().await.write_and_flush(&ping).await {
+        let mut channel = channel.lock().await;
+        match channel.write_and_flush(&ping).await {
             Ok(_) => {}
             Err(_) => {
+                // 写侧已经确认不可用时主动 shutdown，使对端监督器尽快补建，也让本连接读循环收到 EOF。
+                channel.try_write_half_close().await;
                 break;
             }
         };

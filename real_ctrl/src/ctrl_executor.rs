@@ -46,6 +46,22 @@ pub async fn execute(
             InputCtrlCommand::GetFile(_, local_path) => local_path.is_empty(),
             _ => false,
         };
+    if matches!(
+        &input_ctrl_cmd,
+        InputCtrlCommand::Screen(_)
+            | InputCtrlCommand::GetFile(_, _)
+            | InputCtrlCommand::GetBigFile(_, _)
+            | InputCtrlCommand::SetFile(_, _)
+            | InputCtrlCommand::SetBigFile(_, _)
+    ) && context
+        .wait_data_connections_for_send(common::channel::DATA_CONNECTION_RECOVERY_TIMEOUT)
+        .await
+        .is_empty()
+    {
+        // 下载命令一旦到达 Kik 就可能马上产生数据；必须在发送控制命令前确认本会话至少有一条
+        // CtrlData 连接。自动补建期间在这里等待，可避免服务端已接受命令却没有可转发目标。
+        return Err(anyhow!("控制端数据连接在恢复时限内不可用"));
+    }
     let (cmd, cmd_options, pending_transfer) = process_cmd(context, input_ctrl_cmd.clone()).await?;
     let (transfer_start, transfer_task) = match pending_transfer {
         Some(transfer) => (Some(transfer.start), Some(transfer.task)),
@@ -221,10 +237,6 @@ async fn do_set_file(
 ) -> anyhow::Result<(CtrlCommand, CmdOptions, Option<PendingTransfer>)> {
     let data = file_util::read_file_limited(file_path, file_util::MAX_INLINE_FILE_BYTES).await?;
     let data_id = Uuid::new_v4().to_string();
-    context
-        .find_ctrl_data()
-        .await
-        .ok_or_else(|| anyhow!("应用数据传输通道未初始化"))?;
     let send_context = context.clone();
     let task_data_id = data_id.clone();
     let (start, start_rx) = oneshot::channel();
@@ -250,10 +262,6 @@ async fn do_set_big_file(
 
     let data_id = Uuid::new_v4().to_string();
     let data_id_c = data_id.clone();
-    context
-        .find_ctrl_data()
-        .await
-        .ok_or_else(|| anyhow!("应用数据传输通道未初始化"))?;
     let prepared =
         file_util::prepare_big_file(&file_path, file_util::FILE_TRANSFER_CHUNK_BYTES).await?;
     let file_size = prepared.size;

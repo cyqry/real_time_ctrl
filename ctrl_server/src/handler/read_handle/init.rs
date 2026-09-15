@@ -25,6 +25,16 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// 仅调试/E2E 构建使用：记录本进程已经主动断开的 KikData 数量。
+/// production profile 不启用 debug assertions，因此测试故障注入不会进入生产二进制。
+#[cfg(debug_assertions)]
+static E2E_DROPPED_KIK_DATA_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
+static E2E_DROPPED_CTRL_DATA_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
 fn default_error() -> anyhow::Error {
     anyhow::Error::msg("不支持的初始化帧类型")
 }
@@ -224,7 +234,34 @@ async fn kik_data_req(
         .await
         .write_and_flush(&protocol::transfer_encode_frame(InitFrame::KikId(id)))
         .await?;
+    #[cfg(debug_assertions)]
+    schedule_e2e_kik_data_disconnect(channel.clone());
     Ok(())
+}
+
+/// 按 E2E 环境变量只断开最初若干条 KikData，不触碰 Kik 主连接。
+///
+/// 这能稳定复现“数据连接全灭、主连接仍在线”的历史故障。延迟发生在初始化确认之后，确保测试的
+/// 是连接监督与补建路径，而不是握手失败重试。普通开发运行未设置变量时该函数没有任何副作用。
+#[cfg(debug_assertions)]
+fn schedule_e2e_kik_data_disconnect(channel: Arc<Mutex<Channel>>) {
+    let requested = std::env::var("CTRL_SERVER_E2E_DROP_INITIAL_KIK_DATA")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(4);
+    if requested == 0 {
+        return;
+    }
+    let index = E2E_DROPPED_KIK_DATA_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    if index >= requested {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        channel.lock().await.try_write_half_close().await;
+        e2e_trace("server: intentionally dropped initial kik data connection");
+    });
 }
 
 async fn kik_req(
@@ -377,7 +414,31 @@ async fn complete_ctrl_data_auth(
             InitFrame::CtrlDataSessionReply(true),
         ))
         .await?;
+    #[cfg(debug_assertions)]
+    schedule_e2e_ctrl_data_disconnect(channel.clone());
     Ok(())
+}
+
+/// CtrlData 版本的调试故障注入，用来验证 real_ctrl 三个监督槽位也能独立自愈。
+#[cfg(debug_assertions)]
+fn schedule_e2e_ctrl_data_disconnect(channel: Arc<Mutex<Channel>>) {
+    let requested = std::env::var("CTRL_SERVER_E2E_DROP_INITIAL_CTRL_DATA")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(8);
+    if requested == 0 {
+        return;
+    }
+    let index = E2E_DROPPED_CTRL_DATA_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    if index >= requested {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        channel.lock().await.try_write_half_close().await;
+        e2e_trace("server: intentionally dropped initial ctrl data connection");
+    });
 }
 
 async fn complete_ctrl_auth(

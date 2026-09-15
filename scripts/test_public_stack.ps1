@@ -2,7 +2,10 @@
     [ValidateSet("Gray", "Production")]
     [string]$Channel = "Gray",
     [int]$HttpPort = 9000,
-    [int]$BigFileMiB = 32
+    [int]$BigFileMiB = 32,
+    # 本机已有正式 Kik 运行时，可指向仓库 target 下的隔离测试产物，避免终止用户会话。
+    # 留空仍使用发布目录中的标准 artifact，不改变一键发布的默认验收行为。
+    [string]$ArtifactDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,7 +18,16 @@ $ExpectedKikNoisePort = if ($Channel -eq "Gray") { 9005 } else { 9002 }
 $ExpectedControlTlsPort = if ($Channel -eq "Gray") { 9009 } else { 9007 }
 $RemoteDir = if ($Channel -eq "Gray") { "/home/deploy/rust/gray" } else { "/home/deploy/rust/ctrl_server" }
 $DeployDir = Join-Path $Root "target\deploy\$ChannelName"
-$ArtifactDir = Join-Path $DeployDir "artifacts"
+$ArtifactDir = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) {
+    Join-Path $DeployDir "artifacts"
+} else {
+    $candidate = [IO.Path]::GetFullPath($ArtifactDirectory)
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $candidate.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "公网测试 artifact 目录必须位于当前仓库内: $candidate"
+    }
+    $candidate
+}
 $ReportDir = Join-Path $DeployDir "reports"
 $RunDir = Join-Path $DeployDir "public-e2e"
 $LogDir = Join-Path $RunDir "logs"
