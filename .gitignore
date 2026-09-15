@@ -1,8 +1,9 @@
 /target
 /logs
+/deploy
+/reports
 *.lock
 .idea
-rust-toolchain.toml
 !ctrl_kik/rust-toolchain.toml
 Cargo.lock
 **/Cargo.lock

@@ -16,6 +16,7 @@
       <sourceFolder url="file://$MODULE_DIR$/string_obfuscation_macros/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/common/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/ctrl_common/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/real_ctrl/examples" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/real_ctrl/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>

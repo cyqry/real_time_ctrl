@@ -25,7 +25,7 @@ $RemoteDir = if ($Channel -eq "Gray") {
     "/home/deploy/rust/ctrl_server"
 }
 $ServiceName = "real-time-ctrl-$ChannelName"
-$DeployDir = Join-Path $Root "target\deploy\$ChannelName"
+$DeployDir = Join-Path $Root "deploy\$ChannelName"
 $IdentityDir = Join-Path $DeployDir "identity"
 $ArtifactDir = Join-Path $DeployDir "artifacts"
 $ReportDir = Join-Path $DeployDir "reports"
@@ -109,7 +109,7 @@ function Set-PrivateAcl {
         [switch]$Container
     )
 
-    # 部署密钥与环境文件均只允许当前发布用户读取。target/.gitignore 只能避免误提交，
+    # 部署密钥与环境文件均只允许当前发布用户读取。根 .gitignore 只能避免误提交，
     # 不能替代操作系统访问控制，因此 ACL 收紧失败必须中止发布。
     $permission = if ($Container) { "${env:USERNAME}:(OI)(CI)F" } else { "${env:USERNAME}:F" }
     & icacls $Path /inheritance:r /grant:r $permission 2>$null | Out-Null
@@ -250,7 +250,9 @@ function Write-DeploymentFiles {
         REAL_CTRL_AUTH_SECRET = $Identity.ControlSecret
         REAL_CTRL_API_TOKEN = $Identity.ApiToken
         REAL_CTRL_API_ALLOW_EXEC = "1"
-        REAL_CTRL_HTTP_LOCK_PATH = (Join-Path $DeployDir "real_ctrl_http.lock")
+        # 锁文件是进程存活期状态，不属于发布身份或 artifact。放入系统临时目录，避免污染
+        # 可长期保存的 deploy 目录；通道名保证灰度与正式实例不会互相抢锁。
+        REAL_CTRL_HTTP_LOCK_PATH = (Join-Path ([IO.Path]::GetTempPath()) "real_ctrl-http-$ChannelName.lock")
         RUST_BACKTRACE = "1"
     }
     $localEnvPath = Join-Path $DeployDir "real_ctrl.env.json"

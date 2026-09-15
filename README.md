@@ -15,7 +15,7 @@ Windows 被控端、Windows 控制端与 Linux 中继服务组成的远程控制
 ```
 
 脚本会生成或复用身份、审计依赖、构建三个组件、发布 Linux 服务并完成公网验收。
-`target/deploy/gray/artifacts/` 中的程序已经包含当前灰度环境的加密构建默认值，可直接双击：
+`deploy/gray/artifacts/` 中的程序已经包含当前灰度环境的加密构建默认值，可直接双击：
 
 - `real_ctrl.exe`：交互控制台；
 - `real_ctrl_local_server.exe`：命名管道服务；
@@ -33,7 +33,8 @@ Windows 被控端、Windows 控制端与 Linux 中继服务组成的远程控制
 .\scripts\build_hardened.ps1
 ```
 
-生成后的产物位于 `target/prod/`。`ctrl_kik` 正式发布仍必须使用
+生成后的身份与环境位于 `deploy/standalone/`，生产二进制仍会从 Cargo `target/production/`
+复制到对应 `deploy/<channel>/artifacts/`。`ctrl_kik` 正式发布仍必须使用
 `scripts/build_ctrl_kik_protected.ps1`，不能使用通用 hardened 产物。
 
 ## 固定端口
@@ -48,6 +49,7 @@ Windows 被控端、Windows 控制端与 Linux 中继服务组成的远程控制
 - `协议说明.md`：远程连接角色、命令/响应、关联 ID、文件数据面和本地开放 API；
 - `生产架构与安全验收.md`：安全模型、API 和协议护栏；
 - `生产发布与公网验收.md`：发布入口、远端目录和最新公网结果；
+- `并发与渗透测试计划.md`：安全测试范围、压力模型和发布阻断标准；
 - `文件传输架构与性能.md`：分片、乱序、落盘和性能边界；
 - `ctrl_kik/防逆向发布.md`：字符串保护、固定工具链与 PE 审计；
 - `生产环境变量_IDEA.txt`：构建默认值、可覆盖项和秘密注入边界。

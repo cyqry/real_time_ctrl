@@ -62,7 +62,7 @@
   Kik 完整下线后应清除旧引用并选择仍在线的合法候选。
 - 非 debug Cargo profile 的编译期默认日志级别为 INFO；显式 `RUST_LOG` 优先。
 - `ctrl_server/build.rs` 提供 bind、端口、TLS PEM、认证 secret、Noise 私钥和 Exec 策略的正式默认值，
-  运行环境变量优先。敏感构建输入只来自仓库 `target` 下受 ACL 保护的身份目录，发布后必须审计明文泄漏。
+  运行环境变量优先。敏感构建输入只来自仓库 `deploy` 下受 ACL 保护的身份目录，发布后必须审计明文泄漏。
 - 多账号配置由 `CTRL_SERVER_ACCOUNTS_JSON_BASE64` 或同名构建默认值提供；账号 secret、Kik ACL、
   最大实例数和账号/实例并发上限必须逐项验证。配置缺失时只生成兼容部署用的 `default` 账号。
 - Kik 最近状态表最多保留 256 条、仅驻留当前服务端进程；只在初始化完成后记录上线，只在主/数据连接全部消失后记录下线，旧连接回调不得删除重连后的新会话。

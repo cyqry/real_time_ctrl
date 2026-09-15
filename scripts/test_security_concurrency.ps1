@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
-$ReportDir = Join-Path $Root "target\security-tests"
+$ReportDir = Join-Path $Root "reports\security-tests"
 $ReportPath = Join-Path $ReportDir "security-concurrency-summary.json"
 [IO.Directory]::CreateDirectory($ReportDir) | Out-Null
 

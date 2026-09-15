@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $PreviousRustFlags = $env:RUSTFLAGS
-$CompiledDefaultsPath = Join-Path $Root "target\prod\env\compiled_defaults.env.ps1"
+$CompiledDefaultsPath = Join-Path $Root "deploy\standalone\env\compiled_defaults.env.ps1"
 $BuildVariableNames = @(
     "RTC_REAL_CTRL_BUILD_SERVER_HOST",
     "RTC_REAL_CTRL_BUILD_TLS_PORT",

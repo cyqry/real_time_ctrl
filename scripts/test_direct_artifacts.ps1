@@ -11,8 +11,8 @@ Set-StrictMode -Version Latest
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
 $channelName = $Channel.ToLowerInvariant()
-$artifactDir = (Resolve-Path (Join-Path $root "target\deploy\$channelName\artifacts")).Path
-$workDir = Join-Path $root "target\deploy\$channelName\public-e2e"
+$artifactDir = (Resolve-Path (Join-Path $root "deploy\$channelName\artifacts")).Path
+$workDir = Join-Path $root "target\direct-artifacts\$channelName"
 $script:results = [Collections.Generic.List[object]]::new()
 
 function Start-CleanProcess {

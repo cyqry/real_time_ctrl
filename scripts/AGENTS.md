@@ -2,7 +2,9 @@
 
 ## 文件边界
 
-- 除 Cargo/Rust 全局依赖缓存外，构建产物、证书、密钥、环境文件、日志和报告只能写入仓库 `target/`。
+- `target/` 只放 Cargo 中间产物和一次性测试工作文件，必须允许用户随时整目录删除。
+- 可复用部署身份、环境、直启 artifact 和通道报告保存在仓库 `deploy/`；本地机器可读验收报告保存在
+  `reports/`。两者必须被根 `.gitignore` 忽略，敏感文件还必须收紧 ACL。
 - 远端文件只允许写入当前通道目录：灰度 `/home/deploy/rust/gray/`，正式 `/home/deploy/rust/ctrl_server/`。
 - 不读取或打印 SSH 配置、凭据、会话 token、控制面秘密、Noise 私钥或 TLS 私钥。
 
@@ -20,8 +22,8 @@
 ## 密钥与部署
 
 - 灰度端口固定为 Kik Noise `9005`、real_ctrl TLS `9009`；正式端口固定为 Kik Noise `9002`、real_ctrl TLS `9007`，发布脚本和报告禁止再用单一 `server_port` 混淆语义。
-- 部署身份首次生成后保存在 `target/deploy/<channel>/identity/` 并复用；不得静默轮换，否则现有 ctrl_kik 公钥将失配。
-- 控制秘密、TLS 私钥和 Noise 私钥只允许从权限收紧的 `target` 身份文件进入构建或部署环境；
+- 部署身份首次生成后保存在 `deploy/<channel>/identity/` 并复用；不得静默轮换，否则现有 ctrl_kik 公钥将失配。
+- 控制秘密、TLS 私钥和 Noise 私钥只允许从权限收紧的 `deploy` 身份文件进入构建或部署环境；
   禁止出现在命令行、清单和标准输出。发布必须扫描产物，确保原始构建值不可明文搜索。
 - 服务器发布必须把 `scripts/remote/reboot.sh` 安装为 `/home/deploy/rust/reboot.sh` 并设为 0750；
   脚本要独立尝试正式与灰度服务，不能因某个服务未安装而漏重启另一个。
@@ -44,5 +46,5 @@
   必须保持有界，不能通过扩大连接数模拟拒绝服务。
 - 畸形 HTTP、管道、TLS 和 Noise 探针之后必须再次执行健康检查与合法命令，单纯观察连接被关闭不算通过。
 - 固定种子的协议随机测试属于发布门禁；新增网络解析入口时，必须同步纳入 `protocol_robustness` 测试。
-- 测试报告和载荷只能写入 `target/security-tests`、`target/e2e` 或当前通道的 `target/deploy`，失败路径也要
-  生成报告并清理进程。测试计划的威胁假设、阈值和剩余风险维护在根目录 `并发与渗透测试计划.md`。
+- 测试载荷与日志只能写入 `target/` 的专用工作目录；结构化报告写入 `reports/` 或当前通道的
+  `deploy/<channel>/reports`，失败路径也要生成报告并清理进程。测试计划的威胁假设、阈值和剩余风险维护在根目录 `并发与渗透测试计划.md`。

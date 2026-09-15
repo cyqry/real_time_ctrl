@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 if ([string]::IsNullOrWhiteSpace($ReportPath)) {
-    $ReportPath = Join-Path $Root "target\audit\production-dependencies.json"
+    $ReportPath = Join-Path $Root "reports\audit\production-dependencies.json"
 }
 
 # Cargo.lock 会记录 workspace 成员的依赖以及某些未启用的可选依赖，而 cargo-audit

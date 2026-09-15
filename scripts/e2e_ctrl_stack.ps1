@@ -13,14 +13,15 @@ $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $E2eDir = Join-Path $Root "target\e2e"
 $CertDir = Join-Path $E2eDir "certs"
 $LogDir = Join-Path $E2eDir "logs"
-$ReportPath = Join-Path $E2eDir "e2e_report.json"
+$ReportDir = Join-Path $Root "reports\e2e"
+$ReportPath = Join-Path $ReportDir "e2e_report.json"
 $ApiToken = "e2e-local-token"
 $ControlAuthSecret = "e2e-control-auth-secret-0123456789abcdef"
 $SecondAccountSecret = "e2e-second-account-secret-0123456789abcdef"
 $SameAccountHttpPort = $HttpPort + 1
 $SecondAccountHttpPort = $HttpPort + 3
 
-New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir | Out-Null
+New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir, $ReportDir | Out-Null
 # Trace 使用追加写；每轮先删除旧文件，保证故障注入断言只统计本次运行产生的事件。
 Remove-Item -LiteralPath (Join-Path $E2eDir "ctrl_server_trace.log") -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $E2eDir "real_ctrl_trace.log") -Force -ErrorAction SilentlyContinue

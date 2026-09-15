@@ -8,7 +8,7 @@
 
   .\scripts\publish_stack.ps1 -Channel Gray
 
-发布后的 Windows 程序位于 target\deploy\gray\artifacts，可直接双击 EXE，不依赖运行脚本、
+发布后的 Windows 程序位于 deploy\gray\artifacts，可直接双击 EXE，不依赖运行脚本、
 证书或配置 sidecar。正式身份与构建输入先运行：
 
   .\scripts\generate_production_identity.ps1 -ServerAddress ytycc.com
@@ -50,7 +50,7 @@ ctrl_server：
   RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY
   RTC_CTRL_SERVER_BUILD_ALLOW_EXEC
 
-生成脚本把随机秘密和 TLS/Noise 身份保存到仓库 target 下，并收紧 ACL；构建脚本临时加载
+生成脚本把随机秘密和 TLS/Noise 身份保存到仓库 deploy 下，并收紧 ACL；构建脚本临时加载
 这些值。build.rs 只声明读取规则，实际值由 Cargo 传给 rustc，并经 hidden!(env!(...))
 转换为密文数组。发布审计会检查原始值不能在最终二进制中直接搜索到。
 

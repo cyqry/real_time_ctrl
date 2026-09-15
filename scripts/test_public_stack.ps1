@@ -3,7 +3,7 @@
     [string]$Channel = "Gray",
     [int]$HttpPort = 9000,
     [int]$BigFileMiB = 32,
-    # 本机已有正式 Kik 运行时，可指向仓库 target 下的隔离测试产物，避免终止用户会话。
+    # 本机已有正式 Kik 运行时，可指向仓库内的隔离测试产物，避免终止用户会话。
     # 留空仍使用发布目录中的标准 artifact，不改变一键发布的默认验收行为。
     [string]$ArtifactDirectory = ""
 )
@@ -17,7 +17,7 @@ $TargetAlias = "ytycc"
 $ExpectedKikNoisePort = if ($Channel -eq "Gray") { 9005 } else { 9002 }
 $ExpectedControlTlsPort = if ($Channel -eq "Gray") { 9009 } else { 9007 }
 $RemoteDir = if ($Channel -eq "Gray") { "/home/deploy/rust/gray" } else { "/home/deploy/rust/ctrl_server" }
-$DeployDir = Join-Path $Root "target\deploy\$ChannelName"
+$DeployDir = Join-Path $Root "deploy\$ChannelName"
 $ArtifactDir = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) {
     Join-Path $DeployDir "artifacts"
 } else {
@@ -29,7 +29,7 @@ $ArtifactDir = if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) {
     $candidate
 }
 $ReportDir = Join-Path $DeployDir "reports"
-$RunDir = Join-Path $DeployDir "public-e2e"
+$RunDir = Join-Path $Root "target\public-e2e\$ChannelName"
 $LogDir = Join-Path $RunDir "logs"
 $EnvPath = Join-Path $DeployDir "real_ctrl.env.json"
 $KikExe = Join-Path $ArtifactDir "ctrl_kik.exe"
@@ -137,9 +137,10 @@ function Stop-TestProcesses {
 function Remove-TestPayloadFiles {
     if (-not (Test-Path -LiteralPath $RunDir)) { return }
     $fullRunDir = [IO.Path]::GetFullPath($RunDir)
-    $deployPrefix = [IO.Path]::GetFullPath($DeployDir).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-    if (-not $fullRunDir.StartsWith($deployPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "拒绝清理部署目录外的验收文件: $fullRunDir"
+    $transientPrefix = [IO.Path]::GetFullPath((Join-Path $Root "target\public-e2e")).TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    if (-not $fullRunDir.StartsWith($transientPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "拒绝清理约定临时目录外的验收文件: $fullRunDir"
     }
     # 日志是验收证据，根目录中的上传、下载和 lock 文件只是可再生负载，不应长期占用空间。
     Get-ChildItem -LiteralPath $fullRunDir -File -Force -ErrorAction SilentlyContinue |

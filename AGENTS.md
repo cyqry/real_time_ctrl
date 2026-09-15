@@ -42,6 +42,8 @@
 - 修改 `common` 或 `ctrl_common` 后至少运行 `cargo test -p common -p ctrl_common`。
 - 修改连接路径后至少运行对应 crate 的 `cargo check`。
 - 一般测试产物放在仓库 `target`；运行时大文件接收临时文件例外，必须放系统临时目录，使用随机文件名和 `.temp` 后缀，并在所有失败路径清理。
+- `target/` 只允许承载 Cargo 和测试的可再生产物，必须能被整目录删除；部署身份、直启 artifact、
+  manifest 和维护报告分别保存在仓库 `deploy/`、`reports/`，不得依赖 `target/` 长期存在。
 - 如果测试失败，要在最终回复中说明失败命令和原因；不能假装通过。
 
 ## AGENTS.md 粒度
@@ -80,7 +82,7 @@
 - 灰度/正式 `ctrl_kik` 必须通过构建变量 `RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY` 注入 Noise 公钥；
   对应私钥只允许进入 `ctrl_server` 的编译默认值和运行时覆盖，不得进入客户端。
 - 发布 artifact 中的 EXE 必须可直接双击运行，不依赖启动脚本、证书或配置 sidecar。每次构建先清空
-  旧 artifact 目录；敏感身份文件只留在仓库 `target/deploy/<channel>/identity`，不得进入 artifact manifest。
+  旧 artifact 目录；敏感身份文件只留在仓库 `deploy/<channel>/identity`，不得进入 artifact manifest。
 - 每次服务器发布都要安装 `/home/deploy/rust/reboot.sh`；它必须分别重启正式和灰度服务，未安装的
   通道可跳过，但一个通道失败不能阻止另一个通道被尝试。
 

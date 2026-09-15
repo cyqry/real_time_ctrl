@@ -110,10 +110,9 @@ function Get-SubjectAlternativeNameLines {
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$prodDir = Join-Path $repoRoot "target\prod"
+$prodDir = Join-Path $repoRoot "deploy\standalone"
 $certDir = Join-Path $prodDir "certs"
 $envDir = Join-Path $prodDir "env"
-$runtimeDir = Join-Path $prodDir "runtime"
 $certPath = Join-Path $certDir "server.crt"
 $keyPath = Join-Path $certDir "server.key"
 $pubKeyPath = Join-Path $certDir "server.pubkey.pem"
@@ -153,7 +152,7 @@ if ($null -eq $openSsl) {
     throw "OpenSSL was not found. Install OpenSSL 3.x and add openssl.exe to PATH."
 }
 
-New-Item -ItemType Directory -Force -Path $certDir, $envDir, $runtimeDir | Out-Null
+New-Item -ItemType Directory -Force -Path $certDir, $envDir | Out-Null
 
 $sanLines = Get-SubjectAlternativeNameLines -Address $ServerAddress -ServerName $TlsServerName
 $openSslConfig = @(
@@ -215,7 +214,8 @@ if ($spkiPin -notmatch '^[0-9a-f]{64}$') {
 
 $controlAuthSecret = New-RandomToken -ByteCount 48
 $apiToken = New-RandomToken -ByteCount 48
-$httpLockPath = Join-Path $runtimeDir "real_ctrl_invoker_http_service.lock"
+# 运行锁可在异常退出后重建，不应与证书、构建输入一起长期保存。
+$httpLockPath = Join-Path ([IO.Path]::GetTempPath()) "real_ctrl-http-production.lock"
 
 $ctrlServerValues = [ordered]@{
     CTRL_SERVER_BIND_HOST = "0.0.0.0"
@@ -324,15 +324,15 @@ Assert-LastExitCode $LASTEXITCODE "Failed to read certificate fingerprint"
     "Runtime environment variables remain higher-priority overrides.",
     "",
     "Advanced/manual environment loading:",
-    ". .\target\prod\env\production.env.ps1",
-    ". .\target\prod\env\ctrl_server.env.ps1",
-    ". .\target\prod\env\real_ctrl.env.ps1",
-    ". .\target\prod\env\ctrl_kik_build.env.ps1  # build time only",
-    ". .\target\prod\env\compiled_defaults.env.ps1  # build time only",
+    ". .\deploy\standalone\env\production.env.ps1",
+    ". .\deploy\standalone\env\ctrl_server.env.ps1",
+    ". .\deploy\standalone\env\real_ctrl.env.ps1",
+    ". .\deploy\standalone\env\ctrl_kik_build.env.ps1  # build time only",
+    ". .\deploy\standalone\env\compiled_defaults.env.ps1  # build time only",
     "",
     "IDEA environment fields:",
-    "target\prod\env\idea_ctrl_server.txt",
-    "target\prod\env\idea_real_ctrl.txt",
+    "deploy\standalone\env\idea_ctrl_server.txt",
+    "deploy\standalone\env\idea_real_ctrl.txt",
     "",
     "server.key and env contain secrets used as protected build inputs.",
     "Never commit, share or package the secret files.",
