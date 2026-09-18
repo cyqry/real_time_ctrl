@@ -1,7 +1,7 @@
 //! 已认证 Ctrl 主连接上的命令与响应编排。
 //!
 //! 读循环只做解析、策略检查和取得并发许可，然后为每条命令启动独立任务。系统命令在服务端完成；
-//! 远程命令会选择当前 Kik、改写命令/数据关联 ID，并等待该 Kik 的专属 oneshot 响应。
+//! 远程命令会绑定请求目标（旧桌面帧使用当前选择）、改写关联 ID，并等待该 Kik 的专属响应。
 
 use crate::core::connection_meta::CTRL_SESSION_ID;
 use crate::core::context::Context;
@@ -12,7 +12,7 @@ use common::file_util::LONG_COMMAND_TIMEOUT;
 use common::message::kik_frame::KikFrame;
 use common::message::kik_resp::{ClientSuccessResp, KikResp};
 use common::protocol::{self, BufSerializable, ReqCmd};
-use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
+use ctrl_common::cmd_resp_info::{KikInfoVo, ServerCapabilities, SysNow};
 use ctrl_common::ctrl_frame::Frame;
 use ctrl_common::ctrl_protocol::{ctrl_kik_resp, ctrl_server_resp_error, ctrl_server_resp_success};
 use futures::stream;
@@ -37,15 +37,26 @@ pub async fn handle_ctrl(
     allow_remote_exec: bool,
 ) -> anyhow::Result<()> {
     match Frame::from_buf(msg).ok_or_else(default_error)? {
-        Frame::Cmd(req) => {
+        frame @ (Frame::Cmd(_) | Frame::TargetedCmd(_, _) | Frame::Capabilities(_)) => {
             let session_id = channel
                 .lock()
                 .await
                 .attribute(&CTRL_SESSION_ID)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("控制连接缺少会话绑定"))?;
-            let (cmd_id, cmd_options, cmd) = req.split();
-            if matches!(&cmd, Command::Exec(_)) && !allow_remote_exec {
+            let (cmd_id, request) = match frame {
+                Frame::Cmd(req) => (req.get_id().to_owned(), Some((req, None))),
+                Frame::TargetedCmd(target, req) => {
+                    (req.get_id().to_owned(), Some((req, Some(target))))
+                }
+                Frame::Capabilities(id) => (id, None),
+                _ => unreachable!("上层 match 已限制帧类型"),
+            };
+            if request
+                .as_ref()
+                .is_some_and(|(req, _)| matches!(req.get_cmd(), Command::Exec(_)))
+                && !allow_remote_exec
+            {
                 write_error(
                     &channel,
                     cmd_id,
@@ -64,6 +75,21 @@ pub async fn handle_ctrl(
             };
             tokio::spawn(async move {
                 let _permits = permits;
+                let Some((request, target)) = request else {
+                    // 能力查询也持有账号/会话许可，避免已认证客户端制造无界响应任务。
+                    let capabilities = ServerCapabilities {
+                        target_bound_command_v1: true,
+                    };
+                    if let Ok(json) = serde_json::to_string(&capabilities) {
+                        let _ = channel
+                            .lock()
+                            .await
+                            .write_and_flush(&ctrl_server_resp_success(cmd_id, json))
+                            .await;
+                    }
+                    return;
+                };
+                let (_, cmd_options, cmd) = request.split();
                 // session ID 属于数据通道绑定材料；日志只保留服务端随机命令 ID。
                 debug!("处理控制命令: cmd_id={}", cmd_id);
                 if let Err(error) = execute_command(
@@ -73,6 +99,7 @@ pub async fn handle_ctrl(
                     cmd_id.clone(),
                     cmd_options,
                     cmd,
+                    target,
                 )
                 .await
                 {
@@ -103,11 +130,21 @@ async fn execute_command(
     cmd_id: String,
     cmd_options: common::protocol::CmdOptions,
     cmd: Command,
+    target: Option<String>,
 ) -> anyhow::Result<()> {
     match cmd {
         Command::Sys(sys) => execute_system(&context, &channel, &session_id, cmd_id, sys).await,
         remote => {
-            execute_remote(&context, &channel, &session_id, cmd_id, cmd_options, remote).await
+            execute_remote(
+                &context,
+                &channel,
+                &session_id,
+                cmd_id,
+                cmd_options,
+                remote,
+                target.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -193,9 +230,17 @@ async fn execute_remote(
     external_cmd_id: String,
     cmd_options: common::protocol::CmdOptions,
     command: Command,
+    target: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Some(kik) = context.get_kik(session_id).await else {
-        return write_error(channel, external_cmd_id, "没有被控制的Kik".into()).await;
+    let kik = match target {
+        Some(id) => match context.get_authorized_target(session_id, id).await {
+            Ok(kik) => kik,
+            Err(error) => return write_error(channel, external_cmd_id, error.to_string()).await,
+        },
+        None => match context.get_kik(session_id).await {
+            Some(kik) => kik,
+            None => return write_error(channel, external_cmd_id, "没有被控制的Kik".into()).await,
+        },
     };
     let Some(kik_conn) = kik.get_kik_conn().await else {
         return write_error(channel, external_cmd_id, "被控制的Kik已下线".into()).await;

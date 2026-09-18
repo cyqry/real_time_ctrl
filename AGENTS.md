@@ -81,8 +81,9 @@
 - `ctrl_kik` 默认编译并执行 `Exec`，与其他远程命令使用同一分派路径；管理面仍由 `REAL_CTRL_API_ALLOW_EXEC=1` 和 `CTRL_SERVER_ALLOW_EXEC=1` 两层显式授权。
 - 灰度/正式 `ctrl_kik` 必须通过构建变量 `RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY` 注入 Noise 公钥；
   对应私钥只允许进入 `ctrl_server` 的编译默认值和运行时覆盖，不得进入客户端。
-- 发布 artifact 中的 EXE 必须可直接双击运行，不依赖启动脚本、证书或配置 sidecar。每次构建先清空
-  旧 artifact 目录；敏感身份文件只留在仓库 `deploy/<channel>/identity`，不得进入 artifact manifest。
+- 发布 artifact 中的 EXE 必须可直接双击运行，不依赖启动脚本、证书或配置 sidecar。每次构建先清理
+  本轮选中组件的旧产物；用户显式跳过的组件须校验摘要、保留原构建时间并标记 retained，不构建或部署。
+  敏感身份文件只留在仓库 `deploy/<channel>/identity`，不得进入 artifact manifest。
 - 每次服务器发布都要安装 `/home/deploy/rust/reboot.sh`；它必须分别重启正式和灰度服务，未安装的
   通道可跳过，但一个通道失败不能阻止另一个通道被尝试。
 

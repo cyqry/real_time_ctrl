@@ -50,7 +50,8 @@ try {
         $Trees[$package] = "clean"
     }
 
-    $auditArgs = @("audit", "-D", "warnings")
+    # advisory 数据库属于可重建审计资料，留在仓库内；不改变全局 Cargo 依赖缓存。
+    $auditArgs = @("audit", "--db", (Join-Path $Root 'target/advisory-db'), "-D", "warnings")
     foreach ($advisory in $ExcludedAdvisories.Keys) {
         $auditArgs += @("--ignore", $advisory)
     }

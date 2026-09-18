@@ -295,6 +295,8 @@ pub(crate) fn init_frame_kind(frame: &InitFrame) -> &'static str {
 pub(crate) fn frame_kind(frame: &Frame) -> &'static str {
     match frame {
         Frame::Cmd(_) => "command",
+        Frame::TargetedCmd(_, _) => "targeted_command",
+        Frame::Capabilities(_) => "capabilities",
         Frame::Resp(_) => "response",
         Frame::Data(_, _) => "data",
         Frame::DataAck(_) => "data_ack",

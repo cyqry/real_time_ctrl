@@ -4,13 +4,21 @@
     [switch]$BuildOnly,
     [switch]$DeployOnly,
     [switch]$SkipToolchainInstall,
-    [switch]$SkipPublicTests
+    [switch]$SkipPublicTests,
+    [switch]$SkipCtrlServer,
+    [switch]$SkipCtrlKik,
+    [switch]$SkipRealCtrl,
+    [switch]$PlanOnly
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $TargetTriple = "x86_64-unknown-linux-musl"
+# 必须使用完整版本号。cross 会据此寻找 Linux 主机工具链；1.90 与 1.90.0
+# 在 rustup 中是不同的安装名，短别名会触发旧版 cross 的非本机工具链自动安装缺陷。
+$BuildToolchain = "1.90.0"
+$CrossConfig = Join-Path $Root "Cross.toml"
 $ServerHost = "ytycc.com"
 $TargetAlias = "ytycc"
 $ChannelName = $Channel.ToLowerInvariant()
@@ -32,6 +40,9 @@ $ReportDir = Join-Path $DeployDir "reports"
 $ServerArtifact = Join-Path $Root "target\$TargetTriple\production\ctrl_server"
 $KikArtifact = Join-Path $Root "target\ctrl-kik-protected\hardened\ctrl_kik.exe"
 $KikReceipt = Join-Path $Root "target\ctrl-kik-protected\build-receipt.json"
+. (Join-Path $ScriptDir 'publish_components.ps1')
+$Selection = Get-PublishPlan -BuildOnly:$BuildOnly -DeployOnly:$DeployOnly -SkipCtrlServer:$SkipCtrlServer -SkipCtrlKik:$SkipCtrlKik -SkipRealCtrl:$SkipRealCtrl -SkipPublicTests:$SkipPublicTests
+if ($PlanOnly) { [ordered]@{channel=$ChannelName;plan=$Selection;appIncluded=$false} | ConvertTo-Json -Depth 5; return }
 
 function Assert-LastExitCode {
     param([string]$Message)
@@ -73,33 +84,36 @@ function Assert-DockerReady {
     }
 }
 
-function Reset-ArtifactDirectory {
-    $fullArtifactDir = [IO.Path]::GetFullPath($ArtifactDir)
-    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-    if (-not $fullArtifactDir.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "拒绝清理仓库外的产物目录: $fullArtifactDir"
-    }
-    [IO.Directory]::CreateDirectory($fullArtifactDir) | Out-Null
-
-    # Windows 终端可以把当前目录固定在 artifacts。此时目录本身不可删除，但其内容仍可安全清理。
-    # 保留目录、逐项删除也避免发布过程中出现“产物根目录短暂不存在”的观察窗口。
-    $lastError = $null
-    for ($attempt = 1; $attempt -le 4; $attempt++) {
-        try {
-            Get-ChildItem -LiteralPath $fullArtifactDir -Force |
-                Remove-Item -Recurse -Force -ErrorAction Stop
-            $lastError = $null
-            break
-        } catch {
-            $lastError = $_
-            if ($attempt -lt 4) {
-                Start-Sleep -Milliseconds (250 * $attempt)
-            }
+function Assert-PublishToolchains {
+    # cross 在 Windows 上使用 Docker 内的 Linux rustc，除了本机编译器，还需要
+    # Linux 工具链及 musl 标准库。先核对现有安装，避免构建 Kik 后才暴露环境问题。
+    $installed = (& rustup toolchain list) -join "`n"
+    Assert-LastExitCode "读取 Rust 工具链失败"
+    $required = @()
+    if ('real_ctrl' -in $Selection.build -or 'ctrl_server' -in $Selection.build) { $required += "$BuildToolchain-x86_64-pc-windows-msvc" }
+    if ('ctrl_server' -in $Selection.build) { $required += "$BuildToolchain-x86_64-unknown-linux-gnu" }
+    foreach ($toolchain in $required) {
+        if ($installed -notmatch "(?m)^$([regex]::Escape($toolchain))(\s|$)") {
+            throw "缺少发布工具链 $toolchain。先按发布文档准备工具链；脚本不会改变全局默认版本或自动下载另一套别名。"
         }
     }
-    if ($null -ne $lastError) {
-        throw "无法清理旧产物；请关闭正在运行的旧版本后重试: $($lastError.Exception.Message)"
+    if ('ctrl_server' -notin $Selection.build) { return }
+    $targets = @(& rustup target list --installed --toolchain "$BuildToolchain-x86_64-unknown-linux-gnu")
+    Assert-LastExitCode "读取 Linux Rust 标准库目标失败"
+    if ($TargetTriple -notin $targets) {
+        throw "Linux 工具链缺少 $TargetTriple 标准库，无法执行 cross 发布构建。"
     }
+    if (-not (Test-Path -LiteralPath $CrossConfig -PathType Leaf)) {
+        throw "缺少发布 Cross.toml；不能在丢失服务端构建身份变量的情况下继续。"
+    }
+}
+
+function Write-LfText {
+    param([string]$Path, [string]$Text)
+    # PowerShell here-string 会保留脚本检出时的 CRLF。上传前统一为 LF，
+    # 否则 Linux bash 会把 pipefail 后面的回车当成选项内容，部署阶段直接失败。
+    $normalized = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    [IO.File]::WriteAllText($Path, $normalized, [Text.UTF8Encoding]::new($false))
 }
 
 function Set-PrivateAcl {
@@ -301,17 +315,23 @@ WantedBy=multi-user.target
 
 function Build-Stack {
     param($Identity)
-    & (Join-Path $ScriptDir "build_ctrl_kik_protected.ps1") `
-        -SkipToolchainInstall:$SkipToolchainInstall `
-        -ServerHost $ServerHost `
-        -ServerPort $KikNoisePort `
-        -BuildChannel $ChannelName `
-        -NoiseServerPublicKey $Identity.NoisePublic | Out-Null
-    Assert-LastExitCode "ctrl_kik 受保护构建失败"
-
-    $receipt = Get-Content -LiteralPath $KikReceipt -Raw -Encoding UTF8 | ConvertFrom-Json
-    if (-not $receipt.production_ready) {
-        throw "ctrl_kik 二进制审计未达到 production_ready"
+    if ('ctrl_kik' -in $Selection.build) {
+        $previousKikLock = $env:RTC_CTRL_KIK_BUILD_LOCK_PATH
+        try {
+            # 发布产物使用工作目录中的锁文件，不能沿用开发机配置里的固定绝对路径。
+            $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = "ctrl_kik.lock"
+            & (Join-Path $ScriptDir "build_ctrl_kik_protected.ps1") `
+                -SkipToolchainInstall:$SkipToolchainInstall `
+                -ServerHost $ServerHost `
+                -ServerPort $KikNoisePort `
+                -BuildChannel $ChannelName `
+                -NoiseServerPublicKey $Identity.NoisePublic | Out-Null
+            Assert-LastExitCode "ctrl_kik 受保护构建失败"
+        } finally {
+            $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = $previousKikLock
+        }
+        $receipt = Get-Content -LiteralPath $KikReceipt -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $receipt.production_ready) { throw "ctrl_kik 二进制审计未达到 production_ready" }
     }
 
     $buildDefaults = [ordered]@{
@@ -356,12 +376,24 @@ function Build-Stack {
             [EnvironmentVariableTarget]::Process
         )
     }
+    $previousCrossConfig = $env:CROSS_CONFIG
+    $previousCrossDebug = $env:CROSS_DEBUG
     try {
-        & cargo build --locked -p real_ctrl --bins --profile production
-        Assert-LastExitCode "real_ctrl 生产构建失败"
-        & cross build --locked -p ctrl_server --profile production --target $TargetTriple
-        Assert-LastExitCode "ctrl_server 交叉编译失败"
+        # 固定配置只透传变量名；实际值仍来自当前进程，不写进 Cross.toml。
+        # 构建包含私钥输入，禁止启用可能展开容器命令的 cross 调试输出。
+        $env:CROSS_CONFIG = $CrossConfig
+        $env:CROSS_DEBUG = $null
+        if ('real_ctrl' -in $Selection.build) {
+            & cargo "+$BuildToolchain" build --locked -p real_ctrl --bins --profile production
+            Assert-LastExitCode "real_ctrl 生产构建失败"
+        }
+        if ('ctrl_server' -in $Selection.build) {
+            & cross "+$BuildToolchain" build --locked -p ctrl_server --profile production --target $TargetTriple
+            Assert-LastExitCode "ctrl_server 交叉编译失败"
+        }
     } finally {
+        $env:CROSS_CONFIG = $previousCrossConfig
+        $env:CROSS_DEBUG = $previousCrossDebug
         foreach ($entry in $previousBuildDefaults.GetEnumerator()) {
             [Environment]::SetEnvironmentVariable(
                 $entry.Key,
@@ -370,54 +402,38 @@ function Build-Stack {
             )
         }
     }
-    if (-not (Test-Path -LiteralPath $ServerArtifact)) {
+    if ('ctrl_server' -in $Selection.build -and -not (Test-Path -LiteralPath $ServerArtifact)) {
         throw "缺少 ctrl_server 交叉编译产物: $ServerArtifact"
     }
-    Get-ChildItem -LiteralPath (Join-Path $Root "target\production") -Filter "real_ctrl*.exe" -File |
-        ForEach-Object {
-            Assert-EmbeddedValuesEncrypted -Path $_.FullName -Needles ([ordered]@{
-                real_ctrl_auth_secret = $Identity.ControlSecret
-                real_ctrl_api_token = $Identity.ApiToken
-                real_ctrl_embedded_ca = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Identity.Cert))
-            })
-        }
-    Assert-EmbeddedValuesEncrypted -Path $ServerArtifact -Needles ([ordered]@{
-        ctrl_server_auth_secret = $Identity.ControlSecret
-        ctrl_server_noise_private_key = $Identity.NoisePrivate
-        ctrl_server_tls_private_key = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Identity.Key))
-    })
-
-    Reset-ArtifactDirectory
-    Copy-Item -LiteralPath $ServerArtifact -Destination (Join-Path $ArtifactDir "ctrl_server") -Force
-    Copy-Item -LiteralPath $KikArtifact -Destination (Join-Path $ArtifactDir "ctrl_kik.exe") -Force
-    Copy-Item -LiteralPath $KikReceipt -Destination (Join-Path $ArtifactDir "ctrl_kik.build-receipt.json") -Force
-    Get-ChildItem -LiteralPath (Join-Path $Root "target\production") -File |
-        Where-Object { $_.Name -match '^real_ctrl.*\.(exe|pdb)$' } |
-        Copy-Item -Destination $ArtifactDir -Force
-    $artifacts = Get-ChildItem -LiteralPath $ArtifactDir -File -Recurse |
-        Sort-Object FullName |
-        ForEach-Object {
-        $relativeName = $_.FullName.Substring($ArtifactDir.Length).TrimStart('\', '/').Replace('\', '/')
-        [ordered]@{
-            name = $relativeName
-            bytes = $_.Length
-            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+    if ('real_ctrl' -in $Selection.build) {
+        Get-ChildItem -LiteralPath (Join-Path $Root "target\production") -Filter "real_ctrl*.exe" -File |
+            ForEach-Object {
+                Assert-EmbeddedValuesEncrypted -Path $_.FullName -Needles ([ordered]@{
+                    real_ctrl_auth_secret = $Identity.ControlSecret
+                    real_ctrl_api_token = $Identity.ApiToken
+                    real_ctrl_embedded_ca = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Identity.Cert))
+                })
+            }
+    }
+    if ('ctrl_server' -in $Selection.build) {
+        Assert-EmbeddedValuesEncrypted -Path $ServerArtifact -Needles ([ordered]@{
+            ctrl_server_auth_secret = $Identity.ControlSecret
+            ctrl_server_noise_private_key = $Identity.NoisePrivate
+            ctrl_server_tls_private_key = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Identity.Key))
+        })
+    }
+    $sources = [ordered]@{}
+    if ('ctrl_server' -in $Selection.build) { $sources['ctrl_server'] = $ServerArtifact }
+    if ('ctrl_kik' -in $Selection.build) {
+        $sources['ctrl_kik.exe'] = $KikArtifact
+        $sources['ctrl_kik.build-receipt.json'] = $KikReceipt
+    }
+    if ('real_ctrl' -in $Selection.build) {
+        foreach ($binary in @('real_ctrl','real_ctrl_local_server','real_ctrl_invoker_http_service')) {
+            foreach ($extension in @('exe','pdb')) { $name="$binary.$extension"; $sources[$name] = Join-Path $Root "target/production/$name" }
         }
     }
-    $manifest = [ordered]@{
-        schema_version = 2
-        channel = $ChannelName
-        kik_noise_port = $KikNoisePort
-        control_tls_port = $ControlTlsPort
-        target = $TargetTriple
-        built_at = (Get-Date).ToUniversalTime().ToString("o")
-        artifacts = @($artifacts)
-    }
-    [IO.File]::WriteAllText(
-        (Join-Path $DeployDir "manifest.json"),
-        ($manifest | ConvertTo-Json -Depth 8),
-        [Text.UTF8Encoding]::new($false)
-    )
+    Save-SelectedArtifacts -Directory $ArtifactDir -ManifestPath (Join-Path $DeployDir 'manifest.json') -Channel $ChannelName -BackupDirectory (Join-Path $DeployDir "rollback-local/$RunId") -Sources $sources -Retained $RetainedArtifacts
 }
 
 function Publish-Server {
@@ -428,6 +444,7 @@ function Publish-Server {
     $remoteScriptPath = "$RemoteDir/deploy-$ChannelName.sh"
     $deployScriptPath = Join-Path $DeployDir "deploy-remote.sh"
     $rebootScriptPath = Join-Path $ScriptDir "remote\reboot.sh"
+    $rebootUploadPath = Join-Path $DeployDir "reboot.sh"
     $deployScript = @"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -484,9 +501,12 @@ for _ in `$(seq 1 30); do
     sleep 1
 done
 sudo systemctl status "`$service_name.service" --no-pager >&2 || true
-exit 1
+# 显式 exit 不会触发 ERR trap；false 会由 set -e 结束脚本，并先执行已有回滚。
+# 这样进程活着但监听口一直未就绪的超时路径，也会恢复上一版并重启服务。
+false
 "@
-    [IO.File]::WriteAllText($deployScriptPath, $deployScript, [Text.UTF8Encoding]::new($false))
+    Write-LfText -Path $deployScriptPath -Text $deployScript
+    Write-LfText -Path $rebootUploadPath -Text ([IO.File]::ReadAllText($rebootScriptPath))
 
     $session = $null
     try {
@@ -511,7 +531,7 @@ exit 1
         Assert-LastExitCode "上传 TLS 私钥失败"
         sshtool --quiet --session $session upload $deployScriptPath $remoteScriptPath
         Assert-LastExitCode "上传远程发布脚本失败"
-        sshtool --quiet --session $session upload $rebootScriptPath "/home/deploy/rust/reboot.sh"
+        sshtool --quiet --session $session upload $rebootUploadPath "/home/deploy/rust/reboot.sh"
         Assert-LastExitCode "上传 ctrl_server 双通道重启脚本失败"
         sshtool --quiet --session $session exec "chmod 0750 '/home/deploy/rust/reboot.sh'"
         Assert-LastExitCode "设置远程重启脚本权限失败"
@@ -524,47 +544,84 @@ exit 1
     }
 }
 
-if ($BuildOnly -and $DeployOnly) {
-    throw "BuildOnly 与 DeployOnly 不能同时使用"
-}
-$commands = if ($DeployOnly) {
-    @("openssl", "sshtool", "icacls")
-} else {
-    @("cargo", "cargo-audit", "cross", "docker", "openssl", "sshtool", "icacls")
-}
-foreach ($command in $commands) {
-    Assert-CommandAvailable $command
-}
-if (-not $DeployOnly) {
-    Assert-DockerReady
-    & (Join-Path $ScriptDir "audit_production_dependencies.ps1")
-    Assert-LastExitCode "生产依赖 RustSec 审计失败"
-}
-[IO.Directory]::CreateDirectory($DeployDir) | Out-Null
-[IO.Directory]::CreateDirectory($ArtifactDir) | Out-Null
+$RunId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)
+$runReport = [ordered]@{success=$false;channel=$ChannelName;plan=$Selection;app_included=$false;deployed=$false;public_tests='not-run';run_id=$RunId}
+$previousEnvironment = @{}
+$previousLocation = Get-Location
+$buildLock = $null
 [IO.Directory]::CreateDirectory($ReportDir) | Out-Null
-
-$identity = Initialize-DeploymentIdentity
-Write-DeploymentFiles $identity
-if (-not $DeployOnly) {
-    Build-Stack $identity
-} elseif (-not (Test-Path -LiteralPath $ServerArtifact)) {
-    throw "DeployOnly 缺少现有 ctrl_server 产物: $ServerArtifact"
-}
-if (-not $BuildOnly) {
-    Publish-Server
-    if (-not $SkipPublicTests) {
-        & (Join-Path $ScriptDir "test_public_stack.ps1") -Channel $Channel
-        Assert-LastExitCode "公网端到端验收失败"
+try {
+    Set-Location $Root
+    $localPaths = @{TEMP=(Join-Path $Root 'target/tmp');TMP=(Join-Path $Root 'target/tmp');TMPDIR=(Join-Path $Root 'target/tmp');CARGO_TARGET_DIR=(Join-Path $Root 'target');XARGO_HOME=(Join-Path $Root 'target/xargo')}
+    foreach ($entry in $localPaths.GetEnumerator()) {
+        $previousEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key,'Process')
+        [IO.Directory]::CreateDirectory($entry.Value) | Out-Null
+        [Environment]::SetEnvironmentVariable($entry.Key,$entry.Value,'Process')
     }
-}
+    # 两个通道共享 Cargo 输出，必须互斥，防止并发构建互相拿到另一通道的二进制。
+    $buildLock = [IO.File]::Open((Join-Path $Root 'target/publish-stack.lock'),'OpenOrCreate','ReadWrite','None')
+    $commands = @('openssl','icacls')
+    if (!$DeployOnly) { $commands += @('cargo','cargo-audit','rustup') }
+    if ('ctrl_server' -in $Selection.build) { $commands += @('cross','docker') }
+    if ($Selection.deployServer) { $commands += 'sshtool' }
+    foreach ($command in $commands) { Assert-CommandAvailable $command }
+    if ('ctrl_server' -in $Selection.build) { Assert-DockerReady }
+    if (!$DeployOnly) { Assert-PublishToolchains }
 
-[pscustomobject]@{
-    success = $true
-    channel = $ChannelName
-    kik_noise_port = $KikNoisePort
-    control_tls_port = $ControlTlsPort
-    build_manifest = (Join-Path $DeployDir "manifest.json")
-    report_directory = $ReportDir
-    deployed = -not $BuildOnly
-} | ConvertTo-Json
+    $RetainedArtifacts = @(Read-VerifiedArtifacts -Directory $ArtifactDir -ManifestPath (Join-Path $DeployDir 'manifest.json') -Channel $ChannelName -Components $Selection.skipped)
+    if ($DeployOnly -and 'ctrl_server' -notin $RetainedArtifacts.name) { throw 'DeployOnly 必须有清单校验通过的 ctrl_server 归档，不能使用 target 中的临时产物。' }
+    if ($Selection.publicTests) {
+        foreach ($requirement in @(@('ctrl_kik','ctrl_kik.exe'),@('ctrl_kik','ctrl_kik.build-receipt.json'),@('real_ctrl','real_ctrl.exe'),@('real_ctrl','real_ctrl_invoker_http_service.exe'))) {
+            if ($requirement[0] -notin $Selection.build -and $requirement[1] -notin $RetainedArtifacts.name) { throw "公网联调缺少已校验的 $($requirement[1])；请包含该组件，或显式使用 -SkipPublicTests。" }
+        }
+    }
+    if ($RetainedArtifacts.Count -gt 0 -or $DeployOnly) {
+        foreach ($name in @('server.crt','server.key','kik-noise-private.pem','control-auth.secret','local-api-token.secret','server-spki-sha256.txt')) {
+            if (!(Test-Path -LiteralPath (Join-Path $IdentityDir $name))) { throw '旧产物对应的部署身份不完整，拒绝重新生成身份后复用旧产物。' }
+        }
+    }
+    if (!$DeployOnly) {
+        & (Join-Path $ScriptDir 'audit_production_dependencies.ps1')
+        Assert-LastExitCode '生产依赖 RustSec 审计失败'
+    }
+    $identity = Initialize-DeploymentIdentity
+    Write-DeploymentFiles $identity
+    if (!$DeployOnly) { Build-Stack $identity }
+    $ServerArtifact = Join-Path $ArtifactDir 'ctrl_server'
+
+    if ($Selection.deployServer) {
+        # SSH 工具继续读取自己的既有连接配置；仅会话状态改到本项目受 ACL 保护目录。
+        $previousEnvironment['RTC_PUBLISH_SSH_STATE'] = [Environment]::GetEnvironmentVariable('RTC_PUBLISH_SSH_STATE','Process')
+        $env:RTC_PUBLISH_SSH_STATE = Join-Path $DeployDir 'private/sshtool'
+        [IO.Directory]::CreateDirectory($env:RTC_PUBLISH_SSH_STATE) | Out-Null
+        Set-PrivateAcl -Path $env:RTC_PUBLISH_SSH_STATE -Container
+        function sshtool {
+            # 公网验收是子脚本，有自己的 script: 作用域；用进程环境传递状态目录，
+            # 让发布与验收使用同一个项目内目录，并在最外层 finally 恢复调用者环境。
+            $native = (Get-Command sshtool.exe -ErrorAction Stop).Source
+            & $native --state-dir $env:RTC_PUBLISH_SSH_STATE @args
+            $global:LASTEXITCODE = $LASTEXITCODE
+        }
+        # 远端替换中断时结果可能未知，不能在失败报告中错误断言“未部署”。
+        $runReport.deployed = $null
+        Publish-Server
+        $runReport.deployed = $true
+        if ($Selection.publicTests) {
+            $runReport.public_tests = 'running'
+            & (Join-Path $ScriptDir 'test_public_stack.ps1') -Channel $Channel
+            Assert-LastExitCode '公网端到端验收失败'
+            $runReport.public_tests = 'passed'
+        } else { $runReport.public_tests = 'explicitly-skipped' }
+    }
+    $runReport.success = $true
+} catch {
+    $runReport.error = $_.Exception.Message
+    throw
+} finally {
+    $runReport.completed_at = [DateTimeOffset]::UtcNow.ToString('o')
+    [IO.File]::WriteAllText((Join-Path $ReportDir "publish-$RunId.json"),($runReport | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    if ($buildLock) { $buildLock.Dispose() }
+    foreach ($entry in $previousEnvironment.GetEnumerator()) { [Environment]::SetEnvironmentVariable($entry.Key,$entry.Value,'Process') }
+    Set-Location $previousLocation
+}
+$runReport | ConvertTo-Json -Depth 8

@@ -5,6 +5,13 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+/// 能力查询由已认证 TLS 主连接返回。缺失字段按不支持处理，调用端不能安全降级。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCapabilities {
+    #[serde(default)]
+    pub target_bound_command_v1: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KikInfoVo {
     pub id: String,

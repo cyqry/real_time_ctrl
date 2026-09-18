@@ -98,19 +98,8 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
                     }
                 }
                 CtrlCommand::Ls(s) => {
-                    let args: Vec<&str> = s.split_ascii_whitespace().collect();
-                    match (match args.as_slice() {
-                        [path, arg, ..] => {
-                            if *arg == hidden!("-r") {
-                                file_util::ls(*path, true)
-                            } else {
-                                file_util::ls(*path, false)
-                            }
-                        }
-                        _ => file_util::ls(s.as_str(), false),
-                    })
-                    .await
-                    .and_then(|v| {
+                    let (path, recursive) = ls_path_and_options(&s).await;
+                    match file_util::ls(&path, recursive).await.and_then(|v| {
                         Ok(serde_json::to_string(
                             &v.into_iter()
                                 .map(|(filename, is_file, size, created_date, modified_date)| {
@@ -154,6 +143,24 @@ pub async fn run(context: &Context, cmd: Command) -> RunOutcome {
     }
 }
 
+/// 先尊重实际存在的完整路径，包括空格、中文及名字本身以 " -r" 结尾的目录。
+/// 只有完整路径不存在时才识别旧控制台的末尾递归参数；其他错误原样交给 ls，不能访问截断后的目录。
+async fn ls_path_and_options(argument: &str) -> (String, bool) {
+    if matches!(tokio::fs::metadata(argument).await, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        let trimmed = argument.trim_end_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(prefix) = trimmed.strip_suffix(hidden!("-r").as_str()) {
+            if prefix.ends_with(|c: char| c.is_ascii_whitespace()) {
+                let path = prefix.trim_end_matches(|c: char| c.is_ascii_whitespace());
+                if !path.is_empty() {
+                    return (path.to_string(), true);
+                }
+            }
+        }
+    }
+    (argument.to_string(), false)
+}
+
 async fn prepare_get_big_file(context: &Context, file_path: String, data_id: String) -> RunOutcome {
     let prepared =
         match file_util::prepare_big_file(&file_path, file_util::FILE_TRANSFER_CHUNK_BYTES).await {
@@ -180,10 +187,13 @@ async fn prepare_get_big_file(context: &Context, file_path: String, data_id: Str
             file_util::FILE_TRANSFER_TIMEOUT,
             send_big_file_parts(send_context.clone(), data_id.clone(), stream),
         )
-            .await.unwrap_or_else(|_| Err((
-            common::message::dok::ErrCode::ReadError,
-            anyhow::Error::msg(hidden!("大文件发送超过 4 小时总时限")),
-        )));
+        .await
+        .unwrap_or_else(|_| {
+            Err((
+                common::message::dok::ErrCode::ReadError,
+                anyhow::Error::msg(hidden!("大文件发送超过 4 小时总时限")),
+            ))
+        });
         if let Err((code, _error)) = transfer {
             dev_debug!("大文件发送失败: {_error}");
             let encoded = Dok::Err(code).to_buf();
@@ -360,10 +370,51 @@ async fn send_big_file_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{ls_path_and_options, run};
     use crate::context::Context;
-    use common::command::Command;
+    use common::command::{Command, CtrlCommand};
     use common::message::kik_resp::{ClientSuccessResp, KikResp};
+
+    #[tokio::test]
+    async fn directory_names_are_not_split_into_shell_arguments() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/ls-regression")
+            .join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        for name in ["plain", "directory with spaces 中文", "literal -r"] {
+            let path = root.join(name);
+            tokio::fs::create_dir_all(&path).await.unwrap();
+            tokio::fs::write(path.join("marker.txt"), b"marker")
+                .await
+                .unwrap();
+            let text = path.to_string_lossy().into_owned();
+            assert_eq!(ls_path_and_options(&text).await, (text.clone(), false));
+            let (response, _) = run(&Context::new(), Command::Ctrl(CtrlCommand::Ls(text)))
+                .await
+                .split();
+            assert!(
+                matches!(response, KikResp::Success(ClientSuccessResp::Info(json)) if json.contains("marker.txt"))
+            );
+        }
+        let path = root
+            .join("directory with spaces 中文")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            ls_path_and_options(&format!("{path} -r")).await,
+            (path.clone(), true)
+        );
+        let invalid = format!("{path} does-not-exist");
+        assert_eq!(
+            ls_path_and_options(&invalid).await,
+            (invalid.clone(), false)
+        );
+        let (response, _) = run(&Context::new(), Command::Ctrl(CtrlCommand::Ls(invalid)))
+            .await
+            .split();
+        assert!(matches!(response, KikResp::Error(_, _)));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
     #[tokio::test]
     async fn exec_is_available_in_default_build() {
         let (response, transfer_start) = run(

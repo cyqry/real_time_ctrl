@@ -18,6 +18,7 @@ $ReportPath = Join-Path $ReportDir "e2e_report.json"
 $ApiToken = "e2e-local-token"
 $ControlAuthSecret = "e2e-control-auth-secret-0123456789abcdef"
 $SecondAccountSecret = "e2e-second-account-secret-0123456789abcdef"
+$RestrictedAccountSecret = "e2e-restricted-account-secret-0123456789abcdef"
 $SameAccountHttpPort = $HttpPort + 1
 $SecondAccountHttpPort = $HttpPort + 3
 
@@ -204,12 +205,19 @@ function Build-E2eBinaries {
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $NoisePublicKey
         $env:RTC_CTRL_KIK_BUILD_HOST = "127.0.0.1"
         $env:RTC_CTRL_KIK_BUILD_PORT = "$KikNoisePort"
+        # 第二台真实 Kik 使用独立构建锁路径与工作目录；不能通过运行时开关改变 Kik 配置。
+        $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = Join-Path $E2eDir "ctrl_kik_b.lock"
+        & cargo build --locked -p ctrl_kik
+        Assert-CommandOk $LASTEXITCODE "Failed to build second E2E Kik"
+        Copy-Item -LiteralPath (Join-Path $Root "target\debug\ctrl_kik.exe") -Destination (Join-Path $E2eDir "ctrl_kik_b.exe") -Force
         # E2E 使用仓库 target 下的独立锁文件，不能与用户正在运行的正式/灰度 Kik 互相排斥。
         $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = Join-Path $E2eDir "ctrl_kik.lock"
         & cargo build --locked -p ctrl_server -p ctrl_kik -p real_ctrl --bins
         Assert-CommandOk $LASTEXITCODE "Failed to build E2E binaries"
         & cargo build --locked -p real_ctrl --example pipe_concurrency_probe
         Assert-CommandOk $LASTEXITCODE "Failed to build named-pipe concurrency probe"
+        & cargo build --locked -p real_ctrl --example target_binding_probe
+        Assert-CommandOk $LASTEXITCODE "Failed to build target-binding probe"
     } finally {
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $previousKey
         $env:RTC_CTRL_KIK_BUILD_HOST = $previousHost
@@ -222,7 +230,8 @@ function Start-E2eProcess {
     param(
         [string]$Name,
         [string]$ExePath,
-        [hashtable]$EnvMap
+        [hashtable]$EnvMap,
+        [string]$WorkingDirectory = $Root
     )
     if (-not (Test-Path -LiteralPath $ExePath)) {
         throw "Missing executable: $ExePath"
@@ -230,12 +239,16 @@ function Start-E2eProcess {
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $ExePath
-    $psi.WorkingDirectory = $Root
+    $psi.WorkingDirectory = $WorkingDirectory
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
 
+    # 子进程只收到该角色明确需要的控制配置，尤其不能把服务器秘密继承给 Kik。
+    foreach ($key in @($psi.Environment.Keys)) {
+        if ($key -match '^(CTRL_SERVER_|REAL_CTRL_)') { [void]$psi.Environment.Remove($key) }
+    }
     foreach ($item in $EnvMap.GetEnumerator()) {
         $psi.Environment[$item.Key] = [string]$item.Value
     }
@@ -286,6 +299,26 @@ function Stop-E2eProcesses {
             }
         }
     }
+}
+
+function Assert-TargetBindingProbe {
+    param([hashtable]$BaseEnvironment, [string]$Phase, [string]$TargetA, [string]$TargetB)
+    $probeEnv = $BaseEnvironment.Clone()
+    $probeEnv['REAL_CTRL_INSTANCE_ID'] = "target-binding-$Phase"
+    $probeEnv['RTC_E2E_TARGET_PHASE'] = $Phase
+    $probeEnv['RTC_E2E_TARGET_A'] = $TargetA
+    $probeEnv['RTC_E2E_TARGET_B'] = $TargetB
+    if ($Phase -eq 'denied') {
+        $probeEnv['REAL_CTRL_ACCOUNT_ID'] = 'restricted'
+        $probeEnv['REAL_CTRL_AUTH_SECRET'] = $RestrictedAccountSecret
+    }
+    $probe = Start-E2eProcess -Name "target_binding_$Phase" -ExePath (Join-Path $Root 'target/debug/examples/target_binding_probe.exe') -EnvMap $probeEnv
+    if (!$probe.Proc.WaitForExit(95000)) { throw "Target binding $Phase timed out" }
+    if ($probe.Proc.ExitCode -ne 0) { throw "Target binding $Phase failed: $($probe.StdErrTask.Result)" }
+    $output = $probe.StdOutTask.Result | ConvertFrom-Json
+    if (!$output.success) { throw "Target binding $Phase did not report success" }
+    $output | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $ReportDir "target_binding_$Phase.json") -Encoding UTF8
+    return $output.assertions
 }
 
 function Assert-RealCtrlRejected {
@@ -651,6 +684,12 @@ try {
             allowed_kiks = @("*")
             max_instances = 8
             max_commands_per_instance = 16
+        },
+        @{
+            account_id = "restricted"
+            secret = $RestrictedAccountSecret
+            allowed_kiks = @()
+            max_instances = 2
         }
     ) | ConvertTo-Json -Depth 8 -Compress
     $accountsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($accountsJson))
@@ -1118,6 +1157,15 @@ try {
     $result.ls_entry_count = $ls.data.entries.Count
     $result.assertions += "ctrl_ls through ctrl_server and ctrl_kik ok"
 
+    $spaceDirectory = Join-Path $E2eDir 'directory with spaces 中文'
+    New-Item -ItemType Directory -Force -Path $spaceDirectory | Out-Null
+    Set-Content -LiteralPath (Join-Path $spaceDirectory 'space-marker.txt') -Value 'spaces preserved'
+    $spaceListing = Invoke-ApiCommand -Command @{ kind='ctrl_ls'; path=$spaceDirectory } -RequestId 'ctrl-ls-spaces'
+    if (!$spaceListing.ok -or !($spaceListing.data.entries | Where-Object filename -EQ 'space-marker.txt')) {
+        throw 'Original HTTP -> real_ctrl -> ctrl_server -> Kik path-with-spaces regression failed'
+    }
+    $result.assertions += 'original HTTP directory API preserves spaces and Unicode'
+
     # 六个各等待约两秒的命令若串行至少需要约十二秒；阈值给慢 CI 留出余量，
     # 同时能稳定识别旧的全局单命令门禁。
     $parallelCommands = @(0..5 | ForEach-Object {
@@ -1295,6 +1343,22 @@ try {
     $result.assertions += "KikData supervisors recover from a complete data-pool outage before large-file transfer"
     $result.assertions += "CtrlData supervisors recover from a complete data-pool outage before large-file transfer"
 
+    $kikBDirectory = Join-Path $E2eDir 'kik-b'
+    New-Item -ItemType Directory -Force -Path $kikBDirectory | Out-Null
+    Remove-Item -LiteralPath (Join-Path $E2eDir 'unintended-target.txt') -Force -ErrorAction SilentlyContinue
+    $kikB = Start-E2eProcess -Name 'ctrl_kik_b' -ExePath (Join-Path $E2eDir 'ctrl_kik_b.exe') -EnvMap $kikEnv -WorkingDirectory $kikBDirectory
+    $result.started += @{ name='ctrl_kik_b'; pid=$kikB.Proc.Id }
+    $kikBId = $null
+    for ($i=0; $i -lt 40; $i++) {
+        $devices = Invoke-ApiCommand -Command @{kind='sys_list'} -RequestId "two-kiks-$i"
+        $candidate = @($devices.data.items | Where-Object id -NE $kikId)
+        if ($devices.ok -and $candidate.Count -eq 1) { $kikBId=$candidate[0].id; break }
+        Start-Sleep -Milliseconds 250
+    }
+    if (!$kikBId) { throw 'Second real Kik did not come online' }
+    $result.assertions += Assert-TargetBindingProbe -BaseEnvironment $realCtrlEnv -Phase before -TargetA $kikId -TargetB $kikBId
+    $result.assertions += Assert-TargetBindingProbe -BaseEnvironment $realCtrlEnv -Phase denied -TargetA $kikId -TargetB $kikBId
+
     # 主连接和数据连接都退出后才应记为下线；轮询验证真实清理链路而非直接调用状态方法。
     try { $kik.Proc.Kill($true) } catch { $kik.Proc.Kill() }
     $kik.Proc.WaitForExit(5000) | Out-Null
@@ -1318,6 +1382,12 @@ try {
         throw "sys_history did not observe Kik offline transition: $($offlineHistory | ConvertTo-Json -Depth 12 -Compress)"
     }
     $result.assertions += "sys_history records the real Kik offline transition"
+
+    $fallback = Invoke-ApiCommand -Command @{kind='sys_now'} -RequestId 'fallback-after-a-offline'
+    if (!$fallback.ok -or $fallback.data.value.Kik.id -ne $kikBId) { throw 'Original controller did not switch its default target to B' }
+    $result.assertions += 'original controller automatically selects B after A goes offline'
+
+    $result.assertions += Assert-TargetBindingProbe -BaseEnvironment $realCtrlEnv -Phase after -TargetA $kikId -TargetB $kikBId
 
     $result.success = $true
     $result.completed_at = (Get-Date).ToString("o")

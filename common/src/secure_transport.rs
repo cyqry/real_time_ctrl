@@ -14,7 +14,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+mod prefixed_stream;
+use prefixed_stream::PrefixedStream;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -141,15 +143,12 @@ async fn connect_pinned_tls(config: &Config) -> anyhow::Result<TransportParts> {
         })?;
     validate_sha256_pin(expected_pin)?;
     let endpoint = hidden!(&config.server_host, ":", &config.security.tls_port);
-    let mut stream = timeout(config.read_timeout, TcpStream::connect(&endpoint))
+    let stream = timeout(config.read_timeout, TcpStream::connect(&endpoint))
         .await
         .with_context(|| hidden!("连接 TLS 管理端口超时: ", &endpoint))??;
     stream.set_nodelay(true)?;
-    // 部分公网链路设备会复位非标准端口上“首包即 TLS”的连接。固定非秘密前导只用于
-    // 穿透与协议识别；随后仍执行完整 TLS 1.3、证书链、服务名和 SPKI pin 校验。
-    // 服务端同时接受标准 ClientHello，便于运维工具直接探测独立 TLS 端口。
-    stream.write_all(&CTRL_TLS_PREFIX).await?;
-    stream.flush().await?;
+    // 前导由 PrefixedStream 与第一个 TLS 写入合并发送，不能在此单独 flush。
+    // 协议字节及下方证书链、域名、TLS 1.3 和 SPKI pin 校验保持不变。
     let local_addr = stream.local_addr();
     let peer_addr = stream.peer_addr();
 
@@ -178,9 +177,12 @@ async fn connect_pinned_tls(config: &Config) -> anyhow::Result<TransportParts> {
     let connector = TlsConnector::from(Arc::new(client_config));
     let server_name = ServerName::try_from(config.security.tls_server_name.clone())
         .map_err(|_| anyhow!(hidden!("REAL_CTRL_TLS_SERVER_NAME 不是合法 DNS 名称")))?;
-    let tls_stream = timeout(config.read_timeout, connector.connect(server_name, stream))
-        .await
-        .context(hidden!("TLS 握手超时"))??;
+    let tls_stream = timeout(
+        config.read_timeout,
+        connector.connect(server_name, PrefixedStream::new(stream)),
+    )
+    .await
+    .context(hidden!("TLS 握手超时"))??;
 
     let (_, session) = tls_stream.get_ref();
     let peer_certs = session

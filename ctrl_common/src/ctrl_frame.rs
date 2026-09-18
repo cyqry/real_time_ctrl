@@ -5,15 +5,21 @@
 
 use crate::ctrl_resp::CmdResp;
 use bytes::{Buf, BufMut, BytesMut};
+use common::command::Command;
 use common::protocol::{self, BufSerializable, ReqCmd};
 
 pub const DATA_FRAME_CODE: u8 = 13;
 const MAX_DATA_ID_BYTES: usize = protocol::MAX_CORRELATION_ID_BYTES;
+pub const MAX_TARGET_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 /// 管理面 TLS 内允许的帧类型。
 pub enum Frame {
     Cmd(ReqCmd),
+    /// 指定目标的远端命令。服务端不能用会话当前选择替换此 ID，也不能降级成 Cmd。
+    TargetedCmd(String, ReqCmd),
+    /// 已认证主连接上的能力查询，字符串是用于关联响应的请求 ID。
+    Capabilities(String),
     Resp(CmdResp),
 
     /// 数据 ID 与原始 payload，只允许在已绑定会话的 CtrlData 连接上传输。
@@ -38,6 +44,21 @@ impl BufSerializable for Frame {
                 bytes_mut.put_u8(11);
                 bytes_mut.put(req_cmd.to_buf());
                 bytes_mut
+            }
+            Frame::TargetedCmd(target, request) => {
+                let mut bytes = BytesMut::new();
+                bytes.put_u8(17);
+                bytes.put_u32(target.len() as u32);
+                bytes.put_slice(target.as_bytes());
+                bytes.put(request.to_buf());
+                bytes
+            }
+            Frame::Capabilities(id) => {
+                let mut bytes = BytesMut::new();
+                bytes.put_u8(18);
+                bytes.put_u32(id.len() as u32);
+                bytes.put_slice(id.as_bytes());
+                bytes
             }
             Frame::Resp(cmd_resp) => {
                 let mut bytes_mut = BytesMut::new();
@@ -107,14 +128,104 @@ impl BufSerializable for Frame {
                 }
                 Some(Frame::DataAck(String::from_utf8(bys.to_vec()).ok()?))
             }
+            17 => {
+                let target = take_identifier(&mut bys, MAX_TARGET_ID_BYTES)?;
+                let request = ReqCmd::from_buf(bys)?;
+                // Sys 在服务端执行，没有远端目标；拒绝混用，避免调用方误解安全语义。
+                if matches!(request.get_cmd(), Command::Sys(_)) {
+                    return None;
+                }
+                Some(Frame::TargetedCmd(target, request))
+            }
+            18 => {
+                let id = take_identifier(&mut bys, protocol::MAX_CORRELATION_ID_BYTES)?;
+                if !bys.is_empty() {
+                    return None;
+                }
+                Some(Frame::Capabilities(id))
+            }
             _ => None,
         }
     }
 }
 
+/// 长度在读取前校验；ID 不接受控制字符，也不会吞掉后续帧正文。
+fn take_identifier(bytes: &mut BytesMut, maximum: usize) -> Option<String> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let length = bytes.get_u32() as usize;
+    if length == 0 || length > maximum || bytes.len() < length {
+        return None;
+    }
+    let id = String::from_utf8(bytes.split_to(length).to_vec()).ok()?;
+    if id.trim().is_empty() || id.chars().any(char::is_control) {
+        return None;
+    }
+    Some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::{command::SysCommand, protocol::CmdOptions};
+
+    #[test]
+    fn targeted_command_round_trip_and_rejects_malformed_envelopes() {
+        let request = ReqCmd::new(
+            "request".into(),
+            CmdOptions::default(),
+            Command::Exec("echo test".into()),
+        );
+        let encoded = Frame::TargetedCmd("target-a".into(), request.clone()).to_buf();
+        match Frame::from_buf(encoded.clone()).unwrap() {
+            Frame::TargetedCmd(target, decoded) => {
+                assert_eq!(target, "target-a");
+                assert_eq!(decoded.get_id(), "request");
+                assert!(matches!(decoded.get_cmd(), Command::Exec(text) if text == "echo test"));
+            }
+            _ => panic!("wrong frame"),
+        }
+        for end in 0..(5 + "target-a".len()) {
+            assert!(Frame::from_buf(BytesMut::from(&encoded[..end])).is_none());
+        }
+        for target in [
+            String::new(),
+            " ".into(),
+            "bad\nname".into(),
+            "x".repeat(129),
+        ] {
+            assert!(
+                Frame::from_buf(Frame::TargetedCmd(target, request.clone()).to_buf()).is_none()
+            );
+        }
+        let system = ReqCmd::new(
+            "request".into(),
+            CmdOptions::default(),
+            Command::Sys(SysCommand::Now),
+        );
+        assert!(Frame::from_buf(Frame::TargetedCmd("a".into(), system).to_buf()).is_none());
+        let mut invalid_utf8 = encoded;
+        invalid_utf8[5] = 0xff;
+        assert!(Frame::from_buf(invalid_utf8).is_none());
+    }
+
+    #[test]
+    fn capability_query_is_bounded_and_has_no_trailing_bytes() {
+        let encoded = Frame::Capabilities("query".into()).to_buf();
+        assert!(
+            matches!(Frame::from_buf(encoded.clone()), Some(Frame::Capabilities(id)) if id == "query")
+        );
+        for end in 0..encoded.len() {
+            assert!(Frame::from_buf(BytesMut::from(&encoded[..end])).is_none());
+        }
+        let mut trailing = encoded;
+        trailing.put_u8(0);
+        assert!(Frame::from_buf(trailing).is_none());
+        for id in [String::new(), "x".repeat(129), "bad\0id".into()] {
+            assert!(Frame::from_buf(Frame::Capabilities(id).to_buf()).is_none());
+        }
+    }
 
     #[test]
     fn empty_frame_returns_none() {

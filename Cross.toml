@@ -1,0 +1,19 @@
+# cross 默认不会把自定义变量带进容器。这里只列变量名，秘密由原仓库发布脚本
+# 在进程内读取并传递；本文件、命令行和构建日志均不保存秘密值。
+# 参考：https://github.com/cross-rs/cross/wiki/Configuration
+[build.env]
+passthrough = [
+  "RTC_CTRL_SERVER_BUILD_LOG_LEVEL",
+  "RTC_CTRL_SERVER_BUILD_BIND_HOST",
+  "RTC_CTRL_SERVER_BUILD_KIK_PORT",
+  "RTC_CTRL_SERVER_BUILD_TLS_PORT",
+  "RTC_CTRL_SERVER_BUILD_TLS_CERT_PEM_BASE64",
+  "RTC_CTRL_SERVER_BUILD_TLS_KEY_PEM_BASE64",
+  "RTC_CTRL_SERVER_BUILD_AUTH_SECRET",
+  "RTC_CTRL_SERVER_BUILD_ACCOUNTS_JSON_BASE64",
+  "RTC_CTRL_SERVER_BUILD_KIK_NOISE_PRIVATE_KEY",
+  "RTC_CTRL_SERVER_BUILD_ALLOW_EXEC",
+]
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5"

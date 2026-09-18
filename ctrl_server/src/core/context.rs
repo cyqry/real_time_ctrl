@@ -383,6 +383,13 @@ impl Context {
             .ok_or_else(|| anyhow::anyhow!("控制会话已失效"))?;
         let (account_id, instance_limit) = {
             let session = session.lock().await;
+            if session
+                .created_at
+                .elapsed()
+                .map_or(true, |age| age > CTRL_SESSION_TTL)
+            {
+                anyhow::bail!("控制会话已过期，请重新认证");
+            }
             (session.account_id.clone(), session.command_limit.clone())
         };
         let account = self
@@ -422,6 +429,22 @@ impl Context {
         let session = self.sessions.read().await.get(session_id).cloned()?;
         let kik_id = session.lock().await.selected_kik_id.clone()?;
         self.get_initialized_kik_by_id(&kik_id).await
+    }
+
+    /// 只返回请求明确指定且账号允许的目标；绝不读取或修改 selected_kik_id。
+    /// 调用者持有返回的共享 Kik 句柄完成连接选择、配额与数据路由，避免再次查询时换成另一台。
+    pub async fn get_authorized_target(
+        &self,
+        session_id: &str,
+        target_id: &str,
+    ) -> anyhow::Result<Kik> {
+        let policy = self.policy_for_session(session_id).await?;
+        if !policy.allows_kik(target_id) {
+            anyhow::bail!("当前账号无权访问指定 Kik");
+        }
+        self.get_initialized_kik_by_id(target_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("指定 Kik 不存在或已下线，命令未切换到其他设备"))
     }
 
     /// 为尚未选择目标的控制会话选择最近上线且有权限访问的 Kik。
@@ -528,7 +551,17 @@ impl Context {
             .get(session_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("控制会话已失效"))?;
-        let account_id = session.lock().await.account_id.clone();
+        let account_id = {
+            let session = session.lock().await;
+            if session
+                .created_at
+                .elapsed()
+                .map_or(true, |age| age > CTRL_SESSION_TTL)
+            {
+                anyhow::bail!("控制会话已过期，请重新认证");
+            }
+            session.account_id.clone()
+        };
         self.account(&account_id)
             .ok_or_else(|| anyhow::anyhow!("控制账号已失效"))
     }
@@ -1238,6 +1271,19 @@ mod tests {
             context.get_kik(&session_id).await.unwrap().id(),
             Some(fallback_id.as_str())
         );
+        // 安全目标请求不能沿用自动切换后的默认值：A 下线时只能失败，不能返回 B。
+        assert!(context
+            .get_authorized_target(&session_id, &selected_id)
+            .await
+            .is_err());
+        assert_eq!(
+            context
+                .get_authorized_target(&session_id, &fallback_id)
+                .await
+                .unwrap()
+                .id(),
+            Some(fallback_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1270,6 +1316,29 @@ mod tests {
             context.get_kik(&session_id).await.unwrap().id(),
             Some(allowed_id.as_str())
         );
+        assert!(context
+            .get_authorized_target(&session_id, &denied_id)
+            .await
+            .is_err());
+        assert!(context
+            .get_authorized_target("unknown-session", &allowed_id)
+            .await
+            .is_err());
+        // 会话到期后，目标查询和命令许可都必须拒绝，不能仅限制新建数据连接。
+        context
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .lock()
+            .await
+            .created_at = SystemTime::UNIX_EPOCH;
+        assert!(context
+            .get_authorized_target(&session_id, &allowed_id)
+            .await
+            .is_err());
+        assert!(context.try_acquire_command(&session_id).await.is_err());
     }
 
     #[tokio::test]

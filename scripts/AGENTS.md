@@ -12,12 +12,13 @@
 
 - `ctrl_kik` 必须调用 `build_ctrl_kik_protected.ps1`，并检查 receipt 的 `production_ready=true`。
 - `real_ctrl` 和 `ctrl_server` 使用 `production` profile，保留 PDB/DWARF；服务端必须通过 `cross` 构建 musl 目标。
-- 普通发布必须先以 `docker info` 校验 Docker；不可用时立即停止并提示用户启动 Docker。
+- 构建 ctrl_server 时必须先以 `docker info` 校验 Docker；跳过服务端时不要求 Docker，也不连接远端。
 - 普通发布必须运行 `audit_production_dependencies.ps1`。Cargo.lock 中只属于冻结 `start` 或
   未启用可选 feature 的 advisory，必须先用实际生产依赖树证明不进入产物，禁止无条件忽略。
 - `DeployOnly` 只用于已有产物的 unit/环境修订，不得伪装成一次完整生产构建。
-- artifact 每次构建必须先验证路径位于仓库后清空，只生成可直接运行的二进制、调试符号和审计
-  receipt；不得生成运行启动器、sidecar 配置或证书，manifest 不得混入旧文件或秘密环境文件。
+- artifact 更新前必须验证路径位于仓库，只替换选中组件并保留回退副本。显式跳过的组件必须校验旧摘要，
+  原文件保持不动、manifest 标记 retained 并保留原构建时间；禁止将旧包标记为本轮新构建。
+  只归档二进制、调试符号和审计 receipt；不得混入运行启动器、sidecar 配置、证书或秘密环境文件。
 
 ## 密钥与部署
 
