@@ -29,7 +29,7 @@ pub struct RealCtrlApi {
 }
 
 #[derive(Clone)]
-/// 本地入口能力策略，当前单独控制高危 Exec 是否开放。
+/// 本地入口能力策略；Exec 与命名任务均属于远程执行能力，共用开关。
 pub struct ApiPolicy {
     allow_exec: bool,
 }
@@ -52,7 +52,7 @@ impl RealCtrlApi {
             .context
             .try_acquire_command()
             .map_err(|_| ApiServiceError::Busy)?;
-        self.execute_allowed(command).await
+        self.execute_allowed(command, None).await
     }
 
     pub async fn execute_request(&self, request: ApiRequest) -> ApiResponse {
@@ -85,7 +85,10 @@ impl RealCtrlApi {
             request.request_id,
             request.command.kind()
         );
-        match self.execute_allowed(command.clone()).await {
+        match self
+            .execute_allowed(command.clone(), request.target_kik_id.as_deref())
+            .await
+        {
             Ok(resp) => match remote_resp_to_api_data(&command, resp) {
                 Ok(data) => ApiResponse::success(&request, data),
                 Err(err) => ApiResponse::error(request.request_id, err),
@@ -97,28 +100,24 @@ impl RealCtrlApi {
                     request.command.kind(),
                     err
                 );
-                ApiResponse::error(request.request_id, ApiErrorBody::internal("命令执行失败"))
+                ApiResponse::error(request.request_id, err.into_api_error())
             }
         }
     }
 
-    async fn execute_allowed(&self, command: InputCommand) -> Result<RemoteResp, ApiServiceError> {
+    async fn execute_allowed(
+        &self,
+        command: InputCommand,
+        explicit_target: Option<&str>,
+    ) -> Result<RemoteResp, ApiServiceError> {
         // 所有开放 API 入口最终进入同一分发点；有界 permit 持有到关联数据处理结束。
-        dispatch::distribution_other(&self.context, command)
+        dispatch::distribution_other_targeted(&self.context, command, explicit_target)
             .await
             .map_err(ApiServiceError::Execution)
     }
 
     fn ensure_allowed(&self, command: &InputCommand) -> Result<(), ApiServiceError> {
-        match command {
-            InputCommand::Exec(_) if !self.policy.allow_exec => Err(ApiServiceError::Forbidden(
-                "开放 API 的当前策略禁止 Exec，可通过 REAL_CTRL_API_ALLOW_EXEC=1 覆盖".to_string(),
-            )),
-            InputCommand::Local(_) => Err(ApiServiceError::Forbidden(
-                "开放 API 不支持本地生命周期命令".to_string(),
-            )),
-            _ => Ok(()),
-        }
+        self.policy.ensure_allowed(command)
     }
 }
 
@@ -127,12 +126,33 @@ impl ApiServiceError {
         match self {
             Self::Busy => ApiErrorBody::busy("控制命令并发达到上限，请稍后重试"),
             Self::Forbidden(message) => ApiErrorBody::forbidden(message),
+            Self::Execution(error) if error.is::<crate::local_target::NoTargetSelected>() => {
+                ApiErrorBody {
+                    code: "no_target".into(),
+                    message: error.to_string(),
+                }
+            }
             Self::Execution(_) => ApiErrorBody::internal("命令执行失败"),
         }
     }
 }
 
 impl ApiPolicy {
+    fn ensure_allowed(&self, command: &InputCommand) -> Result<(), ApiServiceError> {
+        match command {
+            InputCommand::Exec(_) | InputCommand::RunTask(_) if !self.allow_exec => {
+                Err(ApiServiceError::Forbidden(
+                    "开放 API 的当前策略禁止 Exec 和任务执行，可通过 REAL_CTRL_API_ALLOW_EXEC=1 覆盖"
+                        .to_string(),
+                ))
+            }
+            InputCommand::Local(common::command::LocalCommand::LocalExit) => Err(ApiServiceError::Forbidden(
+                "开放 API 不支持本地生命周期命令".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub fn from_env() -> Self {
         Self {
             allow_exec: crate::runtime_config::api_allow_exec(),
@@ -142,5 +162,44 @@ impl ApiPolicy {
     #[cfg(test)]
     pub fn allow_exec_for_test() -> Self {
         Self { allow_exec: true }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_and_exec_share_the_open_api_execution_policy() {
+        let commands = [
+            InputCommand::Exec("echo test".into()),
+            InputCommand::RunTask("collect-info".into()),
+        ];
+        let disabled = ApiPolicy { allow_exec: false };
+        let enabled = ApiPolicy::allow_exec_for_test();
+        for command in commands {
+            let error = disabled
+                .ensure_allowed(&command)
+                .unwrap_err()
+                .into_api_error();
+            assert_eq!(error.code, "forbidden");
+            assert!(enabled.ensure_allowed(&command).is_ok());
+        }
+        assert!(disabled
+            .ensure_allowed(&InputCommand::Sys(common::command::SysCommand::List))
+            .is_ok());
+        for command in [
+            common::command::LocalCommand::LocalNow,
+            common::command::LocalCommand::LocalUse("A".into()),
+        ] {
+            assert!(disabled
+                .ensure_allowed(&InputCommand::Local(command))
+                .is_ok());
+        }
+        assert!(enabled
+            .ensure_allowed(&InputCommand::Local(
+                common::command::LocalCommand::LocalExit
+            ))
+            .is_err());
     }
 }

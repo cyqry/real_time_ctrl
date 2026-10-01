@@ -20,6 +20,10 @@ pub enum Frame {
     TargetedCmd(String, ReqCmd),
     /// 已认证主连接上的能力查询，字符串是用于关联响应的请求 ID。
     Capabilities(String),
+    /// 只针对 RunTask 的一次性等待预算通知，不能当最终响应或无限续期心跳。
+    TaskBudget(String, u64),
+    /// 已认证管理面上的只读目录请求，不发往 Kik，也不参与任务执行预算。
+    TaskList(crate::task_catalog::TaskListRequest),
     Resp(CmdResp),
 
     /// 数据 ID 与原始 payload，只允许在已绑定会话的 CtrlData 连接上传输。
@@ -39,6 +43,19 @@ pub fn encode_data_frame(data_id: &str, data: &[u8]) -> std::io::Result<BytesMut
 impl BufSerializable for Frame {
     fn to_buf(&self) -> BytesMut {
         match self {
+            Frame::TaskList(request) => {
+                let mut bytes = BytesMut::from(&[20u8][..]);
+                bytes.extend_from_slice(&request.to_buf());
+                bytes
+            }
+            Frame::TaskBudget(id, seconds) => {
+                let mut bytes = BytesMut::new();
+                bytes.put_u8(19);
+                bytes.put_u32(id.len() as u32);
+                bytes.put_slice(id.as_bytes());
+                bytes.put_u64(*seconds);
+                bytes
+            }
             Frame::Cmd(req_cmd) => {
                 let mut bytes_mut = BytesMut::new();
                 bytes_mut.put_u8(11);
@@ -102,6 +119,19 @@ impl BufSerializable for Frame {
         }
         let code = bys.get_u8();
         match code {
+            20 => crate::task_catalog::TaskListRequest::from_buf(bys).map(Frame::TaskList),
+            19 => {
+                let id = take_identifier(&mut bys, protocol::MAX_CORRELATION_ID_BYTES)?;
+                if bys.len() != 8 {
+                    return None;
+                }
+                let seconds = bys.get_u64();
+                let maximum = common::task::MAX_WAIT_SECONDS;
+                if seconds == 0 || seconds > maximum {
+                    return None;
+                }
+                Some(Frame::TaskBudget(id, seconds))
+            }
             11 => Some(Frame::Cmd(ReqCmd::from_buf(bys)?)),
             12 => Some(Frame::Resp(CmdResp::from_buf(bys)?)),
             13 => {
@@ -171,6 +201,31 @@ mod tests {
     use common::{command::SysCommand, protocol::CmdOptions};
 
     #[test]
+    fn task_budget_is_bounded_and_rejects_truncation() {
+        let encoded = Frame::TaskBudget("run".into(), 700).to_buf();
+        assert!(
+            matches!(Frame::from_buf(encoded.clone()), Some(Frame::TaskBudget(id, 700)) if id == "run")
+        );
+        for length in 0..encoded.len() {
+            assert!(Frame::from_buf(BytesMut::from(&encoded[..length])).is_none());
+        }
+        assert!(Frame::from_buf(Frame::TaskBudget("run".into(), u64::MAX).to_buf()).is_none());
+        assert!(Frame::from_buf(Frame::TaskBudget("run".into(), 0).to_buf()).is_none());
+        assert!(Frame::from_buf(
+            Frame::TaskBudget("run".into(), common::task::MAX_WAIT_SECONDS).to_buf()
+        )
+        .is_some());
+        assert!(Frame::from_buf(
+            Frame::TaskBudget("run".into(), common::task::MAX_WAIT_SECONDS + 1).to_buf()
+        )
+        .is_none());
+        assert!(Frame::from_buf(Frame::TaskBudget("\n".into(), 1).to_buf()).is_none());
+        let mut trailing = encoded;
+        trailing.put_u8(0);
+        assert!(Frame::from_buf(trailing).is_none());
+    }
+
+    #[test]
     fn targeted_command_round_trip_and_rejects_malformed_envelopes() {
         let request = ReqCmd::new(
             "request".into(),
@@ -202,7 +257,7 @@ mod tests {
         let system = ReqCmd::new(
             "request".into(),
             CmdOptions::default(),
-            Command::Sys(SysCommand::Now),
+            Command::Sys(SysCommand::List),
         );
         assert!(Frame::from_buf(Frame::TargetedCmd("a".into(), system).to_buf()).is_none());
         let mut invalid_utf8 = encoded;

@@ -7,11 +7,24 @@ use crate::context::Context;
 use crate::input_command::{InputCommand, RemoteResp, RemoteSuccessResp};
 use crate::{ctrl_executor, direct_executor, local_executor, server_executor};
 use common::message::kik_cmd_resp_info;
-use ctrl_common::cmd_resp_info::{KikInfoVo, SysNow};
+use ctrl_common::cmd_resp_info::{KikInfoVo, LocalNow};
 
 /// CLI 分派入口：串行执行并把结构化结果格式化为终端文本。
 pub async fn distribution(context: &Context, command: InputCommand) -> anyhow::Result<String> {
+    // 必须早于上传文件读取/散列等 await；后续 local_use 只能影响下一条操作。
+    let target = if command.requires_target() {
+        context.snapshot_target(None)?
+    } else {
+        String::new()
+    };
     match command {
+        InputCommand::RunTask(name) => {
+            match direct_executor::run_task(context, &name, &target).await? {
+                RemoteResp::Success(RemoteSuccessResp::Info(info)) => Ok(info),
+                RemoteResp::Error(_, info) => Err(anyhow::anyhow!(info)),
+                _ => Err(anyhow::anyhow!("任务响应类型不匹配")),
+            }
+        }
         InputCommand::Sys(sys) => match server_executor::execute(context, sys).await? {
             RemoteResp::Success(RemoteSuccessResp::Info(info)) => Ok(info),
             RemoteResp::Success(RemoteSuccessResp::SysList(vec)) => Ok(format_sys_list(vec)),
@@ -22,14 +35,20 @@ pub async fn distribution(context: &Context, command: InputCommand) -> anyhow::R
             RemoteResp::Error(_code, info) => Err(anyhow::anyhow!(info)),
             _ => Err(anyhow::anyhow!("系统命令响应类型不匹配")),
         },
-        InputCommand::Local(local) => local_executor::execute(context, local).await,
-        InputCommand::Ctrl(ctrl) => match ctrl_executor::execute(context, ctrl, false).await? {
+        InputCommand::Local(local) => match local_executor::execute(context, local).await? {
+            RemoteResp::Success(RemoteSuccessResp::Now(now)) => Ok(format_now(now)),
             RemoteResp::Success(RemoteSuccessResp::Info(info)) => Ok(info),
-            RemoteResp::Success(RemoteSuccessResp::Ls(vec)) => Ok(format_ls(&vec)),
-            RemoteResp::Error(_code, info) => Err(anyhow::anyhow!(info)),
-            _ => Err(anyhow::anyhow!("控制命令响应类型不匹配")),
+            _ => Err(anyhow::anyhow!("本地命令响应类型不匹配")),
         },
-        InputCommand::Exec(cmd) => match direct_executor::execute(context, &cmd).await? {
+        InputCommand::Ctrl(ctrl) => {
+            match ctrl_executor::execute(context, ctrl, false, &target).await? {
+                RemoteResp::Success(RemoteSuccessResp::Info(info)) => Ok(info),
+                RemoteResp::Success(RemoteSuccessResp::Ls(vec)) => Ok(format_ls(&vec)),
+                RemoteResp::Error(_code, info) => Err(anyhow::anyhow!(info)),
+                _ => Err(anyhow::anyhow!("控制命令响应类型不匹配")),
+            }
+        }
+        InputCommand::Exec(cmd) => match direct_executor::execute(context, &cmd, &target).await? {
             RemoteResp::Success(RemoteSuccessResp::Info(info)) => Ok(info),
             RemoteResp::Error(_code, info) => Err(anyhow::anyhow!(info)),
             _ => Err(anyhow::anyhow!("Exec 响应类型不匹配")),
@@ -37,13 +56,16 @@ pub async fn distribution(context: &Context, command: InputCommand) -> anyhow::R
     }
 }
 
-fn format_now(sys_now: SysNow) -> String {
+fn format_now(sys_now: LocalNow) -> String {
     match sys_now {
-        SysNow::Kik(kik) => {
-            format!("当前正在控制 {}-----{}", kik.name, kik.id)
+        LocalNow::Kik(kik) => {
+            format!(
+                "本地已选择 {}-----{}（选择快照，不代表实时在线）",
+                kik.name, kik.id
+            )
         }
-        SysNow::None => "没有被控制的Kik".to_owned(),
-        SysNow::NotOnline => "当前被控Kik不在线".to_owned(),
+        LocalNow::None => "没有被控制的Kik".to_owned(),
+        LocalNow::NotOnline => "当前被控Kik不在线".to_owned(),
     }
 }
 
@@ -161,11 +183,29 @@ pub async fn distribution_other(
     context: &Context,
     command: InputCommand,
 ) -> anyhow::Result<RemoteResp> {
+    distribution_other_targeted(context, command, None).await
+}
+
+/// API 的显式 target 只绑定本次操作，不改写其他调用者共享的本地选择。
+pub async fn distribution_other_targeted(
+    context: &Context,
+    command: InputCommand,
+    explicit_target: Option<&str>,
+) -> anyhow::Result<RemoteResp> {
+    let target = if command.requires_target() {
+        context.snapshot_target(explicit_target)?
+    } else {
+        String::new()
+    };
     match command {
         InputCommand::Sys(sys) => server_executor::execute(context, sys).await,
-        InputCommand::Ctrl(ctrl) => ctrl_executor::execute(context, ctrl, true).await,
-        InputCommand::Exec(cmd) => direct_executor::execute(context, &cmd).await,
-        InputCommand::Local(_) => Err(anyhow::anyhow!("开放 API 不支持本地生命周期命令")),
+        InputCommand::Ctrl(ctrl) => ctrl_executor::execute(context, ctrl, true, &target).await,
+        InputCommand::Exec(cmd) => direct_executor::execute(context, &cmd, &target).await,
+        InputCommand::RunTask(name) => direct_executor::run_task(context, &name, &target).await,
+        InputCommand::Local(common::command::LocalCommand::LocalExit) => {
+            Err(anyhow::anyhow!("开放 API 不支持退出进程"))
+        }
+        InputCommand::Local(local) => local_executor::execute(context, local).await,
     }
 }
 

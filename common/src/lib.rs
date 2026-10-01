@@ -18,6 +18,7 @@ pub mod protocol;
 pub mod secure_transport;
 pub mod session_auth;
 pub mod string_obfuscation;
+pub mod task;
 pub mod time_util;
 
 pub use string_obfuscation_macros::hidden;

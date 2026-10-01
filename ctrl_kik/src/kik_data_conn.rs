@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
@@ -92,6 +92,45 @@ pub async fn kik_data_conn(
         .await
         .decoder_mut()
         .set_max_frame_len(DATA_MAX_FRAME_LENGTH);
+    // 绑定完成后才发布本地数据连接。初始化和证明共用此 reader，不存在并发读帧。
+    use common::{message::kik_frame::KikFrame, task::TaskFrame};
+    channel_arc
+        .lock()
+        .await
+        .write_and_flush(&protocol::transfer_encode_frame(KikFrame::Task(
+            TaskFrame::BindRequest,
+        )))
+        .await?;
+    timeout(Duration::from_secs(30), async {
+        let mut proved = false;
+        loop {
+            let bytes = framed_arc
+                .lock()
+                .await
+                .next()
+                .await
+                .ok_or_else(|| anyhow::Error::msg(hidden!("任务数据绑定连接关闭")))??;
+            match KikFrame::from_buf(bytes) {
+                Some(KikFrame::Task(TaskFrame::Challenge(nonce))) if !proved => {
+                    proved = true;
+                    let proof = common::task::binding_proof(&expected_kik.task_key, &nonce);
+                    channel_arc
+                        .lock()
+                        .await
+                        .write_and_flush(&protocol::transfer_encode_frame(KikFrame::Task(
+                            TaskFrame::Proof(proof),
+                        )))
+                        .await?;
+                }
+                Some(KikFrame::Task(TaskFrame::Bound)) if proved => break,
+                Some(KikFrame::Ping | KikFrame::Pong) => {}
+                _ => return Err(anyhow::Error::msg(hidden!("任务数据绑定响应错误"))),
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::Error::msg(hidden!("任务数据绑定超时")))??;
     context
         .insert_data_conn_for(&expected_kik, channel_arc.clone())
         .await?;
@@ -101,11 +140,17 @@ pub async fn kik_data_conn(
     let channel = channel_arc.clone();
     let handle = tokio::spawn(async move {
         // 认证完成后才启动业务心跳。读任务结束时显式取消它，避免每轮重连遗留独立小任务。
-        let heartbeat_task = tokio::spawn(hearbeat(channel.clone()));
+        let mut heartbeat_task = JoinSet::new();
+        heartbeat_task.spawn(heartbeat(channel.clone()));
         let error = loop {
             let read_result = {
                 let mut framed = framed_arc.lock().await;
-                timeout(DATA_CHANNEL_IO_TIMEOUT, framed.next()).await
+                tokio::select! {
+                    biased;
+                    // 关闭写半边可能超时；不依赖对端 EOF，也能结束读任务并让监督槽位补建。
+                    _ = heartbeat_task.join_next() => break None,
+                    result = timeout(DATA_CHANNEL_IO_TIMEOUT, framed.next()) => result,
+                }
             };
             match read_result {
                 Ok(Some(Ok(msg))) => {
@@ -120,8 +165,7 @@ pub async fn kik_data_conn(
                 Err(error) => break Some(error.into()),
             }
         };
-        heartbeat_task.abort();
-        let _ = heartbeat_task.await;
+        heartbeat_task.shutdown().await;
         if let Some(error) = error {
             handle_error(channel.clone(), error).await;
         }
@@ -130,25 +174,16 @@ pub async fn kik_data_conn(
     Ok(handle)
 }
 
-async fn hearbeat(channel: Arc<Mutex<Channel>>) {
+async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         time::sleep(Duration::from_secs(5)).await;
-        let arc = channel.clone();
-        if arc.lock().await.is_closed() {
+        let mut guard = channel.lock().await;
+        if guard.is_closed()
+            || (guard.channel_type != ChannelType::Unknown
+                && guard.write_and_flush(&protocol::kik_pong()).await.is_err())
+        {
+            guard.try_write_half_close().await;
             return;
-        }
-
-        let mut guard = arc.lock().await;
-        if guard.channel_type != ChannelType::Unknown {
-            match guard.write_and_flush(&protocol::kik_pong()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    // 仅退出心跳任务不会结束仍在等待读取的连接；主动关闭写半边，让服务端回收连接，
-                    // 随后的 EOF 会结束本地读任务并触发监督槽位补建。
-                    guard.try_write_half_close().await;
-                    break;
-                }
-            };
         }
     }
 }

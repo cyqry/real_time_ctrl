@@ -16,11 +16,28 @@ use tokio::time::timeout;
 /// 调用本地管道开放 API，契约与 HTTP 的 ApiRequest/ApiResponse 保持一致。
 pub async fn invoke_api(request: &ApiRequest) -> anyhow::Result<ApiResponse> {
     let req_data = serialize_api_request(request)?;
-    let resp_data = invoke_raw(req_data).await?;
+    // 30 秒限制针对单次管道 I/O，不应抢先结束服务端配置的同步任务。
+    // 执行的精确时限由 real_ctrl 服务端与 Kik 协商；此处保留协议最大总预算作为最终上界。
+    let response_wait = if matches!(
+        request.command,
+        crate::api_contract::ApiCommand::RunTask { .. }
+    ) {
+        std::time::Duration::from_secs(
+            common::task::MAX_WAIT_SECONDS
+                + common::task::BUDGET_ACK_SECONDS
+                + common::task::FINISH_SECONDS,
+        )
+    } else {
+        PIPE_IO_TIMEOUT
+    };
+    let resp_data = invoke_raw(req_data, response_wait).await?;
     deserialize_api_response(&resp_data)
 }
 
-async fn invoke_raw(req_data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+async fn invoke_raw(
+    req_data: Vec<u8>,
+    response_wait: std::time::Duration,
+) -> anyhow::Result<Vec<u8>> {
     let conn = timeout(
         PIPE_IO_TIMEOUT,
         DuplexPipeStream::connect_by_path(PIPE_NAME),
@@ -44,7 +61,7 @@ async fn invoke_raw(req_data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     debug!("发送请求完成");
 
     let mut len_buf = [0u8; 4];
-    timeout(PIPE_IO_TIMEOUT, receiver.read_exact(&mut len_buf))
+    timeout(response_wait, receiver.read_exact(&mut len_buf))
         .await
         .map_err(|_| anyhow::anyhow!("读取本地管道响应长度超时"))??;
     let resp_len = u32::from_be_bytes(len_buf) as usize;

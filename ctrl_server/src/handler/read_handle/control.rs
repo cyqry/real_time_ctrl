@@ -1,7 +1,7 @@
 //! 已认证 Ctrl 主连接上的命令与响应编排。
 //!
 //! 读循环只做解析、策略检查和取得并发许可，然后为每条命令启动独立任务。系统命令在服务端完成；
-//! 远程命令会绑定请求目标（旧桌面帧使用当前选择）、改写关联 ID，并等待该 Kik 的专属响应。
+//! 远程命令必须携带明确目标，改写关联 ID 后只等待该 Kik 的专属响应；无目标请求直接拒绝。
 
 use crate::core::connection_meta::CTRL_SESSION_ID;
 use crate::core::context::Context;
@@ -12,7 +12,7 @@ use common::file_util::LONG_COMMAND_TIMEOUT;
 use common::message::kik_frame::KikFrame;
 use common::message::kik_resp::{ClientSuccessResp, KikResp};
 use common::protocol::{self, BufSerializable, ReqCmd};
-use ctrl_common::cmd_resp_info::{KikInfoVo, ServerCapabilities, SysNow};
+use ctrl_common::cmd_resp_info::{KikInfoVo, ServerCapabilities};
 use ctrl_common::ctrl_frame::Frame;
 use ctrl_common::ctrl_protocol::{ctrl_kik_resp, ctrl_server_resp_error, ctrl_server_resp_success};
 use futures::stream;
@@ -37,6 +37,9 @@ pub async fn handle_ctrl(
     allow_remote_exec: bool,
 ) -> anyhow::Result<()> {
     match Frame::from_buf(msg).ok_or_else(default_error)? {
+        Frame::TaskList(request) => {
+            super::task_catalog::handle(context, channel, request, allow_remote_exec).await?;
+        }
         frame @ (Frame::Cmd(_) | Frame::TargetedCmd(_, _) | Frame::Capabilities(_)) => {
             let session_id = channel
                 .lock()
@@ -52,10 +55,22 @@ pub async fn handle_ctrl(
                 Frame::Capabilities(id) => (id, None),
                 _ => unreachable!("上层 match 已限制帧类型"),
             };
-            if request
-                .as_ref()
-                .is_some_and(|(req, _)| matches!(req.get_cmd(), Command::Exec(_)))
-                && !allow_remote_exec
+            // 旧客户端的无目标远程命令不能回退到任何设备。保留请求 ID 返回迁移错误，
+            // 让客户端能区分版本不匹配与设备离线，同时保证未登记路由、未触碰 Kik。
+            if request.as_ref().is_some_and(|(req, target)| {
+                !matches!(req.get_cmd(), Command::Sys(_)) && target.is_none()
+            }) {
+                write_error(
+                    &channel,
+                    cmd_id,
+                    "远程命令必须携带 Kik ID，请升级客户端并使用 $local_use 选择设备".into(),
+                )
+                .await?;
+                return Ok(());
+            }
+            if request.as_ref().is_some_and(|(req, _)| {
+                matches!(req.get_cmd(), Command::Exec(_) | Command::RunTask(_))
+            }) && !allow_remote_exec
             {
                 write_error(
                     &channel,
@@ -74,11 +89,13 @@ pub async fn handle_ctrl(
                 }
             };
             tokio::spawn(async move {
-                let _permits = permits;
                 let Some((request, target)) = request else {
+                    let _permits = permits;
                     // 能力查询也持有账号/会话许可，避免已认证客户端制造无界响应任务。
                     let capabilities = ServerCapabilities {
                         target_bound_command_v1: true,
+                        task_run_v1: true,
+                        task_list_v1: true,
                     };
                     if let Ok(json) = serde_json::to_string(&capabilities) {
                         let _ = channel
@@ -90,6 +107,23 @@ pub async fn handle_ctrl(
                     return;
                 };
                 let (_, cmd_options, cmd) = request.split();
+                if let Command::RunTask(name) = cmd {
+                    let result = super::task_run::execute(
+                        &context,
+                        &channel,
+                        &session_id,
+                        &cmd_id,
+                        &name,
+                        target.as_deref(),
+                        permits,
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        let _ = write_error(&channel, cmd_id, error.to_string()).await;
+                    }
+                    return;
+                }
+                let _permits = permits;
                 // session ID 属于数据通道绑定材料；日志只保留服务端随机命令 ID。
                 debug!("处理控制命令: cmd_id={}", cmd_id);
                 if let Err(error) = execute_command(
@@ -159,55 +193,18 @@ async fn execute_system(
     let encoded = match command {
         SysCommand::List => {
             let kiks = context.get_can_ctrl_kik(session_id).await?;
-            if kiks.is_empty() {
-                ctrl_server_resp_error(cmd_id, "没有可控制的Kik".to_owned())
-            } else {
-                let list: Vec<KikInfoVo> = stream::iter(kiks)
-                    .then(|(id, kik)| async move {
-                        KikInfoVo {
-                            id,
-                            name: kik.kik_client_info.kik_info.name,
-                            ip: kik.kik_client_info.ip.read().await.to_string(),
-                            recent_online_time: *kik
-                                .kik_client_info
-                                .recent_online_time
-                                .read()
-                                .await,
-                        }
-                    })
-                    .collect()
-                    .await;
-                ctrl_server_resp_success(cmd_id, serde_json::to_string(&list)?)
-            }
-        }
-        SysCommand::Use(id) => match context.set_kik(session_id, &id).await {
-            Ok(kik) if kik.exist_kik_conn().await => ctrl_server_resp_success(
-                cmd_id,
-                serde_json::to_string(&KikInfoVo {
-                    id,
-                    name: kik.kik_client_info.kik_info.name,
-                    ip: kik.kik_client_info.ip.read().await.clone(),
-                    recent_online_time: *kik.kik_client_info.recent_online_time.read().await,
-                })?,
-            ),
-            Ok(_) => ctrl_server_resp_error(cmd_id, "被选择的 Kik 已下线".into()),
-            Err(error) => ctrl_server_resp_error(cmd_id, error.to_string()),
-        },
-        SysCommand::Now => {
-            let now = match context.get_kik(session_id).await {
-                None => SysNow::None,
-                Some(kik) if kik.exist_kik_conn().await => SysNow::Kik(KikInfoVo {
-                    id: kik
-                        .id()
-                        .ok_or_else(|| anyhow::anyhow!("已注册 Kik 缺少实例 ID"))?
-                        .to_string(),
-                    name: kik.kik_client_info.kik_info.name,
-                    ip: kik.kik_client_info.ip.read().await.clone(),
-                    recent_online_time: *kik.kik_client_info.recent_online_time.read().await,
-                }),
-                Some(_) => SysNow::NotOnline,
-            };
-            ctrl_server_resp_success(cmd_id, serde_json::to_string(&now)?)
+            let list: Vec<KikInfoVo> = stream::iter(kiks)
+                .then(|(id, kik)| async move {
+                    KikInfoVo {
+                        id,
+                        name: kik.kik_client_info.kik_info.name,
+                        ip: kik.kik_client_info.ip.read().await.to_string(),
+                        recent_online_time: *kik.kik_client_info.recent_online_time.read().await,
+                    }
+                })
+                .collect()
+                .await;
+            ctrl_server_resp_success(cmd_id, serde_json::to_string(&list)?)
         }
         SysCommand::History(kik_id) => {
             let records = context
@@ -232,15 +229,12 @@ async fn execute_remote(
     command: Command,
     target: Option<&str>,
 ) -> anyhow::Result<()> {
-    let kik = match target {
-        Some(id) => match context.get_authorized_target(session_id, id).await {
-            Ok(kik) => kik,
-            Err(error) => return write_error(channel, external_cmd_id, error.to_string()).await,
-        },
-        None => match context.get_kik(session_id).await {
-            Some(kik) => kik,
-            None => return write_error(channel, external_cmd_id, "没有被控制的Kik".into()).await,
-        },
+    let Some(target) = target else {
+        return write_error(channel, external_cmd_id, "远程命令缺少目标 Kik ID".into()).await;
+    };
+    let kik = match context.get_authorized_target(session_id, target).await {
+        Ok(kik) => kik,
+        Err(error) => return write_error(channel, external_cmd_id, error.to_string()).await,
     };
     let Some(kik_conn) = kik.get_kik_conn().await else {
         return write_error(channel, external_cmd_id, "被控制的Kik已下线".into()).await;
@@ -393,6 +387,91 @@ async fn write_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::channel::ChannelType;
+    use ctrl_common::{
+        ctrl_resp::{Resp, ServerResp},
+        kik::Kik,
+    };
+    use std::{io, time::SystemTime};
+    use tokio::io::AsyncReadExt;
+
+    /// 即使恰好只有一台在线设备，无目标命令也不能被“好心”路由过去。
+    /// 这里调用真实认证后分派入口，并检查被控连接没有收到任何业务字节。
+    #[tokio::test]
+    async fn untargeted_remote_commands_are_rejected_without_touching_any_kik() {
+        let context = Context::init();
+        let (mut control_peer, writer) = tokio::io::duplex(8192);
+        let channel = Arc::new(Mutex::new(Channel::new(
+            Box::pin(writer),
+            Some("controller".into()),
+            ChannelType::Ctrl,
+            Err(io::Error::from(io::ErrorKind::NotConnected)),
+            Err(io::Error::from(io::ErrorKind::NotConnected)),
+        )));
+        context
+            .register_ctrl_session(
+                channel.clone(),
+                "session".into(),
+                "default".into(),
+                "instance".into(),
+            )
+            .await
+            .unwrap();
+        let (mut kik_peer, writer) = tokio::io::duplex(8192);
+        let kik_channel = Arc::new(Mutex::new(Channel::new(
+            Box::pin(writer),
+            Some("device-a".into()),
+            ChannelType::Kik,
+            Err(io::Error::from(io::ErrorKind::NotConnected)),
+            Err(io::Error::from(io::ErrorKind::NotConnected)),
+        )));
+        let kik = Kik::new(
+            "device-a",
+            "test",
+            "127.0.0.1".into(),
+            SystemTime::now(),
+            kik_channel,
+        );
+        kik.set_kik_initialized(true);
+        context.kiks.write().await.insert("device-a".into(), kik);
+        for (index, command) in [
+            Command::Exec("echo bounded-test".into()),
+            Command::Ctrl(CtrlCommand::Ls(".".into())),
+            Command::RunTask("task_a".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("missing-target-{index}");
+            let request = ReqCmd::new(id.clone(), common::protocol::CmdOptions::default(), command);
+            handle_ctrl(
+                context.clone(),
+                channel.clone(),
+                Frame::Cmd(request).to_buf(),
+                true,
+            )
+            .await
+            .unwrap();
+            let length = control_peer.read_u32().await.unwrap();
+            let mut body = vec![0; length as usize];
+            control_peer.read_exact(&mut body).await.unwrap();
+            let Some(Frame::Resp(response)) = Frame::from_buf(BytesMut::from(body.as_slice()))
+            else {
+                panic!("expected correlated response")
+            };
+            assert_eq!(response.get_cmd_id(), &id);
+            assert!(
+                matches!(response.get_resp(), Resp::Server(ServerResp::Error(_, message)) if message.contains("Kik ID"))
+            );
+        }
+        let mut byte = [0];
+        assert!(timeout(Duration::from_millis(30), kik_peer.read(&mut byte))
+            .await
+            .is_err());
+        // 版本不兼容的请求只失败自身，不能破坏认证会话或合法列表查询。
+        assert_eq!(context.get_can_ctrl_kik("session").await.unwrap().len(), 1);
+        assert!(context.session_auth_secret("session").await.is_some());
+    }
 
     #[test]
     fn download_business_error_is_not_reported_as_id_mismatch() {

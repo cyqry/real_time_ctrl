@@ -22,6 +22,8 @@ pub async fn create_context() -> anyhow::Result<Context> {
     ));
 
     let context = Context::new(agent);
+    // 只在整个 Context 首次建立时查询一次。后续 Agent 重连不会重新选择其他设备。
+    context.initialize_local_target().await?;
     context.data_init().await?;
     debug!("real_ctrl 连接初始化成功");
     Ok(context)

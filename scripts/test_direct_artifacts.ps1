@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("Gray", "Production")]
     [string]$Channel = "Gray",
     [ValidateRange(1, 65535)]
@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
+. (Join-Path $scriptDir 'kik_test_lock.ps1')
 $channelName = $Channel.ToLowerInvariant()
 $artifactDir = (Resolve-Path (Join-Path $root "deploy\$channelName\artifacts")).Path
 $workDir = Join-Path $root "target\direct-artifacts\$channelName"
@@ -18,6 +19,11 @@ $script:results = [Collections.Generic.List[object]]::new()
 function Start-CleanProcess {
     param([string]$Name, [string]$Path)
 
+    if ($Name -eq 'ctrl_kik.exe') {
+        # 网络检查可能耗时较长，启动前再次核对，避免使用期间被替换的 EXE 或回执。
+        $null = Assert-KikTestLockLocation -ProjectRoot $root -WorkingDirectory $workDir `
+            -BinaryPath $Path -ReceiptPath (Join-Path $artifactDir 'ctrl_kik.build-receipt.json')
+    }
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $Path
     $info.WorkingDirectory = $workDir
@@ -89,7 +95,12 @@ function Assert-StaysRunning {
     Start-Sleep -Seconds 1
 }
 
+# 必须在创建工作目录之前拒绝目录联接，不能先写到项目外再由锁路径预检报错。
+$workDir = Assert-KikTestPathInProject $workDir $root
 [IO.Directory]::CreateDirectory($workDir) | Out-Null
+# 在任何验收进程启动前检查真实编译锁路径；项目外固定锁需要人工验收，不能偷偷覆盖。
+$kikLock = Assert-KikTestLockLocation -ProjectRoot $root -WorkingDirectory $workDir `
+    -BinaryPath (Join-Path $artifactDir 'ctrl_kik.exe') -ReceiptPath (Join-Path $artifactDir 'ctrl_kik.build-receipt.json')
 try {
     $httpName = "real_ctrl_invoker_http_service.exe"
     $http = Start-CleanProcess -Name $httpName -Path (Join-Path $artifactDir $httpName)
@@ -126,7 +137,7 @@ try {
     Assert-StaysRunning -Name "ctrl_kik.exe"
 } finally {
     [IO.File]::Delete((Join-Path ([IO.Path]::GetTempPath()) "real_ctrl-http-$channelName.lock"))
-    [IO.File]::Delete((Join-Path $workDir "ctrl_kik.lock"))
+    # Kik 单实例锁文件是配置指定的持久路径；关闭进程已释放锁，不能删除文件来“解锁”。
 }
 
 $script:results | ConvertTo-Json

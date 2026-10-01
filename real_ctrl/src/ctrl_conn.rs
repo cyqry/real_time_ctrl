@@ -27,9 +27,11 @@ use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::{self, timeout};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
+use tokio_util::task::AbortOnDropHandle;
 
 const AUTH_OK_PREFIX: &str = "##authtrue:";
 
@@ -90,7 +92,7 @@ pub(crate) async fn ctrl_conn(
     e2e_trace("ctrl_conn: sent auth start");
 
     let (mut tx, mut rx) = mpsc::channel::<CmdResp>(5);
-    tokio::spawn(async move {
+    let read_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut read_context = ControlReadContext {
             auth_secret,
             account_id,
@@ -99,16 +101,20 @@ pub(crate) async fn ctrl_conn(
             auth_phase: AuthPhase::AwaitingChallenge,
             responses,
         };
-        let chan = channel.clone();
-        tokio::spawn(async move {
-            heartbeat(chan).await;
-        });
+        // JoinSet 随读任务销毁时也会取消心跳，避免握手失败或外层取消留下独立小任务。
+        let mut heartbeat_task = JoinSet::new();
+        heartbeat_task.spawn(heartbeat(channel.clone()));
 
         loop {
             // 读锁只包住 next().await，避免后续处理逻辑需要同一 reader 时形成隐式自锁。
             let read_result = {
                 let mut framed = framed_arc.lock().await;
-                timeout(read_timeout, framed.next()).await
+                tokio::select! {
+                    biased;
+                    // 关闭 TLS/Noise 写半边也可能超时；不能只等对端 EOF 才释放本地连接。
+                    _ = heartbeat_task.join_next() => break,
+                    result = timeout(read_timeout, framed.next()) => result,
+                }
             };
 
             match read_result {
@@ -145,39 +151,57 @@ pub(crate) async fn ctrl_conn(
             };
         }
 
+        heartbeat_task.shutdown().await;
         handle_inactive(channel.clone()).await;
         read_context.responses.fail_all().await;
-    });
+    }));
 
     // 第一次响应只用于控制通道鉴权确认，后续 rx 才承载业务响应。
-    let auth_response = timeout(config.read_timeout, rx.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("等待控制通道鉴权响应超时"))?
-        .ok_or_else(|| anyhow::anyhow!("控制连接在鉴权完成前断开"))?;
-    let session_id = match auth_response.get_resp() {
-        Server(ServerResp::Success(ServerSuccessResp::Info(auth)))
-            if auth.starts_with(AUTH_OK_PREFIX) =>
-        {
-            auth.strip_prefix(AUTH_OK_PREFIX)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
+    let auth_result = async {
+        let auth_response = timeout(config.read_timeout, rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("等待控制通道鉴权响应超时"))?
+            .ok_or_else(|| anyhow::anyhow!("控制连接在鉴权完成前断开"))?;
+        match auth_response.get_resp() {
+            Server(ServerResp::Success(ServerSuccessResp::Info(auth)))
+                if auth.starts_with(AUTH_OK_PREFIX) =>
+            {
+                Ok(auth
+                    .strip_prefix(AUTH_OK_PREFIX)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string))
+            }
+            _ => Err(anyhow::anyhow!("服务端返回了不支持的控制连接初始化响应")),
         }
-        _ => return Err(anyhow::anyhow!("服务端返回了不支持的控制连接初始化响应")),
+    }
+    .await;
+    let session_id = match auth_result {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            // 尚未发布的主连接必须在返回错误前回收，否则重试会留下旧认证读循环。
+            read_task.abort();
+            let _ = read_task.await;
+            channel_arc.lock().await.try_write_half_close().await;
+            return Err(error);
+        }
     };
 
     debug!("控制连接校验成功");
+    // 认证成功后由连接状态管理器接管生命周期；初始化 future 取消时则由上面的保护器取消读任务。
+    drop(read_task.detach());
     Ok((channel_arc, session_id))
 }
 
 async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         time::sleep(Duration::from_secs(5)).await;
-        let arc = channel.clone();
-        let mut guard = arc.lock().await;
-        if guard.channel_type != ChannelType::Unknown
-            && guard.write_and_flush(&ctrl_pong()).await.is_err()
+        let mut guard = channel.lock().await;
+        if guard.is_closed()
+            || (guard.channel_type != ChannelType::Unknown
+                && guard.write_and_flush(&ctrl_pong()).await.is_err())
         {
-            break;
+            guard.try_write_half_close().await;
+            return;
         }
     }
 }
@@ -263,6 +287,9 @@ async fn handle_read(
     } else {
         let frame = Frame::from_buf(msg)?;
         match frame {
+            Frame::TaskBudget(id, seconds) => {
+                context.responses.task_budget(&id, seconds).await;
+            }
             Frame::Resp(resp) => {
                 context.responses.deliver(resp).await;
             }
@@ -297,6 +324,8 @@ pub(crate) fn frame_kind(frame: &Frame) -> &'static str {
         Frame::Cmd(_) => "command",
         Frame::TargetedCmd(_, _) => "targeted_command",
         Frame::Capabilities(_) => "capabilities",
+        Frame::TaskBudget(_, _) => "task_budget",
+        Frame::TaskList(_) => "task_list",
         Frame::Resp(_) => "response",
         Frame::Data(_, _) => "data",
         Frame::DataAck(_) => "data_ack",

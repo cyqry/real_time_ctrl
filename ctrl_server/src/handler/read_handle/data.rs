@@ -58,6 +58,7 @@ pub async fn handle_kik_data(
     msg: BytesMut,
 ) -> anyhow::Result<()> {
     match KikFrame::from_buf(msg).ok_or_else(default_error)? {
+        KikFrame::Task(frame) => super::task_binding::handle(&context, &channel, frame).await?,
         KikFrame::Data(wire_id, data) => {
             let kik_id = channel
                 .lock()

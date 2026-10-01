@@ -18,6 +18,8 @@ pub enum KikFrame {
     CmdExtra(Command, String),
     RespExtra(KikResp, String),
     Cmd(ReqCmd),
+    /// 握手完成后的任务扩展；主通道与数据通道分别校验允许的子类型。
+    Task(crate::task::TaskFrame),
 
     Data(String, BytesMut), //数据传输的data帧
 
@@ -33,6 +35,12 @@ pub fn encode_data_frame(data_id: &str, data: &[u8]) -> std::io::Result<BytesMut
 impl BufSerializable for KikFrame {
     fn to_buf(&self) -> BytesMut {
         match self {
+            Task(frame) => {
+                let mut bytes = BytesMut::new();
+                bytes.put_u8(20);
+                bytes.put(frame.to_buf());
+                bytes
+            }
             CmdExtra(cmd, s) => {
                 let mut bytes_mut = BytesMut::new();
                 bytes_mut.put_u8(14);
@@ -87,6 +95,7 @@ impl BufSerializable for KikFrame {
         }
         let code = bys.get_u8();
         match code {
+            20 => Some(Task(crate::task::TaskFrame::from_buf(bys)?)),
             14 => {
                 if bys.remaining() < 4 {
                     return None;

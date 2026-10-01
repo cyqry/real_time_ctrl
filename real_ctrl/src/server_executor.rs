@@ -1,6 +1,6 @@
 //! 由 ctrl_server 自身处理的系统命令适配器。
 //!
-//! 在线列表、当前目标和上下线历史不会发送给 Kik；服务端返回的结构化 JSON 在这里恢复为控制端业务类型。
+//! 在线列表和上下线历史不会发送给 Kik；目标选择由控制端本地状态维护。
 
 use crate::context::{id, Context};
 use crate::input_command::{RemoteResp, RemoteSuccessResp};
@@ -28,12 +28,20 @@ pub async fn execute(context: &Context, cmd: SysCommand) -> anyhow::Result<Remot
     }
 }
 
-fn to_remote_resp(cmd: SysCommand, info: &String) -> anyhow::Result<RemoteSuccessResp> {
+fn to_remote_resp(cmd: SysCommand, info: &str) -> anyhow::Result<RemoteSuccessResp> {
     let res = match cmd {
         SysCommand::List => RemoteSuccessResp::SysList(serde_json::from_str(info)?),
-        SysCommand::Use(_) => RemoteSuccessResp::Info(info.to_owned()),
-        SysCommand::Now => RemoteSuccessResp::Now(serde_json::from_str(info)?),
         SysCommand::History(_) => RemoteSuccessResp::History(serde_json::from_str(info)?),
     };
     Ok(res)
+}
+
+pub async fn online_kiks(
+    context: &Context,
+) -> anyhow::Result<Vec<ctrl_common::cmd_resp_info::KikInfoVo>> {
+    match execute(context, SysCommand::List).await? {
+        RemoteResp::Success(RemoteSuccessResp::SysList(kiks)) => Ok(kiks),
+        RemoteResp::Error(_, message) => Err(anyhow::anyhow!(message)),
+        _ => Err(anyhow::anyhow!("在线列表响应类型不匹配")),
+    }
 }

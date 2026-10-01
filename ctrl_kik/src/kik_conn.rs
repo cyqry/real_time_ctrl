@@ -24,11 +24,16 @@ use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
+use tokio_util::task::AbortOnDropHandle;
+
+pub(crate) const TASK_HELLO_ACK: common::channel::ChannelAttributeKey<
+    tokio::sync::mpsc::Sender<()>,
+> = common::channel::ChannelAttributeKey::new(0x7461_736b_6163_6b31);
 
 /// 建立并注册一条 Kik 主连接，返回负责其余生命周期的后台读任务。
 pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinHandle<()>> {
@@ -68,20 +73,23 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
     let context_clone = context.clone();
     let channel_clone = channel_arc.clone();
     let read_timeout = config.read_timeout;
-    let handle = tokio::spawn(async move {
+    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
         let context = context_clone;
         let channel = channel_clone;
         // 心跳独立运行，命令任务变慢时仍能及时发现半开连接。
-        let chan = channel.clone();
-        tokio::spawn(async move {
-            heartbeat(chan).await;
-        });
+        let mut heartbeat_task = JoinSet::new();
+        heartbeat_task.spawn(heartbeat(channel.clone()));
 
         let e = loop {
             // 读锁只包住 next().await，避免 match 臂内处理逻辑被临时锁生命周期拖住。
             let read_result = {
                 let mut framed = framed_arc.lock().await;
-                timeout(read_timeout, framed.next()).await
+                tokio::select! {
+                    biased;
+                    // 半关闭可能无法唤醒对端；心跳结束必须主动结束本地读等待，进入已有重连路径。
+                    _ = heartbeat_task.join_next() => break None,
+                    result = timeout(read_timeout, framed.next()) => result,
+                }
             };
 
             match read_result {
@@ -123,55 +131,82 @@ pub async fn kik_conn(context: Context, config: &Config) -> anyhow::Result<JoinH
             };
         };
 
+        heartbeat_task.shutdown().await;
         if let Some(error) = e {
             let chan = channel.clone();
             handle_error(chan, error).await;
         }
         handle_inactive(context.clone(), channel.clone()).await;
-    });
+    }));
 
     // 等待初始化通道中的唯一 Kik ID，确保调用者随后创建的数据连接绑定正确会话。
-    match timeout(read_timeout, rx.recv()).await {
-        Ok(recv) => match recv {
-            None => {
-                return Err(anyhow::Error::msg(hidden!("校验时连接断开")));
-            }
-            Some(kik_id) => {
-                {
-                    let mut guard = channel_arc.lock().await;
-                    guard.channel_type = ChannelType::Kik;
-                    guard.set_id(kik_id.clone());
+    let init_result = async {
+        match timeout(read_timeout, rx.recv()).await {
+            Ok(recv) => match recv {
+                None => {
+                    return Err(anyhow::Error::msg(hidden!("校验时连接断开")));
                 }
-                *context.id.lock().await = Some(kik_id);
-                context.set_kik(Some(Kik::new(channel_arc.clone()))).await;
+                Some(kik_id) => {
+                    {
+                        let mut guard = channel_arc.lock().await;
+                        guard.channel_type = ChannelType::Kik;
+                        guard.set_id(kik_id.clone());
+                    }
+                    *context.id.lock().await = Some(kik_id);
+                    let kik = Kik::new(channel_arc.clone());
+                    let (hello_tx, mut hello_rx) = tokio::sync::mpsc::channel(1);
+                    channel_arc
+                        .lock()
+                        .await
+                        .insert_attribute(&TASK_HELLO_ACK, hello_tx);
+                    context.set_kik(Some(kik.clone())).await;
+                    channel_arc
+                        .lock()
+                        .await
+                        .write_and_flush(&protocol::transfer_encode_frame(
+                            common::message::kik_frame::KikFrame::Task(
+                                common::task::TaskFrame::HelloNamed(kik.task_key),
+                            ),
+                        ))
+                        .await?;
+                    if !matches!(
+                        timeout(Duration::from_secs(15), hello_rx.recv()).await,
+                        Ok(Some(()))
+                    ) {
+                        return Err(anyhow::Error::msg(hidden!(
+                            "服务端不支持任务文件名协议，请先升级服务端"
+                        )));
+                    }
+                }
+            },
+            Err(_error) => {
+                return Err(anyhow::Error::msg(hidden!("服务器超时未响应")));
             }
-        },
-        Err(_error) => {
-            channel.lock().await.try_write_half_close().await;
-            return Err(anyhow::Error::msg(hidden!("服务器超时未响应")));
-        }
-    };
-    Ok(handle)
+        };
+        Ok(())
+    }
+    .await;
+    if let Err(error) = init_result {
+        // 注册或任务能力握手失败时先回收旧读任务，避免下一次建连后旧清理回调触碰新会话。
+        handle.abort();
+        let _ = handle.await;
+        handle_inactive(context, channel_arc).await;
+        return Err(error);
+    }
+    Ok(handle.detach())
 }
 
 async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         time::sleep(Duration::from_secs(5)).await;
 
-        let arc = channel.clone();
-        let mut guard = arc.lock().await;
-        if guard.is_closed() {
+        let mut guard = channel.lock().await;
+        if guard.is_closed()
+            || (guard.channel_type != ChannelType::Unknown
+                && guard.write_and_flush(&protocol::kik_pong()).await.is_err())
+        {
+            guard.try_write_half_close().await;
             return;
-        }
-
-        // 验证成功才执行
-        if guard.channel_type != ChannelType::Unknown {
-            match guard.write_and_flush(&protocol::kik_pong()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    break;
-                }
-            };
         }
     }
 }
@@ -195,14 +230,19 @@ async fn handle_active(
         .await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, CmdOptions, Command)>(32);
     channel.lock().await.insert_attribute(&COMMAND_SENDER, tx);
-    // Sender 绑定在连接属性上；主连接释放后发送端全部销毁，任务会自然退出。
+    // Channel 属性持有 Sender，空闲 worker 只能持有 Weak，否则两者会互相保活，重连后无法释放。
+    // 只有取得执行许可的具体命令才升级为 Arc，保持已经开始执行的命令原有生命周期。
+    let weak_channel = Arc::downgrade(&channel);
     tokio::spawn(async move {
         let limit = Arc::new(Semaphore::new(16));
         while let Some((cmd_id, cmd_options, cmd)) = rx.recv().await {
             let Ok(permit) = limit.clone().acquire_owned().await else {
                 break;
             };
-            let (context, channel) = (context.clone(), channel.clone());
+            let Some(channel) = weak_channel.upgrade() else {
+                break;
+            };
+            let context = context.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 read_handle::handle_kik_cmd(context, &channel, cmd_id, cmd_options, cmd).await;
@@ -241,5 +281,50 @@ async fn handle_read(
             Ok(())
         }
         _ => Err(anyhow::Error::msg(hidden!("连接状态与帧类型不匹配"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn idle_command_worker_does_not_keep_old_channel_alive() {
+        let (writer, mut peer) = tokio::io::duplex(4096);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let channel = Arc::new(Mutex::new(Channel::new(
+            Box::pin(writer),
+            None,
+            ChannelType::Unknown,
+            Ok(addr),
+            Ok(addr),
+        )));
+        let weak_channel = Arc::downgrade(&channel);
+        let name = "worker-lifecycle-regression".to_string();
+        let expected = protocol::transfer_encode_frame(InitFrame::KikReq(KikInfo {
+            id: None,
+            name: name.clone(),
+        }));
+        // 走真实注册入口建立 Channel -> Sender -> worker 关系；Context 尚未发布 Kik 主连接。
+        timeout(
+            Duration::from_secs(2),
+            handle_active(Context::new(), name, channel.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(channel.lock().await.attribute(&COMMAND_SENDER).is_some());
+        tokio::task::yield_now().await;
+
+        // 不显式 shutdown：若空闲 worker 仍捕获强引用，这里既不能释放 Channel，也读不到 EOF。
+        drop(channel);
+        assert!(weak_channel.upgrade().is_none());
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), peer.read_to_end(&mut received))
+            .await
+            .expect("旧连接释放后，对端必须收到 EOF")
+            .unwrap();
+        assert_eq!(received, expected);
     }
 }

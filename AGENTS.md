@@ -1,5 +1,11 @@
 # real_time_ctrl 维护规则
 
+## Kik 程序规范入口
+
+- 涉及 Kik 程序的信息获取、安全、构建、分发或升级时，先阅读并遵循 [Kik端程序规范.md](Kik端程序规范.md)。
+  它是可跨项目复用的通用要求；本项目的协议、配置和操作入口见 [ctrl_kik 部署适配说明](ctrl_kik/部署规范.md)。
+  改变通用边界或项目实现时分别更新对应文档，历史验收报告不能替代当次发布验证。
+
 ## 当前安全传输基线
 
 - `real_ctrl -> ctrl_server` 生产控制面默认 pinned TLS，不得在强安全模式下自动降级明文。
@@ -20,7 +26,7 @@
 - 每个 Rust 源模块使用 `//!` 说明它在核心链路中的位置、输入输出和生命周期；关键共享状态、关联 ID、
   锁与资源许可使用 `///` 写明作用域和不变量。注释面向初次接触项目的维护者，但不能逐行翻译代码或描述
   尚未实现的行为；实现变化时必须同步修正注释。
-- 不把 Android 控制端纳入当前实施范围。协议设计可以保留扩展空间，但不写 Android 端代码。
+- 涉及控制协议和目标选择时，同步维护相邻 `real_time_ctrl_app`，避免 PC、App 与服务端语义分叉。
 
 ## 安全模型
 
@@ -67,9 +73,10 @@
   保留 PDB/DWARF。加固只能提高逆向成本，不能替代协议安全和权限边界。
 - `real_ctrl` / `ctrl_server` 使用 `scripts/build_hardened.ps1` 的 `production` profile，保留运行诊断
   和性能观测能力；`ctrl_kik` 才使用剥离符号的 protected hardened 流水线。
-- 地址、端口、TLS 身份、pin、控制认证秘密、API token、Noise 私钥和 Exec 策略由各 crate
+- `real_ctrl` / `ctrl_server` 的地址、端口、TLS 身份、pin、控制认证秘密、API token、Noise 私钥和 Exec 策略由各自
   `build.rs` 提供可覆盖默认值，发布时使用 `RTC_*_BUILD_*` 注入；运行时同名业务环境变量优先。
   编译默认值必须经 `hidden!(env!(...))` 加密，且发布脚本必须审计原始值不以明文存在于产物。
+  Kik 的端点、锁路径和 Noise 公钥仅在构建期确定，运行时不得覆盖；其中 `LOCK_FILE_PATH` 只取 `common/config.json`，构建环境和发布脚本也不得覆盖，详见统一部署规范。
 - 完整发布必须通过 `scripts/audit_production_dependencies.ps1`；审计脚本需要先证明整仓
   Cargo.lock 中受豁免条目不在生产活动依赖树，再对其他 RustSec 漏洞和警告实行零容忍。
 - `ctrl_kik` 只能使用 `scripts/build_ctrl_kik_protected.ps1` 发布；它使用独立固定 Rust 提交、编译标准库、剔除日志、审计源码痕迹和 PE 缓解属性，不能混入通用构建入口。
@@ -95,14 +102,17 @@
   独立拥有响应 oneshot 和数据 ID 队列，禁止恢复共享 Receiver 或全局串行门禁。
 - 服务端按账号、实例、Kik 和全局四级配额限制命令并发；同账号不同实例、不同账号不得相互替换会话，
   同账号同实例重连只替换自身旧会话。
-- 每个控制会话没有当前目标时自动选择最近上线且 ACL 允许的在线 Kik；自动选择不得覆盖显式
-  `sys_use`，当前目标完整下线时需要切换到仍在线的合法候选。
+- `$run` 遵循用户确认的独立任务语义：配置读取和程序传输仍受入站许可及传输背压保护，启动后的任务数量不设配额。
+  同步等待不占普通 Kik 的 16 个执行许可；本地 API 的 32 个在途请求保护保留。详见 `任务执行.md`。
+- 服务端不保存被控者选择；每条远端命令必须携带 Kik ID，无目标请求直接拒绝。
+  客户端启动仅自动选择一次；此后通过 `local_use`/`local_now` 切换和查看本地快照。
+  设备下线与重连保持目标，单次操作在入口固定 ID，禁止自动回退或重放。
 
 ## 端到端验收
 
 - `ctrl_server`、`ctrl_kik` 与多个 `real_ctrl_invoker_http_service` 实例的端到端测试使用 `scripts/e2e_ctrl_stack.ps1`。
 - 该脚本默认使用本地端口 `9002` / `19443` / `9000`；脚本通过 Cargo 构建期变量生成测试专用 `ctrl_kik`，运行时仍不得覆盖端点或 Noise 公钥。
-- E2E 会通过 HTTP API 验证 `health`、token 拒绝、Kik 自动选择、`sys_list`、`sys_history`、`sys_use`、`sys_now` 和 `ctrl_ls`，并在结束时清理全部测试进程。
+- E2E 通过 HTTP API 验证 `health`、token 拒绝、客户端首次选择、`sys_list`、`sys_history`、`local_use`、`local_now` 和 `ctrl_ls`；两 Kik 场景必须证明目标下线不换机，结束时清理全部测试进程。
 - E2E 还必须验证错误 SPKI pin、端口角色隔离、Kik/KikData 只能通过 Noise NK 接入，以及真实 Kik 退出后记录最近下线时间。
 - E2E 必须同时验证同账号多实例、多账号多实例和同一 HTTP 进程的命令乱序响应隔离；用有耗时的
   独立命令证明请求确实并行，不能只验证多个请求最终都成功。

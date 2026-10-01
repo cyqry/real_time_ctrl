@@ -1,0 +1,14 @@
+# 停用示例：配置保留在 tasks/disabled_task/task.toml，拒绝新的执行请求。
+# 停用不会终止已经运行的程序；Android 可用任务列表会隐藏此任务。
+# 恢复时将 enabled 改为 true，并保证本目录的 tool.exe 可用。
+enabled = false
+binary = "tool.exe"
+args = []
+mode = "sync"
+timeout_seconds = 60
+
+[response]
+mode = "output"
+default_content = "执行完成"
+
+# 不要通过删除 task.toml 停用任务：没有配置时会恢复默认启用规则。

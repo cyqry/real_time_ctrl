@@ -10,7 +10,6 @@ use common::channel::{Channel, DATA_CONNECTION_RECOVERY_TIMEOUT};
 use common::config::Config;
 use common::protocol::ReqCmd;
 use ctrl_common::ctrl_frame::encode_data_frame;
-use ctrl_common::ctrl_protocol::ctrl_cmd_req;
 use ctrl_common::ctrl_protocol::ctrl_data_ack;
 use ctrl_common::ctrl_resp::CmdResp;
 use std::collections::HashMap;
@@ -42,12 +41,30 @@ const DATA_CONNECTION_STABLE_AFTER: Duration = Duration::from_secs(30);
 /// 控制响应按关联 ID 定向投递，避免并行请求争抢同一个 Receiver。
 #[derive(Clone, Default)]
 pub(crate) struct ResponseRouter {
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<CmdResp>>>>,
+    // 锁内只有 HashMap 操作，没有 I/O/await；同步锁允许请求 future 被取消时立即清理路由。
+    pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<CmdResp>>>>,
+    /// 只有 RunTask 请求才注册一次性预算接收器，服务端不能反复延长等待。
+    task_budgets: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<u64>>>>,
+}
+
+/// 请求取消、超时和正常结束都移除等待者，避免断开的 HTTP 调用耗尽后续请求容量。
+struct ResponseRegistration {
+    router: ResponseRouter,
+    id: String,
+}
+
+impl Drop for ResponseRegistration {
+    fn drop(&mut self) {
+        self.router.remove(&self.id);
+    }
 }
 
 impl ResponseRouter {
     pub async fn register(&self, id: &str) -> anyhow::Result<oneshot::Receiver<CmdResp>> {
-        let mut pending = self.pending.lock().await;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if pending.len() >= MAX_PARALLEL_API_COMMANDS {
             anyhow::bail!("活动控制请求达到上限");
         }
@@ -60,17 +77,67 @@ impl ResponseRouter {
     }
 
     pub async fn deliver(&self, response: CmdResp) {
-        if let Some(sender) = self.pending.lock().await.remove(response.get_cmd_id()) {
+        if let Some(sender) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(response.get_cmd_id())
+        {
             let _ = sender.send(response);
         }
     }
 
     pub async fn cancel(&self, id: &str) {
-        self.pending.lock().await.remove(id);
+        self.remove(id);
+    }
+
+    fn remove(&self, id: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id);
+        self.task_budgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id);
+    }
+
+    fn guard(&self, id: &str) -> ResponseRegistration {
+        ResponseRegistration {
+            router: self.clone(),
+            id: id.to_owned(),
+        }
+    }
+
+    fn register_task_budget(&self, id: &str) -> oneshot::Receiver<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.task_budgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id.to_owned(), tx);
+        rx
     }
 
     pub async fn fail_all(&self) {
-        self.pending.lock().await.clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.task_budgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    pub async fn task_budget(&self, id: &str, seconds: u64) {
+        if let Some(tx) = self
+            .task_budgets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id)
+        {
+            let _ = tx.send(seconds);
+        }
     }
 }
 
@@ -123,6 +190,8 @@ pub struct Context {
     command_gate: CommandGate,
     /// 连接故障时保证只有一个请求执行重连。
     reconnect_gate: Arc<Mutex<()>>,
+    /// 进程级本地选择，重连只替换 Agent，绝不清除或自动改选此状态。
+    local_target: crate::local_target::LocalTarget,
 }
 
 #[derive(Clone)]
@@ -145,11 +214,45 @@ impl Context {
             data_routes: Arc::new(Mutex::new(HashMap::new())),
             command_gate: CommandGate::new(),
             reconnect_gate: Arc::new(Mutex::new(())),
+            local_target: crate::local_target::LocalTarget::default(),
         }
     }
 
     pub fn try_acquire_command(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
         self.command_gate.try_acquire()
+    }
+
+    pub async fn initialize_local_target(&self) -> anyhow::Result<()> {
+        if self.local_target.is_initialized() {
+            return Ok(());
+        }
+        let online = crate::server_executor::online_kiks(self).await?;
+        self.local_target.initialize(online);
+        Ok(())
+    }
+
+    pub async fn select_local_target(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<ctrl_common::cmd_resp_info::KikInfoVo> {
+        crate::local_target::validate_target_id(id)?;
+        let selected = crate::server_executor::online_kiks(self)
+            .await?
+            .into_iter()
+            .find(|kik| kik.id == id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("指定 Kik 不在线或当前账号无权访问，原本地选择保持不变")
+            })?;
+        self.local_target.select(selected.clone());
+        Ok(selected)
+    }
+
+    pub fn local_now(&self) -> ctrl_common::cmd_resp_info::LocalNow {
+        self.local_target.current()
+    }
+
+    pub fn snapshot_target(&self, explicit: Option<&str>) -> anyhow::Result<String> {
+        self.local_target.snapshot(explicit)
     }
 
     pub async fn insert_ctrl_data_conn(
@@ -453,7 +556,11 @@ impl Context {
     }
 
     pub async fn request(&self, cmd: &ReqCmd) -> anyhow::Result<CmdResp> {
-        self.request_after_send(cmd, None).await
+        self.request_after_send(cmd, None, None).await
+    }
+
+    pub async fn request_targeted(&self, cmd: &ReqCmd, target: &str) -> anyhow::Result<CmdResp> {
+        self.request_after_send(cmd, Some(target), None).await
     }
 
     /// 发出命令，并在控制帧写成功后可选地放行关联上传任务。
@@ -462,10 +569,14 @@ impl Context {
     pub async fn request_after_send(
         &self,
         cmd: &ReqCmd,
+        target: Option<&str>,
         transfer_start: Option<oneshot::Sender<()>>,
     ) -> anyhow::Result<CmdResp> {
+        if target.is_none() && !matches!(cmd.get_cmd(), common::command::Command::Sys(_)) {
+            return Err(crate::local_target::NoTargetSelected.into());
+        }
         let failed_agent = self.agent.read().await.clone();
-        let request_error = match failed_agent.req(cmd, transfer_start).await {
+        let request_error = match failed_agent.req(cmd, target, transfer_start).await {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
@@ -569,6 +680,22 @@ async fn supervise_ctrl_data_connection(
     }
 }
 
+/// 系统查询不需要设备目标；其余动作缺少明确 ID 时禁止发帧，不能依赖服务端隐式选择。
+fn encode_request(cmd: &ReqCmd, target: Option<&str>) -> anyhow::Result<BytesMut> {
+    use common::{command::Command, protocol::transfer_encode_frame};
+    use ctrl_common::ctrl_frame::Frame;
+    let frame = match (cmd.get_cmd(), target) {
+        (Command::Sys(_), None) => Frame::Cmd(cmd.clone()),
+        (Command::Sys(_), Some(_)) => anyhow::bail!("系统查询不接受设备目标"),
+        (_, Some(target)) => {
+            crate::local_target::validate_target_id(target)?;
+            Frame::TargetedCmd(target.to_owned(), cmd.clone())
+        }
+        (_, None) => return Err(crate::local_target::NoTargetSelected.into()),
+    };
+    Ok(transfer_encode_frame(frame))
+}
+
 impl Agent {
     /// 建立 pinned TLS 主连接并完成 HMAC 认证，返回可供多个请求共享的 Agent。
     pub async fn create(config: &Config) -> anyhow::Result<Self> {
@@ -614,16 +741,22 @@ impl Agent {
     pub async fn req(
         &self,
         cmd: &ReqCmd,
+        target: Option<&str>,
         transfer_start: Option<oneshot::Sender<()>>,
     ) -> anyhow::Result<CmdResp> {
-        let response_rx = self.responses.register(cmd.get_id()).await?;
-        if let Err(error) = self
-            .conn
-            .lock()
-            .await
-            .write_and_flush(&ctrl_cmd_req(cmd.clone()))
-            .await
-        {
+        let frame = encode_request(cmd, target)?;
+        let is_task = matches!(cmd.get_cmd(), common::command::Command::RunTask(_));
+        if is_task {
+            self.require_task_support().await?;
+        }
+        let mut response_rx = self.responses.register(cmd.get_id()).await?;
+        let _registration = self.responses.guard(cmd.get_id());
+        let budget_rx = if is_task {
+            Some(self.responses.register_task_budget(cmd.get_id()))
+        } else {
+            None
+        };
+        if let Err(error) = self.conn.lock().await.write_and_flush(&frame).await {
             self.responses.cancel(cmd.get_id()).await;
             return Err(error);
         }
@@ -637,13 +770,55 @@ impl Agent {
         } else {
             LONG_CONTROL_RESPONSE_TIMEOUT
         };
-        let result = tokio::time::timeout(response_timeout, response_rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("等待控制响应超过命令总时限"))?
-            .map_err(|_| anyhow::anyhow!("控制响应通道已关闭"));
-        if result.is_err() {
-            self.responses.cancel(cmd.get_id()).await;
+        let result = async {
+            let wait = if let Some(budget_rx) = budget_rx {
+                tokio::select! {
+                    response = &mut response_rx => return response.map_err(|_| anyhow::anyhow!("连接关闭，执行结果未确认")),
+                    budget = tokio::time::timeout(Duration::from_secs(common::task::BUDGET_ACK_SECONDS), budget_rx) => {
+                        Duration::from_secs(budget.map_err(|_| anyhow::anyhow!("等待任务预算超时"))?
+                            .map_err(|_| anyhow::anyhow!("任务预算连接已关闭"))?)
+                    }
+                }
+            } else { response_timeout };
+            tokio::time::timeout(wait, response_rx).await
+                .map_err(|_| anyhow::anyhow!("等待控制响应超过总时限，执行结果未确认"))?
+                .map_err(|_| anyhow::anyhow!("控制响应通道已关闭，执行结果未确认"))
+        }.await;
+        self.responses.cancel(cmd.get_id()).await;
+        result
+    }
+
+    /// 先查询既有能力端点，旧服务端不支持任务时不发送未知命令。
+    async fn require_task_support(&self) -> anyhow::Result<()> {
+        use ctrl_common::{
+            ctrl_frame::Frame,
+            ctrl_resp::{Resp, ServerResp, ServerSuccessResp},
+        };
+        let id = id();
+        let rx = self.responses.register(&id).await?;
+        let _registration = self.responses.guard(&id);
+        let result = async {
+            self.conn
+                .lock()
+                .await
+                .write_and_flush(&common::protocol::transfer_encode_frame(
+                    Frame::Capabilities(id.clone()),
+                ))
+                .await?;
+            let response = tokio::time::timeout(Duration::from_secs(15), rx).await??;
+            if let Resp::Server(ServerResp::Success(ServerSuccessResp::Info(json))) =
+                response.get_resp()
+            {
+                let capabilities: ctrl_common::cmd_resp_info::ServerCapabilities =
+                    serde_json::from_str(json)?;
+                if capabilities.task_run_v1 {
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("服务端不支持 $run，请先升级服务端")
         }
+        .await;
+        self.responses.cancel(&id).await;
         result
     }
 }
@@ -656,6 +831,153 @@ pub fn id() -> String {
 mod tests {
     use super::{CommandGate, ResponseRouter, MAX_PARALLEL_API_COMMANDS};
     use ctrl_common::ctrl_resp::{CmdResp, Resp, ServerResp};
+
+    fn memory_context() -> (super::Context, tokio::io::DuplexStream) {
+        use common::{
+            channel::{Channel, ChannelType},
+            config::{Config, Id, SecurityConfig},
+        };
+        use std::{sync::Arc, time::Duration};
+        use tokio::sync::{Mutex, RwLock};
+        let (writer, peer) = tokio::io::duplex(4096);
+        let channel = Channel::new(
+            Box::pin(writer),
+            None,
+            ChannelType::Ctrl,
+            Err(std::io::Error::other("memory test")),
+            Err(std::io::Error::other("memory test")),
+        );
+        let agent = super::Agent {
+            config: Config {
+                id: Id::anonymous(),
+                server_host: String::new(),
+                server_port: String::new(),
+                read_timeout: Duration::from_secs(1),
+                write_timeout: Duration::from_secs(1),
+                security: SecurityConfig::kik(),
+            },
+            session_id: None,
+            conn: Arc::new(Mutex::new(channel)),
+            responses: ResponseRouter::default(),
+        };
+        (super::Context::new(Arc::new(RwLock::new(agent))), peer)
+    }
+
+    fn selected(id: &str) -> ctrl_common::cmd_resp_info::KikInfoVo {
+        ctrl_common::cmd_resp_info::KikInfoVo {
+            id: id.into(),
+            name: id.into(),
+            ip: "127.0.0.1".into(),
+            recent_online_time: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_selection_fails_before_upload_file_preprocessing() {
+        use crate::input_command::{InputCommand, InputCtrlCommand};
+        let (context, _peer) = memory_context();
+        let result = crate::dispatch::distribution_other(
+            &context,
+            InputCommand::Ctrl(InputCtrlCommand::SetBigFile(
+                "missing-local-file".into(),
+                "remote-file".into(),
+            )),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .is::<crate::local_target::NoTargetSelected>());
+        let api = crate::api_service::RealCtrlApi::with_policy(
+            context,
+            crate::api_service::ApiPolicy::allow_exec_for_test(),
+        );
+        let response = api
+            .execute_request(crate::api_contract::ApiRequest::new(
+                crate::api_contract::ApiCommand::Exec {
+                    command: "must not send".into(),
+                },
+            ))
+            .await;
+        assert_eq!(response.error.unwrap().code, "no_target");
+    }
+
+    #[tokio::test]
+    async fn operation_keeps_target_across_await_and_parallel_local_selection() {
+        use crate::input_command::{InputCommand, InputCtrlCommand};
+        use common::{ltc_codec::LengthFieldBasedFrameDecoder, protocol::BufSerializable};
+        use ctrl_common::ctrl_frame::Frame;
+        use futures::{Future, StreamExt};
+        let (context, peer) = memory_context();
+        context.local_target.select(selected("A"));
+        let agent = context.agent.read().await.clone();
+        let writing = agent.conn.lock().await;
+        let mut operation = Box::pin(crate::dispatch::distribution_other(
+            &context,
+            InputCommand::Ctrl(InputCtrlCommand::Ls("C:/".into())),
+        ));
+        // 写锁模拟其他命令/心跳占用连接。先确认本次操作已经跨过入口，到达异步等待。
+        std::future::poll_fn(|cx| {
+            assert!(operation.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        context.local_target.select(selected("B"));
+        drop(writing);
+        let verify = async {
+            let mut reader = tokio_util::codec::FramedRead::new(
+                tokio::io::BufReader::new(peer),
+                LengthFieldBasedFrameDecoder::new_with_max_frame_len(1024 * 1024),
+            );
+            let bytes = reader.next().await.unwrap().unwrap();
+            let Some(Frame::TargetedCmd(target, request)) = Frame::from_buf(bytes) else {
+                panic!("remote frame must have a target")
+            };
+            assert_eq!(target, "A");
+            agent
+                .responses
+                .deliver(CmdResp::new(
+                    request.get_id().to_owned(),
+                    Resp::Server(ServerResp::Error(1, "test response".into())),
+                ))
+                .await;
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(operation, verify);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(context.snapshot_target(None).unwrap(), "B");
+    }
+
+    #[test]
+    fn wire_encoder_rejects_all_unbound_remote_commands() {
+        use common::{
+            command::{Command, CtrlCommand, SysCommand},
+            protocol::{BufSerializable, CmdOptions, ReqCmd},
+        };
+        use ctrl_common::ctrl_frame::Frame;
+        for command in [
+            Command::Exec("echo test".into()),
+            Command::Ctrl(CtrlCommand::GetFile("remote".into(), "data-id".into())),
+            Command::RunTask("task".into()),
+        ] {
+            let request = ReqCmd::new("request".into(), CmdOptions::default(), command);
+            assert!(super::encode_request(&request, None).is_err());
+            let mut encoded = super::encode_request(&request, Some("fixed-target")).unwrap();
+            let _ = encoded.split_to(4);
+            assert!(
+                matches!(Frame::from_buf(encoded), Some(Frame::TargetedCmd(target, _)) if target == "fixed-target")
+            );
+        }
+        let list = ReqCmd::new(
+            "list".into(),
+            CmdOptions::default(),
+            Command::Sys(SysCommand::List),
+        );
+        assert!(super::encode_request(&list, None).is_ok());
+        assert!(super::encode_request(&list, Some("target")).is_err());
+    }
 
     #[test]
     fn command_gate_allows_bounded_parallel_commands() {
@@ -689,5 +1011,54 @@ mod tests {
 
         assert_eq!(first.await.unwrap().get_cmd_id(), "first");
         assert_eq!(second.await.unwrap().get_cmd_id(), "second");
+    }
+
+    #[tokio::test]
+    async fn task_budget_is_correlated_and_can_only_arrive_once() {
+        let router = ResponseRouter::default();
+        let response = router.register("task").await.unwrap();
+        let _registration = router.guard("task");
+        let mut budget = router.register_task_budget("task");
+        router.task_budget("other", 60).await;
+        assert!(matches!(
+            budget.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        router.task_budget("task", 700).await;
+        router.task_budget("task", 900).await;
+        assert_eq!(budget.await.unwrap(), 700);
+        assert!(router.task_budgets.lock().unwrap().is_empty());
+        router
+            .deliver(CmdResp::new(
+                "task".into(),
+                Resp::Server(ServerResp::Error(1, "done".into())),
+            ))
+            .await;
+        assert_eq!(response.await.unwrap().get_cmd_id(), "task");
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_drops_its_response_and_budget_registrations() {
+        let router = ResponseRouter::default();
+        let response = router.register("cancelled").await.unwrap();
+        let registration = router.guard("cancelled");
+        let budget = router.register_task_budget("cancelled");
+        drop(registration);
+        assert!(response.await.is_err());
+        assert!(budget.await.is_err());
+        assert!(router.pending.lock().unwrap().is_empty());
+        assert!(router.task_budgets.lock().unwrap().is_empty());
+        assert!(router.register("cancelled").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnected_router_closes_both_response_paths() {
+        let router = ResponseRouter::default();
+        let response = router.register("task").await.unwrap();
+        let _registration = router.guard("task");
+        let budget = router.register_task_budget("task");
+        router.fail_all().await;
+        assert!(response.await.is_err());
+        assert!(budget.await.is_err());
     }
 }

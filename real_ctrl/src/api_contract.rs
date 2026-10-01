@@ -24,6 +24,9 @@ pub struct ApiRequest {
     /// 调用者自定义的追踪 ID；服务端只校验并原样回显，不把它当成内部命令 ID。
     #[serde(default)]
     pub request_id: Option<String>,
+    /// 可选的本次操作目标；省略时快照客户端本地选择，显式提供不会改变该选择。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kik_id: Option<String>,
     pub command: ApiCommand,
 }
 
@@ -33,15 +36,18 @@ pub struct ApiRequest {
 ///
 /// `local_path` 始终属于运行 real_ctrl 的机器，`remote_path` 始终属于 Kik；两者不能互换。
 pub enum ApiCommand {
+    RunTask {
+        task_name: String,
+    },
     // 使用零字段结构体变体而不是 unit 变体：Serde 对内部标签 unit 变体会忽略额外字段，
     // 结构体变体才能让 deny_unknown_fields 在开放 API 边界真正 fail-closed。
     SysList {},
-    SysNow {},
+    LocalNow {},
     SysHistory {
         #[serde(default)]
         kik_id: Option<String>,
     },
-    SysUse {
+    LocalUse {
         kik_id: String,
     },
     CtrlLs {
@@ -100,8 +106,8 @@ pub enum ApiResponseData {
     SysList {
         items: Vec<ctrl_common::cmd_resp_info::KikInfoVo>,
     },
-    SysNow {
-        value: ctrl_common::cmd_resp_info::SysNow,
+    LocalNow {
+        value: ctrl_common::cmd_resp_info::LocalNow,
     },
     SysHistory {
         items: Vec<ctrl_common::cmd_resp_info::KikPresenceVo>,
@@ -126,6 +132,7 @@ impl ApiRequest {
         Self {
             version: API_VERSION,
             request_id: None,
+            target_kik_id: None,
             command,
         }
     }
@@ -133,6 +140,20 @@ impl ApiRequest {
     pub fn validate(&self) -> Result<(), ApiErrorBody> {
         if let Some(request_id) = &self.request_id {
             validate_text(request_id, "request_id", MAX_REQUEST_ID_BYTES)?;
+        }
+        if let Some(target) = &self.target_kik_id {
+            validate_target_id(target, "target_kik_id")?;
+            if matches!(
+                self.command,
+                ApiCommand::SysList {}
+                    | ApiCommand::SysHistory { .. }
+                    | ApiCommand::LocalUse { .. }
+                    | ApiCommand::LocalNow {}
+            ) {
+                return Err(ApiErrorBody::bad_request(
+                    "target_kik_id 只允许用于远端操作",
+                ));
+            }
         }
         self.command.validate()
     }
@@ -211,10 +232,11 @@ impl ApiErrorBody {
 impl ApiCommand {
     pub fn kind(&self) -> &'static str {
         match self {
+            ApiCommand::RunTask { .. } => "run_task",
             ApiCommand::SysList {} => "sys_list",
-            ApiCommand::SysNow {} => "sys_now",
+            ApiCommand::LocalNow {} => "local_now",
             ApiCommand::SysHistory { .. } => "sys_history",
-            ApiCommand::SysUse { .. } => "sys_use",
+            ApiCommand::LocalUse { .. } => "local_use",
             ApiCommand::CtrlLs { .. } => "ctrl_ls",
             ApiCommand::CtrlScreen { .. } => "ctrl_screen",
             ApiCommand::CtrlGetFile { .. } => "ctrl_get_file",
@@ -227,14 +249,21 @@ impl ApiCommand {
 
     fn validate(&self) -> Result<(), ApiErrorBody> {
         match self {
-            ApiCommand::SysList {} | ApiCommand::SysNow {} => Ok(()),
+            ApiCommand::RunTask { task_name } => {
+                if common::task::valid_task_name(task_name) {
+                    Ok(())
+                } else {
+                    Err(ApiErrorBody::bad_request("任务名格式错误"))
+                }
+            }
+            ApiCommand::SysList {} | ApiCommand::LocalNow {} => Ok(()),
             ApiCommand::SysHistory { kik_id } => {
                 if let Some(kik_id) = kik_id {
                     validate_text(kik_id, "kik_id", MAX_KIK_ID_BYTES)?;
                 }
                 Ok(())
             }
-            ApiCommand::SysUse { kik_id } => validate_text(kik_id, "kik_id", MAX_KIK_ID_BYTES),
+            ApiCommand::LocalUse { kik_id } => validate_target_id(kik_id, "kik_id"),
             ApiCommand::CtrlLs { path } => validate_path(path, "path", false),
             ApiCommand::CtrlScreen { save_path } => {
                 if let Some(path) = save_path {
@@ -283,13 +312,14 @@ impl ApiCommand {
 
     pub fn into_input_command(self) -> InputCommand {
         match self {
+            ApiCommand::RunTask { task_name } => InputCommand::RunTask(task_name),
             ApiCommand::SysList {} => InputCommand::Sys(common::command::SysCommand::List),
-            ApiCommand::SysNow {} => InputCommand::Sys(common::command::SysCommand::Now),
+            ApiCommand::LocalNow {} => InputCommand::Local(common::command::LocalCommand::LocalNow),
             ApiCommand::SysHistory { kik_id } => {
                 InputCommand::Sys(common::command::SysCommand::History(kik_id))
             }
-            ApiCommand::SysUse { kik_id } => {
-                InputCommand::Sys(common::command::SysCommand::Use(kik_id))
+            ApiCommand::LocalUse { kik_id } => {
+                InputCommand::Local(common::command::LocalCommand::LocalUse(kik_id))
             }
             ApiCommand::CtrlLs { path } => InputCommand::Ctrl(InputCtrlCommand::Ls(path)),
             ApiCommand::CtrlScreen { save_path } => InputCommand::Ctrl(InputCtrlCommand::Screen(
@@ -322,6 +352,11 @@ impl ApiCommand {
     }
 }
 
+fn validate_target_id(value: &str, field: &str) -> Result<(), ApiErrorBody> {
+    crate::local_target::validate_target_id(value)
+        .map_err(|error| ApiErrorBody::bad_request(format!("{field}: {error}")))
+}
+
 fn validate_path(value: &str, field: &str, allow_empty: bool) -> Result<(), ApiErrorBody> {
     if allow_empty && value.is_empty() {
         return Ok(());
@@ -350,7 +385,9 @@ pub fn remote_resp_to_api_data(
         RemoteResp::Success(RemoteSuccessResp::SysList(items)) => {
             Ok(ApiResponseData::SysList { items })
         }
-        RemoteResp::Success(RemoteSuccessResp::Now(value)) => Ok(ApiResponseData::SysNow { value }),
+        RemoteResp::Success(RemoteSuccessResp::Now(value)) => {
+            Ok(ApiResponseData::LocalNow { value })
+        }
         RemoteResp::Success(RemoteSuccessResp::History(items)) => {
             Ok(ApiResponseData::SysHistory { items })
         }
@@ -386,6 +423,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_target_is_envelope_scoped_and_retired_commands_are_rejected() {
+        let request: ApiRequest = serde_json::from_str(r#"{"version":1,"target_kik_id":"kik-a","command":{"kind":"exec","command":"echo test"}}"#).unwrap();
+        assert!(request.validate().is_ok());
+        assert_eq!(request.target_kik_id.as_deref(), Some("kik-a"));
+        for kind in ["sys_use", "sys_now"] {
+            assert!(serde_json::from_value::<ApiRequest>(
+                serde_json::json!({"version":1,"command":{"kind":kind,"kik_id":"a"}})
+            )
+            .is_err());
+        }
+        for command in [
+            ApiCommand::SysList {},
+            ApiCommand::LocalNow {},
+            ApiCommand::LocalUse { kik_id: "A".into() },
+        ] {
+            let mut request = ApiRequest::new(command);
+            request.target_kik_id = Some("B".into());
+            assert!(request.validate().is_err());
+        }
+        for bad in [
+            "".to_owned(),
+            "   ".into(),
+            "a\0b".into(),
+            "a\nb".into(),
+            "a\tb".into(),
+            "a\u{0085}b".into(),
+            "x".repeat(MAX_KIK_ID_BYTES + 1),
+        ] {
+            let mut request = ApiRequest::new(ApiCommand::RunTask {
+                task_name: "valid-task".into(),
+            });
+            request.target_kik_id = Some(bad.clone());
+            assert!(request.validate().is_err());
+            assert!(ApiRequest::new(ApiCommand::LocalUse { kik_id: bad })
+                .validate()
+                .is_err());
+        }
+        let now = ApiRequest::new(ApiCommand::LocalNow {});
+        assert!(matches!(
+            now.command.into_input_command(),
+            InputCommand::Local(common::command::LocalCommand::LocalNow)
+        ));
+    }
+
+    #[test]
+    fn capabilities_default_missing_task_support_to_false() {
+        use ctrl_common::cmd_resp_info::ServerCapabilities;
+        let old: ServerCapabilities =
+            serde_json::from_str(r#"{"target_bound_command_v1":true}"#).unwrap();
+        assert!(old.target_bound_command_v1);
+        assert!(!old.task_run_v1);
+        assert!(!old.task_list_v1);
+        let future: ServerCapabilities =
+            serde_json::from_str(r#"{"task_run_v1":true,"future_feature":true}"#).unwrap();
+        assert!(future.task_run_v1);
+        assert!(!future.target_bound_command_v1);
+
+        // 已安装的旧 App 只有这一个字段；新增字段不能改变原有目标绑定能力的解析。
+        #[derive(Deserialize)]
+        struct LegacyCapabilities {
+            #[serde(default)]
+            target_bound_command_v1: bool,
+        }
+        let current = ServerCapabilities {
+            target_bound_command_v1: true,
+            task_run_v1: true,
+            task_list_v1: true,
+        };
+        let advertised = serde_json::to_string(&current).unwrap();
+        let legacy: LegacyCapabilities = serde_json::from_str(&advertised).unwrap();
+        assert!(legacy.target_bound_command_v1);
+        let current: ServerCapabilities = serde_json::from_str(&advertised).unwrap();
+        assert!(current.target_bound_command_v1 && current.task_run_v1 && current.task_list_v1);
+    }
+
+    #[test]
     fn api_command_json_is_stable() {
         let json =
             r#"{"version":1,"request_id":"r1","command":{"kind":"ctrl_ls","path":"C:\\Temp"}}"#;
@@ -395,6 +508,39 @@ mod tests {
         match req.command {
             ApiCommand::CtrlLs { path } => assert_eq!(path, "C:\\Temp"),
             _ => panic!("命令类型解析错误"),
+        }
+    }
+
+    #[test]
+    fn task_api_has_a_name_only_and_keeps_output_response_contract() {
+        let json = r#"{"version":1,"request_id":"run-1","command":{"kind":"run_task","task_name":"collect-info"}}"#;
+        let request: ApiRequest = serde_json::from_str(json).unwrap();
+        assert!(request.validate().is_ok());
+        assert_eq!(request.command.kind(), "run_task");
+        let input = request.command.into_input_command();
+        assert!(matches!(&input, InputCommand::RunTask(name) if name == "collect-info"));
+        let output = remote_resp_to_api_data(
+            &input,
+            RemoteResp::Success(RemoteSuccessResp::Info("binary output".into())),
+        )
+        .unwrap();
+        assert!(matches!(output, ApiResponseData::Info { message } if message == "binary output"));
+        let error = remote_resp_to_api_data(&input, RemoteResp::Error(1, "task_timeout".into()))
+            .unwrap_err();
+        assert_eq!(error.code, "remote_1");
+        assert_eq!(error.message, "task_timeout");
+        for value in [
+            r#"{"version":1,"command":{"kind":"run_task","task_name":"task","args":["unsafe"]}}"#,
+            r#"{"version":1,"command":{"kind":"run_task","task_name":"task","binary":"C:\\tool.exe"}}"#,
+        ] {
+            assert!(serde_json::from_str::<ApiRequest>(value).is_err());
+        }
+        for name in ["", "../task", "task arg", "task.exe", "任务"] {
+            assert!(ApiRequest::new(ApiCommand::RunTask {
+                task_name: name.into()
+            })
+            .validate()
+            .is_err());
         }
     }
 
@@ -418,7 +564,7 @@ mod tests {
 
     #[test]
     fn api_request_rejects_oversized_or_nul_fields() {
-        let oversized = ApiRequest::new(ApiCommand::SysUse {
+        let oversized = ApiRequest::new(ApiCommand::LocalUse {
             kik_id: "x".repeat(MAX_KIK_ID_BYTES + 1),
         });
         assert!(oversized.validate().is_err());
@@ -428,16 +574,16 @@ mod tests {
         });
         assert!(nul_path.validate().is_err());
 
-        let mut nul_request_id = ApiRequest::new(ApiCommand::SysNow {});
+        let mut nul_request_id = ApiRequest::new(ApiCommand::LocalNow {});
         nul_request_id.request_id = Some("safe\0forged".to_string());
         assert!(nul_request_id.validate().is_err());
     }
 
     #[test]
     fn api_json_rejects_unknown_fields_in_envelope_and_command() {
-        let envelope = r#"{"version":1,"command":{"kind":"sys_now"},"unexpected":true}"#;
+        let envelope = r#"{"version":1,"command":{"kind":"local_now"},"unexpected":true}"#;
         let command = r#"{"version":1,"command":{"kind":"ctrl_ls","path":"C:\\Temp","typo":true}}"#;
-        let unit_like_command = r#"{"version":1,"command":{"kind":"sys_now","typo":true}}"#;
+        let unit_like_command = r#"{"version":1,"command":{"kind":"local_now","typo":true}}"#;
 
         assert!(serde_json::from_str::<ApiRequest>(envelope).is_err());
         assert!(serde_json::from_str::<ApiRequest>(command).is_err());

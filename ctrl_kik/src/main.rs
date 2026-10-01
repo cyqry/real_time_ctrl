@@ -41,6 +41,9 @@ mod kik_conn;
 mod kik_data_conn;
 mod read_handle;
 mod screen;
+mod task_cache;
+mod task_process;
+mod task_runner;
 
 /// 每个主会话维持三条独立数据连接，既可并行发送分片，也允许单链路故障时继续工作。
 const DESIRED_DATA_CONNECTIONS: usize = 3;

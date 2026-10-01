@@ -131,9 +131,10 @@ mod tests {
 
     #[test]
     fn compiled_public_defaults_are_valid() {
-        assert!(!DEFAULT_SERVER_HOST.is_empty());
+        for value in [DEFAULT_SERVER_HOST, DEFAULT_TLS_SERVER_NAME] {
+            assert!(!value.is_empty());
+        }
         assert!(DEFAULT_TLS_PORT.parse::<u16>().is_ok());
-        assert!(!DEFAULT_TLS_SERVER_NAME.is_empty());
         let pin = hidden!(env!("REAL_CTRL_DEFAULT_TLS_SPKI_SHA256"));
         assert!(pin.is_empty() || pin.len() == 64);
         assert!(hidden!(env!("REAL_CTRL_DEFAULT_AUTH_SECRET")).len() >= 32);

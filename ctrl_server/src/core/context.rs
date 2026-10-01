@@ -32,7 +32,7 @@ type SharedChannel = Arc<Mutex<Channel>>;
 
 /// 一条已通过 HMAC 挑战的控制主会话。
 ///
-/// `selected_kik_id` 是会话私有选择；`data_connections`、nonce 集合和实例级命令许可也不能跨会话复用。
+/// 会话仅保存授权、数据连接和配额；被控者由每条客户端请求明确指定，不保存默认目标。
 struct CtrlSession {
     /// 决定认证 secret、Kik ACL 和账号级并发上限。
     account_id: String,
@@ -46,8 +46,6 @@ struct CtrlSession {
     data_connection_notify: Arc<Notify>,
     /// 选择下一条数据连接的轮询游标。
     next_data_connection: Arc<AtomicUsize>,
-    /// 当前命令默认发往的 Kik；为空时由自动选择逻辑补充。
-    selected_kik_id: Option<String>,
     /// 用于限制会话最长寿命，避免永久 session。
     created_at: SystemTime,
     /// 已消费的数据通道 nonce，防止同一 proof 被重放建立更多连接。
@@ -80,7 +78,7 @@ struct DataRoute {
     expires_at: Instant,
 }
 
-/// 同一账号的多个实例共享 ACL，但会话选择、命令许可和数据通道完全隔离。
+/// 同一账号的多个实例共享 ACL，但命令许可和数据通道完全隔离。
 ///
 /// `Context` 的克隆成本很低，只复制共享状态句柄，适合移动进每个连接和命令任务。
 #[derive(Clone)]
@@ -146,7 +144,6 @@ impl Context {
             data_connections: HashMap::new(),
             data_connection_notify: Arc::new(Notify::new()),
             next_data_connection: Arc::new(AtomicUsize::new(0)),
-            selected_kik_id: None,
             created_at: SystemTime::now(),
             used_data_nonces: HashSet::new(),
             command_limit: Arc::new(Semaphore::new(policy.max_commands_per_instance)),
@@ -177,9 +174,6 @@ impl Context {
         if let Some(old_session_id) = old_session_id {
             self.remove_session(&old_session_id, None).await;
         }
-        // 控制端和 Kik 的连接顺序没有保证。会话注册完成后再做一次自动选择，
-        // 与 Kik 上线侧的对应逻辑共同消除“双方恰好同时上线”时的漏选窗口。
-        self.ensure_session_has_selected_kik(&session_id).await;
         Ok(())
     }
 
@@ -405,33 +399,7 @@ impl Context {
         Ok((global, account, local))
     }
 
-    pub async fn set_kik(&self, session_id: &str, kik_id: &str) -> anyhow::Result<Kik> {
-        let policy = self.policy_for_session(session_id).await?;
-        if !policy.allows_kik(kik_id) {
-            anyhow::bail!("当前账号无权访问该 Kik");
-        }
-        let kik = self
-            .get_initialized_kik_by_id(kik_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("找不到该 Kik"))?;
-        let session = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("控制会话已失效"))?;
-        session.lock().await.selected_kik_id = Some(kik_id.to_string());
-        Ok(kik)
-    }
-
-    pub async fn get_kik(&self, session_id: &str) -> Option<Kik> {
-        let session = self.sessions.read().await.get(session_id).cloned()?;
-        let kik_id = session.lock().await.selected_kik_id.clone()?;
-        self.get_initialized_kik_by_id(&kik_id).await
-    }
-
-    /// 只返回请求明确指定且账号允许的目标；绝不读取或修改 selected_kik_id。
+    /// 只返回请求明确指定且账号允许的目标；不存在默认目标或离线回退。
     /// 调用者持有返回的共享 Kik 句柄完成连接选择、配额与数据路由，避免再次查询时换成另一台。
     pub async fn get_authorized_target(
         &self,
@@ -447,100 +415,18 @@ impl Context {
             .ok_or_else(|| anyhow::anyhow!("指定 Kik 不存在或已下线，命令未切换到其他设备"))
     }
 
-    /// 为尚未选择目标的控制会话选择最近上线且有权限访问的 Kik。
-    ///
-    /// 候选扫描和连接状态读取均在集合锁外完成，避免慢连接状态锁阻塞全局会话注册。
-    async fn ensure_session_has_selected_kik(&self, session_id: &str) {
-        let Some(session) = self.sessions.read().await.get(session_id).cloned() else {
-            return;
-        };
-        let account_id = {
-            let session = session.lock().await;
-            if session.selected_kik_id.is_some() {
-                return;
-            }
-            session.account_id.clone()
-        };
-        let Some(policy) = self.account(&account_id) else {
-            return;
-        };
-        let Some(kik_id) = self.latest_online_kik_id(&policy).await else {
-            return;
-        };
-
-        // sys_use 可能在候选扫描期间完成；只填充空选择，绝不覆盖用户显式选择。
-        let mut session = session.lock().await;
-        if session.selected_kik_id.is_none() {
-            session.selected_kik_id = Some(kik_id);
-        }
-    }
-
-    async fn latest_online_kik_id(&self, policy: &AccountPolicy) -> Option<String> {
-        let snapshot = self
-            .kiks
-            .read()
-            .await
-            .iter()
-            .filter(|(id, _)| policy.allows_kik(id))
-            .map(|(id, kik)| (id.clone(), kik.clone()))
-            .collect::<Vec<_>>();
-        let mut latest: Option<(SystemTime, String)> = None;
-        for (id, kik) in snapshot {
-            if !kik.initialized() || !kik.exist_kik_conn().await {
-                continue;
-            }
-            let online_at = *kik.kik_client_info.recent_online_time.read().await;
-            let replace = latest.as_ref().is_none_or(|(latest_at, latest_id)| {
-                online_at > *latest_at || (online_at == *latest_at && id > *latest_id)
-            });
-            if replace {
-                latest = Some((online_at, id));
-            }
-        }
-        latest.map(|(_, id)| id)
-    }
-
-    /// 新 Kik 上线时，只为没有当前目标的会话补默认值；账号 ACL 仍是硬边界。
-    async fn select_kik_for_unassigned_sessions(&self, kik_id: &str) {
-        let sessions = self
+    /// 审计只使用账号名；不能把兼作数据连接绑定材料的 session ID 或 secret 写入日志。
+    pub async fn account_id_for_audit(&self, session_id: &str) -> anyhow::Result<String> {
+        self.policy_for_session(session_id).await?;
+        let session = self
             .sessions
             .read()
             .await
-            .values()
+            .get(session_id)
             .cloned()
-            .collect::<Vec<_>>();
-        for session in sessions {
-            let mut session = session.lock().await;
-            if session.selected_kik_id.is_none()
-                && self
-                    .account(&session.account_id)
-                    .is_some_and(|policy| policy.allows_kik(kik_id))
-            {
-                session.selected_kik_id = Some(kik_id.to_string());
-            }
-        }
-    }
-
-    /// Kik 完整下线后清除引用它的会话，并立即选择仍在线的最近候选。
-    async fn replace_offline_kik_selections(&self, kik_id: &str) {
-        let sessions = self
-            .sessions
-            .read()
-            .await
-            .iter()
-            .map(|(id, session)| (id.clone(), session.clone()))
-            .collect::<Vec<_>>();
-        let mut cleared = Vec::new();
-        for (session_id, session) in sessions {
-            let mut session = session.lock().await;
-            if session.selected_kik_id.as_deref() == Some(kik_id) {
-                session.selected_kik_id = None;
-                cleared.push(session_id);
-            }
-        }
-        for session_id in cleared {
-            self.ensure_session_has_selected_kik(&session_id).await;
-        }
+            .ok_or_else(|| anyhow::anyhow!("控制会话已失效"))?;
+        let account_id = session.lock().await.account_id.clone();
+        Ok(account_id)
     }
 
     async fn policy_for_session(&self, session_id: &str) -> anyhow::Result<AccountPolicy> {
@@ -844,9 +730,6 @@ impl Context {
                 .lock()
                 .await
                 .retain(|_, route| route.kik_id != kik_id);
-            if removed.is_some() {
-                self.replace_offline_kik_selections(kik_id).await;
-            }
             removed
         } else {
             None
@@ -893,7 +776,6 @@ impl Context {
             },
         );
         drop(records);
-        self.select_kik_for_unassigned_sessions(&id).await;
     }
 
     async fn record_kik_offline(&self, kik: &Kik) {
@@ -1200,47 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kik_online_after_ctrl_is_selected_automatically() {
-        let context = Context::init();
-        let (session_id, _) = session(&context, "default", "ctrl-first").await;
-        assert!(context.get_kik(&session_id).await.is_none());
-
-        let kik_id = Uuid::new_v4().to_string();
-        add_online_kik(&context, &kik_id, SystemTime::now()).await;
-
-        assert_eq!(
-            context.get_kik(&session_id).await.unwrap().id(),
-            Some(kik_id.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn ctrl_online_after_kik_selects_latest_accessible_kik() {
-        let context = Context::init();
-        let first = Uuid::new_v4().to_string();
-        let latest = Uuid::new_v4().to_string();
-        add_online_kik(
-            &context,
-            &first,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        )
-        .await;
-        add_online_kik(
-            &context,
-            &latest,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(2),
-        )
-        .await;
-
-        let (session_id, _) = session(&context, "default", "kik-first").await;
-        assert_eq!(
-            context.get_kik(&session_id).await.unwrap().id(),
-            Some(latest.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn offline_selection_falls_back_to_another_online_kik() {
+    async fn offline_explicit_target_never_falls_back_to_another_kik() {
         let context = Context::init();
         let fallback_id = Uuid::new_v4().to_string();
         let selected_id = Uuid::new_v4().to_string();
@@ -1258,7 +1100,11 @@ mod tests {
         .await;
         let (session_id, _) = session(&context, "default", "fallback").await;
         assert_eq!(
-            context.get_kik(&session_id).await.unwrap().id(),
+            context
+                .get_authorized_target(&session_id, &selected_id)
+                .await
+                .unwrap()
+                .id(),
             Some(selected_id.as_str())
         );
 
@@ -1267,11 +1113,7 @@ mod tests {
             .delete_kik_if_not_online(&selected_id)
             .await
             .is_some());
-        assert_eq!(
-            context.get_kik(&session_id).await.unwrap().id(),
-            Some(fallback_id.as_str())
-        );
-        // 安全目标请求不能沿用自动切换后的默认值：A 下线时只能失败，不能返回 B。
+        // A 下线后只能失败；只有显式传入 B 的请求才能获取 B。
         assert!(context
             .get_authorized_target(&session_id, &selected_id)
             .await
@@ -1287,7 +1129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_selection_never_crosses_account_acl() {
+    async fn explicit_target_never_crosses_account_acl() {
         let allowed_id = Uuid::new_v4().to_string();
         let denied_id = Uuid::new_v4().to_string();
         let registry = AccountRegistry::from_json_or_default(
@@ -1313,7 +1155,11 @@ mod tests {
 
         let (session_id, _) = session(&context, "restricted", "acl").await;
         assert_eq!(
-            context.get_kik(&session_id).await.unwrap().id(),
+            context
+                .get_authorized_target(&session_id, &allowed_id)
+                .await
+                .unwrap()
+                .id(),
             Some(allowed_id.as_str())
         );
         assert!(context
@@ -1363,7 +1209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounts_instances_selections_and_data_ids_are_isolated() {
+    async fn accounts_instances_explicit_targets_and_data_ids_are_isolated() {
         let registry = AccountRegistry::from_json_or_default(
             Some(
                 r#"[
@@ -1390,14 +1236,20 @@ mod tests {
             kik.set_kik_initialized(true);
             context.kiks.write().await.insert(id.clone(), kik);
         }
-        context.set_kik(&session_a, &kik_a_id).await.unwrap();
-        context.set_kik(&session_b, &kik_b_id).await.unwrap();
         assert_eq!(
-            context.get_kik(&session_a).await.unwrap().id(),
+            context
+                .get_authorized_target(&session_a, &kik_a_id)
+                .await
+                .unwrap()
+                .id(),
             Some(kik_a_id.as_str())
         );
         assert_eq!(
-            context.get_kik(&session_b).await.unwrap().id(),
+            context
+                .get_authorized_target(&session_b, &kik_b_id)
+                .await
+                .unwrap()
+                .id(),
             Some(kik_b_id.as_str())
         );
 

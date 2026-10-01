@@ -27,6 +27,10 @@ pub const DATA_CHANNEL_IO_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 /// 补建任务采用最高 30 秒的指数退避，因此 45 秒足够覆盖一次最坏退避和一次正常握手。
 pub const DATA_CONNECTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// 正常业务帧已经逐帧 flush，关闭只负责协议收尾；失效连接不能再占用六分钟数据写窗口。
+/// 五秒上限给读循环退出和连接池补建留出时间，避免坏连接拖住其他文件任务。
+const CHANNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// 连接通过初始化消息认证后得到的角色。
 ///
@@ -83,6 +87,8 @@ pub struct Channel {
     writer: BoxedAsyncWrite,
     addr: (io::Result<SocketAddr>, io::Result<SocketAddr>),
     attr: HashMap<u64, Box<dyn Any + Send + Sync>>,
+    /// 写帧开始前先设为 true，完整写入并 flush 成功后才恢复为 false。
+    /// 因而 future 被取消时，即使没有执行错误分支，也不会留下可复用的半帧连接。
     closed: bool,
     write_timeout: Duration,
 }
@@ -171,29 +177,41 @@ impl Channel {
 
     pub async fn write_half_close(&mut self) -> std::io::Result<()> {
         self.closed = true;
-        tokio::time::timeout(self.write_timeout, self.writer.shutdown())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, hidden!("关闭写半连接超时")))?
+        tokio::time::timeout(
+            self.write_timeout.min(CHANNEL_SHUTDOWN_TIMEOUT),
+            self.writer.shutdown(),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, hidden!("关闭写半连接超时")))?
     }
     pub async fn try_write_half_close(&mut self) {
         let _ = self.write_half_close().await;
     }
     pub async fn write_and_flush(&mut self, bys: &[u8]) -> anyhow::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                hidden!("连接已关闭，不能继续写入"),
+            )
+            .into());
+        }
+        // &mut self 保证同一时刻只有一个写入者。必须在首次 await 前标为不可复用：
+        // 外层 timeout、select 或 abort 都可能直接丢弃 future，不会进入下面的错误分支。
+        // 只有整帧及 flush 均完成，才能确认流中没有残留半帧并恢复可用状态。
+        self.closed = true;
         match tokio::time::timeout(self.write_timeout, async {
             self.writer.write_all(bys).await?;
             self.writer.flush().await
         })
         .await
         {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                // 写失败后 TCP 流边界已不可恢复，禁止后续分片继续复用该连接。
-                self.closed = true;
-                Err(error.into())
+            Ok(Ok(())) => {
+                self.closed = false;
+                Ok(())
             }
+            Ok(Err(error)) => Err(error.into()),
             Err(_) => {
                 // 超时会取消进行中的 write_all，连接里可能已有半帧，必须立即淘汰。
-                self.closed = true;
                 Err(anyhow::Error::msg(hidden!("写连接超时")))
             }
         }
@@ -206,6 +224,13 @@ impl Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWrite};
 
     const TEXT_ATTRIBUTE: ChannelAttributeKey<String> = ChannelAttributeKey::new(0x7465_7874);
 
@@ -242,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_partial_write_marks_connection_closed() {
-        let (_reader, writer) = tokio::io::duplex(1);
+        let (mut reader, writer) = tokio::io::duplex(1);
         let mut channel = Channel::new(
             Box::pin(writer),
             None,
@@ -254,6 +279,147 @@ mod tests {
 
         assert!(channel.write_and_flush(&[7_u8; 1024]).await.is_err());
         assert!(channel.is_closed());
+        assert!(channel.write_and_flush(b"must not be sent").await.is_err());
+        channel.write_half_close().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, [7]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_write_cannot_be_reused() {
+        let (mut reader, writer) = tokio::io::duplex(1);
+        let mut channel = Channel::new(
+            Box::pin(writer),
+            None,
+            ChannelType::Ctrl,
+            Err(io::Error::other("test")),
+            Err(io::Error::other("test")),
+        );
+        let mut writing = Box::pin(channel.write_and_flush(b"first frame"));
+        // 只 poll 一次：duplex 容量为 1，实际写出首字节后立即背压。
+        // 直接 drop 与外层 select/timeout 取消具有相同语义，无需依赖线程调度或 sleep。
+        std::future::poll_fn(|cx| {
+            assert!(writing.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(writing);
+
+        assert!(channel.is_closed());
+        assert!(channel.write_and_flush(b"next frame").await.is_err());
+        channel.write_half_close().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"f");
+    }
+
+    /// 模拟已经缓存完整明文、但 flush 仍背压的 TLS/Noise 写端。
+    /// 取消风险不仅存在于 write_all，也存在于加密记录尚未发完的 flush 阶段。
+    struct PendingFlush {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        shutdown_pending: bool,
+    }
+
+    impl AsyncWrite for PendingFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.shutdown_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_rejects_next_frame_without_touching_writer() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut channel = Channel::new(
+            Box::pin(PendingFlush {
+                bytes: bytes.clone(),
+                shutdown_pending: false,
+            }),
+            None,
+            ChannelType::Ctrl,
+            Err(io::Error::other("test")),
+            Err(io::Error::other("test")),
+        );
+        let mut writing = Box::pin(channel.write_and_flush(b"first frame"));
+        std::future::poll_fn(|cx| {
+            assert!(writing.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(writing);
+
+        assert!(channel.is_closed());
+        assert!(channel.write_and_flush(b"next frame").await.is_err());
+        assert_eq!(*bytes.lock().unwrap(), b"first frame");
+    }
+
+    #[tokio::test]
+    async fn stalled_shutdown_does_not_wait_for_the_data_frame_timeout() {
+        let mut channel = Channel::new(
+            Box::pin(PendingFlush {
+                bytes: Arc::new(Mutex::new(Vec::new())),
+                shutdown_pending: true,
+            }),
+            None,
+            ChannelType::KikData,
+            Err(io::Error::other("test")),
+            Err(io::Error::other("test")),
+        );
+        channel.set_write_timeout(DATA_CHANNEL_IO_TIMEOUT);
+        // 模拟关闭阶段永远不就绪的传输层，必须在短关闭窗口返回，而不是等待六分钟。
+        let error = tokio::time::timeout(Duration::from_secs(7), channel.write_half_close())
+            .await
+            .expect("shutdown exceeded the recovery window")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(channel.is_closed());
+    }
+
+    #[tokio::test]
+    async fn successful_frames_remain_reusable_until_explicit_shutdown() {
+        let (mut reader, writer) = tokio::io::duplex(64);
+        let mut channel = Channel::new(
+            Box::pin(writer),
+            None,
+            ChannelType::Ctrl,
+            Err(io::Error::other("test")),
+            Err(io::Error::other("test")),
+        );
+        channel.write_and_flush(b"first").await.unwrap();
+        assert!(!channel.is_closed());
+        channel.write_and_flush(b"second").await.unwrap();
+        assert!(!channel.is_closed());
+        channel.write_half_close().await.unwrap();
+        assert!(channel.write_and_flush(b"after close").await.is_err());
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"firstsecond");
     }
 
     #[test]

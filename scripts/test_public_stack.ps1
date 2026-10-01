@@ -12,6 +12,7 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Net.Http
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
+. (Join-Path $ScriptDir 'kik_test_lock.ps1')
 $ChannelName = $Channel.ToLowerInvariant()
 $TargetAlias = "ytycc"
 $ExpectedKikNoisePort = if ($Channel -eq "Gray") { 9005 } else { 9002 }
@@ -38,6 +39,7 @@ $RealCtrlExe = Join-Path $ArtifactDir "real_ctrl.exe"
 $HttpExe = Join-Path $ArtifactDir "real_ctrl_invoker_http_service.exe"
 $ReportPath = Join-Path $ReportDir "public-e2e.json"
 $script:Processes = @()
+$script:KikTestLockPath = $null
 
 function Test-PortFree {
     param([int]$Port)
@@ -66,6 +68,13 @@ function Wait-TcpPort {
 function Start-TestProcess {
     param([string]$Name, [string]$Path, [string]$WorkingDirectory, [hashtable]$Environment)
     if (-not (Test-Path -LiteralPath $Path)) { throw "缺少被测程序: $Path" }
+    if ($Name -eq 'ctrl-kik') {
+        $startLock = Assert-KikTestLockLocation -ProjectRoot $Root -WorkingDirectory $WorkingDirectory `
+            -BinaryPath $Path -ReceiptPath $KikReceipt
+        if ($startLock.resolved_path -ne $script:KikTestLockPath) {
+            throw '公网预检后 Kik 锁配置发生变化，拒绝继续验收'
+        }
+    }
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $Path
     $info.WorkingDirectory = $WorkingDirectory
@@ -135,6 +144,8 @@ function Stop-TestProcesses {
 }
 
 function Remove-TestPayloadFiles {
+    # 预检失败时不知道程序真实锁位置，不进行历史测试目录的清理。
+    if (-not $script:KikTestLockPath) { return }
     if (-not (Test-Path -LiteralPath $RunDir)) { return }
     $fullRunDir = [IO.Path]::GetFullPath($RunDir)
     $transientPrefix = [IO.Path]::GetFullPath((Join-Path $Root "target\public-e2e")).TrimEnd('\', '/') +
@@ -142,8 +153,9 @@ function Remove-TestPayloadFiles {
     if (-not $fullRunDir.StartsWith($transientPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "拒绝清理约定临时目录外的验收文件: $fullRunDir"
     }
-    # 日志是验收证据，根目录中的上传、下载和 lock 文件只是可再生负载，不应长期占用空间。
+    # 只清理负载，保留配置指定的 Kik 单实例锁；锁在进程退出时释放，无需删除。
     Get-ChildItem -LiteralPath $fullRunDir -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not [string]::Equals($_.FullName, $script:KikTestLockPath, [StringComparison]::OrdinalIgnoreCase) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
     # 直启验收刻意不注入 REAL_CTRL_HTTP_LOCK_PATH，因此清理构建默认值在系统临时目录产生的锁文件。
     # 这里只删除当前通道的固定文件名，不扫描或递归清理系统临时目录。
@@ -152,12 +164,14 @@ function Remove-TestPayloadFiles {
 }
 
 function Invoke-ApiCommand {
-    param([hashtable]$Command, [string]$RequestId, [string]$Token)
-    $body = @{
+    param([hashtable]$Command, [string]$RequestId, [string]$Token, [string]$TargetKikId = '')
+    $request = @{
         version = 1
         request_id = $RequestId
         command = $Command
-    } | ConvertTo-Json -Depth 12 -Compress
+    }
+    if ($TargetKikId) { $request.target_kik_id = $TargetKikId }
+    $body = $request | ConvertTo-Json -Depth 12 -Compress
     Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$HttpPort/api/v1/commands" `
         -Headers @{ Authorization = "Bearer $Token" } -ContentType "application/json" -Body $body
 }
@@ -375,10 +389,13 @@ function Measure-NetworkBaseline {
     }
 }
 
+# 目录创建本身已经会写磁盘；先检查所有入口目录与报告文件，避免跟随已有目录联接。
+foreach ($path in @($ReportDir, $ReportPath, $RunDir, $LogDir)) {
+    [void](Assert-KikTestPathInProject $path $Root)
+}
 [IO.Directory]::CreateDirectory($ReportDir) | Out-Null
 [IO.Directory]::CreateDirectory($RunDir) | Out-Null
 [IO.Directory]::CreateDirectory($LogDir) | Out-Null
-Remove-TestPayloadFiles
 if (-not (Test-Path -LiteralPath $EnvPath)) { throw "缺少部署环境文件: $EnvPath" }
 if (-not (Test-Path -LiteralPath $KikReceipt)) { throw "缺少 ctrl_kik 构建回执: $KikReceipt" }
 Test-PortFree $HttpPort
@@ -404,6 +421,11 @@ $result = [ordered]@{
 }
 
 try {
+    $kikLock = Assert-KikTestLockLocation -ProjectRoot $Root -WorkingDirectory $RunDir `
+        -BinaryPath $KikExe -ReceiptPath $KikReceipt
+    $script:KikTestLockPath = $kikLock.resolved_path
+    $result.kik_lock = $kikLock
+    Remove-TestPayloadFiles
     Wait-TcpPort $environment["REAL_CTRL_SERVER_HOST"] $ExpectedKikNoisePort 15
     Wait-TcpPort $environment["REAL_CTRL_SERVER_HOST"] $ExpectedControlTlsPort 15
     $result.assertions += "Kik Noise 与 real_ctrl TLS 双公网端口可达"
@@ -443,11 +465,22 @@ try {
     Test-ControlRejectedOnKikPort
     $result.assertions += "Kik Noise 端口拒绝 real_ctrl TLS 角色"
 
-    $http = Start-TestProcess -Name "real-ctrl-http" -Path $HttpExe -WorkingDirectory $Root -Environment @{}
+    # 非默认端口的隔离验收只覆盖本地监听和锁路径；TLS、账号、凭据仍来自交付 EXE。
+    # 默认 9000 路径继续验证完全无运行环境覆盖的直启行为。
+    $httpEnvironment = @{}
+    if ($HttpPort -ne 9000) {
+        $httpEnvironment['REAL_CTRL_HTTP_PORT'] = "$HttpPort"
+        $httpEnvironment['REAL_CTRL_HTTP_LOCK_PATH'] = Join-Path $RunDir "http-$HttpPort.lock"
+    }
+    $http = Start-TestProcess -Name "real-ctrl-http" -Path $HttpExe -WorkingDirectory $Root -Environment $httpEnvironment
     Wait-TcpPort "127.0.0.1" $HttpPort 30
     $health = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:$HttpPort/api/health"
     if ($health -ne "OK") { throw "HTTP health 返回异常" }
-    $result.assertions += "real_ctrl EXE 无启动脚本/运行环境可直接连接，HTTP 健康检查通过"
+    $result.assertions += if ($HttpPort -eq 9000) {
+        "real_ctrl EXE 无启动脚本/运行环境可直接连接，HTTP 健康检查通过"
+    } else {
+        "real_ctrl EXE 使用内置部署身份，仅覆盖本地端口/锁路径，HTTP 健康检查通过"
+    }
 
     $unauthorized = $false
     try {
@@ -471,7 +504,7 @@ try {
     $malformedBodies = @(
         '{"version":1,"command":',
         '{"version":1,"request_id":"unknown","command":{"kind":"not_a_command"}}',
-        '{"version":1,"request_id":"unknown-field","command":{"kind":"sys_now","typo":true}}'
+        '{"version":1,"request_id":"unknown-field","command":{"kind":"local_now","typo":true}}'
     )
     foreach ($malformed in $malformedBodies) {
         $malformedResponse = Invoke-RawHttpRequest `
@@ -483,7 +516,7 @@ try {
             throw "发布态 HTTP 畸形输入未返回有界 4xx: $($malformedResponse.Status)"
         }
     }
-    $oversizedBody = '{"version":1,"request_id":"oversized","command":{"kind":"sys_now"},"padding":"' +
+    $oversizedBody = '{"version":1,"request_id":"oversized","command":{"kind":"local_now"},"padding":"' +
         ("x" * (1MB + 4096)) + '"}'
     $oversizedResponse = Invoke-RawHttpRequest `
         -Method "POST" `
@@ -503,21 +536,45 @@ try {
     if ($baseline.ok -and $baseline.data.items) {
         foreach ($item in $baseline.data.items) { $baselineIds[[string]$item.id] = $true }
     }
-    $beforeKikNow = Invoke-ApiCommand @{ kind = "sys_now" } "before-kik-now" $apiToken
-    $hadCurrentKik = $beforeKikNow.ok -and $null -ne $beforeKikNow.data.value.Kik
+    $beforeKikNow = Invoke-ApiCommand @{ kind = "local_now" } "before-kik-now" $apiToken
 
-    $kik = Start-TestProcess -Name "ctrl-kik" -Path $KikExe -WorkingDirectory $RunDir -Environment @{}
+    # 服务刚重启时其他机器也会重连，不能把“第一个新 ID”当成本轮进程。
+    # 展示名和随机文件只用于缩小范围；专属 TEMP 才能进一步区分同机旧进程的重连。
+    $ownershipName = 'ownership-' + [Guid]::NewGuid().ToString('N') + '.txt'
+    [IO.File]::WriteAllText((Join-Path $RunDir $ownershipName), 'public-e2e-owned', [Text.UTF8Encoding]::new($false))
+    $kikTemp = Join-Path $RunDir ('kik-temp-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($kikTemp) | Out-Null
+    $kik = Start-TestProcess -Name "ctrl-kik" -Path $KikExe -WorkingDirectory $RunDir -Environment @{TEMP=$kikTemp;TMP=$kikTemp;TMPDIR=$kikTemp}
     $selected = $null
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         Start-Sleep -Milliseconds 500
         $list = Invoke-ApiCommand @{ kind = "sys_list" } "list-$attempt" $apiToken
         if ($list.ok) {
-            $selected = @($list.data.items | Where-Object { -not $baselineIds.ContainsKey([string]$_.id) }) | Select-Object -First 1
-            if ($selected) { break }
+            $candidates = @($list.data.items | Where-Object {
+                $parts = ([string]$_.name).Split([char]92)
+                -not $baselineIds.ContainsKey([string]$_.id) -and $parts.Count -eq 3 -and
+                    [string]::Equals($parts[1], [Environment]::MachineName, [StringComparison]::OrdinalIgnoreCase) -and
+                    [string]::Equals($parts[2], [Environment]::UserName, [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($candidates.Count -gt 1) { throw '出现多个本机测试 Kik 候选，拒绝随机选择目标' }
+            if ($candidates.Count -eq 1) {
+                $candidate = $candidates[0]
+                $proof = Invoke-ApiCommand @{kind='ctrl_ls';path=$RunDir} "owned-directory-$attempt" $apiToken ([string]$candidate.id)
+                if ($proof.ok -and @($proof.data.entries | Where-Object filename -eq $ownershipName).Count -eq 1) {
+                    $processProof = Invoke-ApiCommand @{kind='exec';command='echo %TEMP%'} "owned-process-$attempt" $apiToken ([string]$candidate.id)
+                    if (-not $processProof.ok -or -not [string]::Equals(([string]$processProof.data.message).Trim(), $kikTemp, [StringComparison]::OrdinalIgnoreCase)) {
+                        throw '候选 Kik 的进程 TEMP 不属于本轮，拒绝向该实例发送测试任务'
+                    }
+                    $selected = $candidate
+                    break
+                }
+                throw "测试 Kik 无法证明本轮目录归属: $($proof | ConvertTo-Json -Depth 6 -Compress)"
+            }
         }
     }
     if (-not $selected) { throw "公网服务未发现本次启动的 ctrl_kik" }
     $kikId = [string]$selected.id
+    $result.test_kik = @{id=$kikId;name=[string]$selected.name;ownership_marker=$ownershipName;temp=$kikTemp}
     $result.assertions += "ctrl_kik 通过 Noise NK 接入公网服务"
 
     $history = Invoke-ApiCommand @{ kind = "sys_history"; kik_id = $kikId } "history-online" $apiToken
@@ -526,19 +583,17 @@ try {
     }
     $result.assertions += "sys_history 返回最近上线时间与在线状态"
 
-    if (-not $hadCurrentKik) {
-        $autoNow = Invoke-ApiCommand @{ kind = "sys_now" } "auto-now" $apiToken
-        if (-not ($autoNow.ok -and [string]$autoNow.data.value.Kik.id -eq $kikId)) {
-            throw "无当前目标时，新上线 Kik 未被自动选择"
-        }
-        $result.assertions += "无当前目标时自动选择新上线 Kik"
+    $afterKikNow = Invoke-ApiCommand @{ kind = "local_now" } "selection-after-new-kik" $apiToken
+    if (!$afterKikNow.ok -or ($afterKikNow.data.value | ConvertTo-Json -Compress -Depth 6) -ne ($beforeKikNow.data.value | ConvertTo-Json -Compress -Depth 6)) {
+        throw "Newly online Kik changed the controller-local selection"
     }
+    $result.assertions += "新 Kik 上线不会改动客户端已经完成的初始选择"
 
-    $use = Invoke-ApiCommand @{ kind = "sys_use"; kik_id = $kikId } "use" $apiToken
-    if (-not $use.ok) { throw "sys_use 失败: $($use.error.message)" }
-    $now = Invoke-ApiCommand @{ kind = "sys_now" } "now" $apiToken
-    if (-not $now.ok) { throw "sys_now 失败: $($now.error.message)" }
-    $result.assertions += "sys_list/sys_use/sys_now 通过"
+    $use = Invoke-ApiCommand @{ kind = "local_use"; kik_id = $kikId } "use" $apiToken
+    if (-not $use.ok) { throw "local_use 失败: $($use.error.message)" }
+    $now = Invoke-ApiCommand @{ kind = "local_now" } "now" $apiToken
+    if (-not $now.ok) { throw "local_now 失败: $($now.error.message)" }
+    $result.assertions += "sys_list/local_use/local_now 通过"
 
     $missingRemote = Join-Path $RunDir "missing-download-source.bin"
     $missingLocal = Join-Path $RunDir "missing-download-target.bin"
@@ -556,7 +611,11 @@ try {
     $listPath = Join-Path $RunDir "list-marker.txt"
     [IO.File]::WriteAllText($listPath, "public e2e", [Text.UTF8Encoding]::new($false))
     $ls = Invoke-ApiCommand @{ kind = "ctrl_ls"; path = $RunDir } "ls" $apiToken
-    if (-not ($ls.ok -and @($ls.data.entries).Count -gt 0)) { throw "ctrl_ls 失败" }
+    if (-not ($ls.ok -and @($ls.data.entries).Count -gt 0)) {
+        # 保留结构化业务错误，避免把协议拒绝、离线与目录权限问题都折叠成同一条失败。
+        $result.directory_failure = $ls
+        throw "ctrl_ls 失败: $($ls | ConvertTo-Json -Depth 6 -Compress)"
+    }
     $result.assertions += "目录读取通过"
 
     $exec = Invoke-ApiCommand @{ kind = "exec"; command = "echo public-e2e-ok" } "exec" $apiToken

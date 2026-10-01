@@ -16,6 +16,7 @@ use std::time::Duration;
 mod core;
 mod handler;
 mod logger;
+mod tasks;
 
 // build.rs 保证发布二进制自带可直启默认值；同名运行环境变量仍可用于部署轮换。
 const LOG_LEVEL: &str = env!("LOG_LEVEL");

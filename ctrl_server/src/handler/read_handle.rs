@@ -7,6 +7,9 @@ mod control;
 mod data;
 mod init;
 mod kik;
+mod task_binding;
+mod task_catalog;
+mod task_run;
 
 pub use control::handle_ctrl;
 pub use data::{handle_ctrl_data, handle_kik_data};

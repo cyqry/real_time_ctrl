@@ -1,0 +1,15 @@
+# 同步执行并返回程序输出。
+# 使用：把本文件和真实的 info.exe 放到服务器程序旁的 tasks/sync_output/。
+# PC 命令：$run sync_output；Android 中选择 sync_output 后确认执行。
+enabled = true
+binary = "info.exe"
+# 不写 file_name：Kik 保留原文件名 info.exe，并按该名称检查缓存的大小和 SHA-256。
+args = []
+mode = "sync"
+# 从进程启动后计时，超过 30 秒由 Kik 终止；应按程序实际耗时调整。
+timeout_seconds = 30
+
+[response]
+mode = "output"
+# 成功退出且程序没有输出时，才使用这条备用响应。
+default_content = "执行完成，程序没有输出"

@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio::{io, time};
 use tokio_stream::StreamExt;
@@ -186,10 +187,8 @@ async fn handle_transport_parts(
 
     let channel = channel_arc.clone();
 
-    let chan = channel.clone();
-    tokio::spawn(async move {
-        heartbeat(chan).await;
-    });
+    let mut heartbeat_task = JoinSet::new();
+    heartbeat_task.spawn(heartbeat(channel.clone()));
 
     let e = loop {
         // `FramedRead::next` 只有在整帧到齐后才返回。4 MiB 文件帧不能沿用控制通道的 45 秒
@@ -202,7 +201,12 @@ async fn handle_transport_parts(
         // 读锁必须在进入 match 前释放；否则后续调整 decoder 上限会再次锁同一个 FramedRead。
         let read_result = {
             let mut framed = framed_arc.lock().await;
-            timeout(frame_read_timeout, framed.next()).await
+            tokio::select! {
+                biased;
+                // 写端已不可用时不再等待读超时；即使 shutdown 卡住，也会在其有界收尾后退出。
+                _ = heartbeat_task.join_next() => break None,
+                result = timeout(frame_read_timeout, framed.next()) => result,
+            }
         };
 
         match read_result {
@@ -254,6 +258,8 @@ async fn handle_transport_parts(
             }
         };
     };
+    // 读循环先退出时也必须取消、回收心跳；JoinSet 还覆盖外层任务被取消的情况。
+    heartbeat_task.shutdown().await;
     let chan = channel.clone();
     if let Some(error) = e {
         handle_error(chan, error).await;
@@ -332,10 +338,14 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         // 初始化阶段不能发送业务帧；先等待角色确定，再按该角色选择心跳编码。
         time::sleep(Duration::from_secs(5)).await;
-        if channel.lock().await.is_closed() {
-            return;
-        }
-        let channel_type = channel.lock().await.channel_type;
+        let channel_type = {
+            let mut guard = channel.lock().await;
+            if guard.is_closed() {
+                guard.try_write_half_close().await;
+                return;
+            }
+            guard.channel_type
+        };
         let ping = match channel_type {
             ChannelType::Ctrl | ChannelType::CtrlData => Some(ctrl_ping()),
             ChannelType::Kik | ChannelType::KikData => Some(kik_ping()),
@@ -349,7 +359,7 @@ async fn heartbeat(channel: Arc<Mutex<Channel>>) {
         match channel.write_and_flush(&ping).await {
             Ok(_) => {}
             Err(_) => {
-                // 写侧已经确认不可用时主动 shutdown，使对端监督器尽快补建，也让本连接读循环收到 EOF。
+                // 尽力通知对端；本地读循环也监听心跳任务结束，不依赖对端一定返回 EOF。
                 channel.try_write_half_close().await;
                 break;
             }
@@ -396,12 +406,155 @@ async fn handle_read(
 
 #[cfg(test)]
 mod tests {
-    use super::is_tls_record_prefix;
+    use super::*;
+    use common::config::{Id, SecurityConfig};
+    use common::kik_info::KikInfo;
+    use common::message::init_frame::InitFrame;
+    use common::protocol::transfer_encode_frame;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskContext, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::sync::Notify;
 
     #[test]
     fn dedicated_tls_port_recognizes_client_hello() {
         assert!(is_tls_record_prefix(0x16));
         assert!(!is_tls_record_prefix(0));
         assert!(!is_tls_record_prefix(1));
+    }
+
+    /// 初始化响应成功后只让心跳写入失败；shutdown 始终 Pending，模拟加密层无法刷出收尾数据。
+    struct FailingHeartbeatWriter {
+        writes: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+        initialized: Arc<Notify>,
+        dropped: Arc<Notify>,
+    }
+
+    impl AsyncWrite for FailingHeartbeatWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.writes.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.initialized.notify_one();
+                Poll::Ready(Ok(bytes.len()))
+            } else {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for FailingHeartbeatWriter {
+        fn drop(&mut self) {
+            self.dropped.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_failure_releases_blocked_real_read_loop() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let initialized = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let (reader, mut peer) = tokio::io::duplex(1024);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let parts = TransportParts {
+            reader: Box::pin(reader),
+            writer: Box::pin(FailingHeartbeatWriter {
+                writes: writes.clone(),
+                shutdowns: shutdowns.clone(),
+                initialized: initialized.clone(),
+                dropped: dropped.clone(),
+            }),
+            local_addr: Ok(addr),
+            peer_addr: Ok(addr),
+        };
+        let config = Config {
+            id: Id::anonymous(),
+            server_host: String::new(),
+            server_port: String::new(),
+            read_timeout: Duration::from_secs(60),
+            write_timeout: Duration::from_millis(50),
+            security: SecurityConfig::kik(),
+        };
+        // 直接运行生产读循环；只替换传输字节流，不复制 select 或清理逻辑。
+        let mut connection = tokio::spawn(handle_transport_parts(
+            Context::init(),
+            config,
+            parts,
+            addr,
+            TransportPolicy::NoiseKik,
+        ));
+        peer.write_all(&transfer_encode_frame(InitFrame::KikReq(KikInfo {
+            id: None,
+            name: "heartbeat-regression".to_string(),
+        })))
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), initialized.notified())
+            .await
+            .expect("初始化响应应成功，随后读循环等待读取下一帧");
+        assert!(!connection.is_finished());
+
+        // 保持 peer 打开且不再发送。初始化原有 5 秒登记延迟，心跳也按 5+5 秒节奏运行，
+        // 故给首轮最多 15 秒并留调度余量；旧实现仍只能等待 60 秒读超时。
+        let result = timeout(Duration::from_secs(18), &mut connection).await;
+        if result.is_err() {
+            connection.abort();
+            let _ = connection.await;
+        }
+        result.expect("写心跳失败必须提前结束真实读循环").unwrap();
+        timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("inactive 收尾后必须释放故障 writer");
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert!(shutdowns.load(Ordering::SeqCst) >= 1);
+        assert!(peer.write_all(b"late-frame").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_closes_channel_after_cancelled_frame() {
+        let (writer, mut peer) = tokio::io::duplex(1);
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let channel = Arc::new(Mutex::new(Channel::new(
+            Box::pin(writer),
+            None,
+            ChannelType::CtrlData,
+            Ok(addr),
+            Ok(addr),
+        )));
+        {
+            let mut guard = channel.lock().await;
+            // duplex 只容纳一个字节，整帧写入会阻塞；外层 timeout 模拟业务 future 被取消。
+            assert!(timeout(
+                Duration::from_millis(20),
+                guard.write_and_flush(b"partial-frame")
+            )
+            .await
+            .is_err());
+            assert!(guard.is_closed());
+        }
+        timeout(Duration::from_secs(7), heartbeat(channel.clone()))
+            .await
+            .expect("已失效连接应在下一轮心跳有界关闭");
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(1), peer.read_to_end(&mut received))
+            .await
+            .expect("心跳关闭必须让对端读到 EOF，而不是只留下 closed 标志")
+            .unwrap();
+        assert_eq!(received, b"p");
+        assert!(channel.lock().await.is_closed());
     }
 }

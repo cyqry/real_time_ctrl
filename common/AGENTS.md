@@ -37,11 +37,13 @@
   凭据或 API token；用户要求单文件直启时，秘密只允许由确实需要它的 `real_ctrl` / `ctrl_server`
   以各自 `hidden!(env!(...))` 默认值持有，并由发布脚本审计原始明文。
 - 需要集中复用或调整的非秘密字符串统一维护在 `config.json`；nonce 必须绑定字段名和字段值，生成函数使用 `OnceLock` 缓存解密结果。
-- `RTC_CTRL_KIK_BUILD_LOCK_PATH` 只允许在构建时覆盖 `LOCK_FILE_PATH`，用于让仓库内 E2E 与用户
-  正在运行的 Kik 使用不同锁文件；ctrl_kik 运行时仍不得从环境变量替换锁路径。
+- `LOCK_FILE_PATH` 的唯一来源是本构建工作区的 `common/config.json`，构建期和运行时都不得通过环境变量或发布脚本覆盖。
+  自动测试使用仓库 `target` 下的独立源码副本和该副本的配置文件；不得临时修改原配置，也不得启动会写项目外锁路径的测试程序。
 - `common` 会被受保护 Kik 静态链接：除 `#[cfg(test)]` 测试数据和编译期路径外，运行时字符串都必须来自 `config.json` 或 `common::hidden!`；静态片段不得重新放回 `format!`、`anyhow!`、断言消息或 `io::Error` 明文字面量。
 - 字符串混淆 key 会进入二进制，只用于提高静态搜索成本，禁止复用于 TLS、认证、文件加密或业务数据保护。
 - `Channel` 的写入、flush 和 shutdown 必须受超时控制；业务 crate 不应自行绕过这些方法裸写。
+  写帧或 flush 被外层取消也必须保持不可复用，只有完整成功才能恢复可用；已关闭连接必须在触碰写端前拒写。
+  shutdown 使用独立的短收尾上限，不能沿用数据帧六分钟窗口；心跳结束必须唤醒读循环执行原连接清理。
 - 协议当前每帧都会 flush，`Channel` 不再套 `BufWriter`；若未来引入批量 flush，必须先证明不会增加命令延迟或破坏心跳时序。
 - `Channel` 的连接 ID 使用 `Option<String>` 表达初始化状态，禁止恢复 `undefined_id` 一类哨兵值或在读取未初始化 ID 时 panic。
 - 角色相关连接属性必须使用 `ChannelAttributeKey<T>` 和唯一非零数值 ID；禁止恢复字符串键或调用点手写 downcast。

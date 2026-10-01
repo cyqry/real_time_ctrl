@@ -4,11 +4,11 @@
 //! HTTP/管道直接构造这些类型，不受控制台按空白切分的表达能力限制。
 
 use anyhow::anyhow;
-use common::command::LocalCommand::LocalExit;
+use common::command::LocalCommand::{LocalExit, LocalNow as LocalNowCommand, LocalUse};
 use common::command::SysCommand::*;
 use common::command::{CtrlCommand, LocalCommand, SysCommand};
 use common::message::kik_cmd_resp_info;
-use ctrl_common::cmd_resp_info::{KikInfoVo, KikPresenceVo, SysNow};
+use ctrl_common::cmd_resp_info::{KikInfoVo, KikPresenceVo, LocalNow};
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,14 @@ pub enum InputCommand {
     Local(LocalCommand),
     Ctrl(InputCtrlCommand),
     Exec(String),
+    RunTask(String),
+}
+
+impl InputCommand {
+    /// 在任何磁盘预处理或网络等待之前固定目标；系统查询和本地选择不消费设备目标。
+    pub fn requires_target(&self) -> bool {
+        matches!(self, Self::Ctrl(_) | Self::Exec(_) | Self::RunTask(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +50,7 @@ pub enum RemoteSuccessResp {
     Ls(Vec<kik_cmd_resp_info::Ls>),
     SysList(Vec<KikInfoVo>),
     History(Vec<KikPresenceVo>),
-    Now(SysNow),
+    Now(LocalNow),
 }
 
 #[cfg(target_os = "windows")]
@@ -73,19 +81,31 @@ impl FromStr for InputCommand {
         if s.is_empty() {
             return Err(anyhow!("命令不能为空"));
         }
+        if matches!(s.split_whitespace().next(), Some("sys_use" | "sys_now")) {
+            return Err(anyhow!(
+                "sys_use/sys_now 已移除，请使用 $local_use/$local_now"
+            ));
+        }
         if let Some(command_body) = s.strip_prefix('$') {
             let parts: Vec<&str> = command_body.split_whitespace().collect();
 
             match parts.as_slice() {
-                ["sys_now"] => Ok(InputCommand::Sys(Now)),
+                ["run", name] if common::task::valid_task_name(name) => {
+                    Ok(InputCommand::RunTask((*name).to_owned()))
+                }
+                ["local_now"] => Ok(InputCommand::Local(LocalNowCommand)),
+                ["sys_now", ..] | ["sys_use", ..] => Err(anyhow!(
+                    "$sys_use/$sys_now 已移除，请使用 $local_use/$local_now"
+                )),
                 ["sys_list"] => Ok(InputCommand::Sys(List)),
                 ["sys_history"] => Ok(InputCommand::Sys(History(None))),
                 ["sys_history", value] => Ok(InputCommand::Sys(History(Some(
                     value.trim_matches('"').to_string(),
                 )))),
-                ["sys_use", value] => {
+                ["local_use", value] => {
                     let val = value.trim_matches('"').to_string();
-                    Ok(InputCommand::Sys(Use(val)))
+                    crate::local_target::validate_target_id(&val)?;
+                    Ok(InputCommand::Local(LocalUse(val)))
                 }
                 ["local_exit"] => Ok(InputCommand::Local(LocalExit)),
                 // CLI 按空白切分，带空格路径应通过 HTTP/pipe 结构化 API 传入。
@@ -140,12 +160,49 @@ fn unknown<T>(s: &str) -> anyhow::Result<T> {
 }
 
 #[test]
+fn local_selection_syntax_rejects_retired_server_commands() {
+    assert!(
+        matches!("$local_use kik-a".parse::<InputCommand>().unwrap(), InputCommand::Local(LocalUse(id)) if id == "kik-a")
+    );
+    assert!(matches!(
+        "$local_now".parse::<InputCommand>().unwrap(),
+        InputCommand::Local(LocalNowCommand)
+    ));
+    for input in [
+        "$sys_use A",
+        "$sys_now",
+        "$sys_use",
+        "$sys_now extra",
+        "sys_use A",
+        "sys_now",
+        "$local_use",
+        "$local_use a b",
+        "$local_now extra",
+    ] {
+        assert!(
+            input.parse::<InputCommand>().is_err(),
+            "{input} must never fall back to Exec"
+        );
+    }
+}
+
+#[test]
 fn parses_recursive_ls_command() {
     let command: InputCommand = "$ls sdfsdf -r".parse().unwrap();
     assert!(matches!(
         command,
         InputCommand::Ctrl(InputCtrlCommand::Ls(path)) if path == "sdfsdf -r"
     ));
+}
+
+#[test]
+fn run_accepts_one_task_name_without_dynamic_arguments() {
+    assert!(
+        matches!("$run task_A-1".parse::<InputCommand>().unwrap(), InputCommand::RunTask(name) if name == "task_A-1")
+    );
+    for input in ["$run", "$run ../task", "$run a b", "$run a.exe"] {
+        assert!(input.parse::<InputCommand>().is_err());
+    }
 }
 
 #[test]

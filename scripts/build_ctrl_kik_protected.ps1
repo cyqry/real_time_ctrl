@@ -17,6 +17,7 @@ $AuditScript = Join-Path $ScriptDir "audit_ctrl_kik_binary.ps1"
 $TargetDir = Join-Path $Root "target\ctrl-kik-protected"
 $Artifact = Join-Path $TargetDir "hardened\ctrl_kik.exe"
 $ReceiptPath = Join-Path $TargetDir "build-receipt.json"
+$CommonConfigPath = Join-Path $Root 'common\config.json'
 
 $ToolchainText = Get-Content -LiteralPath $ToolchainManifest -Raw -Encoding UTF8
 $ToolchainMatch = [regex]::Match($ToolchainText, '(?m)^\s*channel\s*=\s*"([^"]+)"')
@@ -50,6 +51,17 @@ try {
     }
     if (Test-Path -LiteralPath $Artifact) {
         Remove-Item -LiteralPath $Artifact -Force
+    }
+    # 锁路径只读取集中配置。记录构建输入摘要，禁止发布脚本改写用户选定的单实例边界。
+    $CommonConfigSha256 = (Get-FileHash -LiteralPath $CommonConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $CommonConfig = Get-Content -LiteralPath $CommonConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $ConfiguredLockPath = $CommonConfig.strings.LOCK_FILE_PATH
+    if ($ConfiguredLockPath -isnot [string] -or [string]::IsNullOrWhiteSpace($ConfiguredLockPath) -or
+        $ConfiguredLockPath.Contains([char]0)) {
+        throw 'common/config.json 中的 LOCK_FILE_PATH 必须是非空且无 NUL 的字符串'
+    }
+    if ((Get-FileHash -LiteralPath $CommonConfigPath -Algorithm SHA256).Hash -ne $CommonConfigSha256) {
+        throw '读取期间 common/config.json 已变化，请配置保存稳定后重新构建'
     }
     $Rustup = Get-Command rustup.exe -ErrorAction Stop
     $Installed = (& $Rustup.Source toolchain list) -join "`n"
@@ -143,9 +155,13 @@ try {
     # 防逆向验收只依赖可验证的内容最小化和 PE 缓解属性，不把代码签名误当作混淆能力。
     $FinalAuditJson = & $AuditScript -BinaryPath $Artifact
     $FinalAudit = $FinalAuditJson | ConvertFrom-Json
+    $CommonConfigSha256After = (Get-FileHash -LiteralPath $CommonConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($CommonConfigSha256After -ne $CommonConfigSha256) {
+        throw '构建期间 common/config.json 已变化，拒绝生成成功回执；请重新构建'
+    }
 
     $Receipt = [ordered]@{
-        schema_version = 4
+        schema_version = 5
         crate = "ctrl_kik"
         profile = "hardened-protected"
         toolchain = $Toolchain
@@ -158,6 +174,14 @@ try {
             port = if ($ServerPort -eq 0) { "config-default" } else { $ServerPort }
             channel = $BuildChannel
             kik_transport = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+            lock_file_path = $ConfiguredLockPath
+            lock_file_path_source = 'common/config.json'
+            config_sha256 = $CommonConfigSha256
+        }
+        config_integrity = [ordered]@{
+            sha256_before_build = $CommonConfigSha256
+            sha256_after_build = $CommonConfigSha256After
+            unchanged = $true
         }
         production_ready = $FinalAudit.passed -and $FinalAudit.full_project_plaintext_clean
         audit = $FinalAudit

@@ -33,6 +33,7 @@ fn network_parsers_reject_arbitrary_short_frames_without_panicking() {
         let _ = Dok::from_buf(bytes.clone());
         let _ = ReqCmd::from_buf(bytes.clone());
         let _ = Command::from_buf(bytes.clone());
+        let _ = common::task::TaskFrame::from_buf(bytes.clone());
 
         let mut decoder = LengthFieldBasedFrameDecoder::new_with_max_frame_len(1_024);
         let mut framed = bytes;

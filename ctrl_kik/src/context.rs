@@ -57,6 +57,8 @@ struct DataChan {
 #[derive(Clone)]
 /// 一条 Kik 主连接及其多条 KikData 连接。
 pub struct Kik {
+    /// 本轮主连接专有的短期任务数据绑定密钥，不写入磁盘。
+    pub task_key: [u8; 32],
     /// 主连接；清理时先从 Option 移出，再在锁外关闭。
     pub conn_op: Arc<RwLock<Option<Arc<Mutex<Channel>>>>>,
     /// 连接自身随机 ID 到写半连接的映射。
@@ -70,6 +72,7 @@ pub struct Kik {
 impl Kik {
     pub fn new(channel: Arc<Mutex<Channel>>) -> Self {
         Self {
+            task_key: common::task::random_key(),
             conn_op: Arc::new(RwLock::new(Some(channel))),
             data_conns: Arc::new(Mutex::new(HashMap::new())),
             data_connection_notify: Arc::new(Notify::new()),

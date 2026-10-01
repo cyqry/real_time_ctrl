@@ -50,6 +50,9 @@
   限制 HTTP。连接故障只允许单飞重连，已写出的命令不得自动重放。
 - 开放 API 的 `ctrl_get_big_file` 必须提供 `local_path` 并流式写入系统临时目录的随机 `.temp` 文件；禁止把大文件聚合为 HTTP/管道内存响应。
 - `$sys_history [kik_id]`、HTTP 与命名管道的 `sys_history` 必须共用服务层；返回服务端本进程观察到的最近上下线时间，不得伪装成跨重启持久历史。
+- 目标选择只保存在共享 `Context`，不放进会重建的 `Agent`。首次上下文初始化成功查询一次在线列表，选最近上线设备；空列表保持未选。后续上线、下线和重连不得自动换机。
+- CLI 使用 `$local_use`/`$local_now`，API 使用 `local_use`/`local_now`；旧 `sys_use`/`sys_now` 必须拒绝，不能降级成 Exec。local_now 仅返回本地选择快照，不宣称实时在线。
+- API 信封可传 `target_kik_id` 固定本次远端操作，不能改变本地选择；系统/本地命令带此字段必须拒绝。所有 Exec/Ctrl/RunTask 在入口快照一次 ID，早于文件预处理及任意网络等待；发帧必须为 `TargetedCmd`，缺目标立即失败，禁止服务端隐式选择或离线回退。
 - 大文件上传后台任务必须由当前命令持有 `JoinHandle`；服务端提前拒绝或连接失败时要 abort，不能污染下一条命令。
 - 上传数据任务必须等待 `Agent` 成功写出控制帧后才启动；该本地 oneshot 门禁不能提前触发，也不能改成额外网络往返。
 - 每个控制会话目标建立 3 条 CtrlData 连接；至少一条成功时允许降级运行。大文件使用最多 3 个在途分片逐帧轮询连接，接收端必须按地址范围支持乱序和完全重复帧。
@@ -67,6 +70,9 @@
   文件内容、Exec 命令、proof、nonce、session ID、token 或 secret。
 
 ## 测试要求
+
+- `$run task_name` 与 HTTP/pipe 的 run_task 共用服务端 Exec 授权；HTTP/pipe 另检查本地 API Exec 策略，CLI 保持既有入口语义。仅接受任务名，不接受调用者指定程序路径或临时参数。
+- 任务预算只允许为本次 RunTask 延长一次等待，最终响应仍按关联 ID 匹配；调用 future 取消时立即清理响应/预算路由。
 
 - 修改本地 API 后运行 `cargo check -p real_ctrl`，并优先补服务层单元测试。
 - 修改 `real_ctrl` 控制/数据通道握手后，运行根目录 `scripts/e2e_ctrl_stack.ps1` 验证 pinned TLS、HTTP API 和 `ctrl_kik` 转发链路。

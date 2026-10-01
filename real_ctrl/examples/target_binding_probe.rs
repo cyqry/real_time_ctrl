@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::BytesMut;
 use common::{
-    command::{Command, CtrlCommand, SysCommand},
+    command::{Command, CtrlCommand},
     config::Config,
     ltc_codec::{LengthFieldBasedFrameDecoder, CONTROL_MAX_FRAME_LENGTH},
     message::{
@@ -15,7 +15,7 @@ use common::{
     session_auth::{ctrl_auth_proof, random_nonce_hex},
 };
 use ctrl_common::{
-    cmd_resp_info::{ServerCapabilities, SysNow},
+    cmd_resp_info::ServerCapabilities,
     ctrl_frame::Frame,
     ctrl_resp::{CmdResp, Resp, ServerResp, ServerSuccessResp},
 };
@@ -157,16 +157,19 @@ async fn probe() -> Result<()> {
     client.capabilities().await?;
     let mut assertions = vec!["authenticated target-bound capability query"];
     if mode == "before" {
-        // 两个 Kik 有不同工作目录；cd 的结果证明真正执行请求的是目标 A/B，而非当前选择。
-        for (selected, target, expected) in [
-            (&target_b, &target_a, root.clone()),
-            (&target_a, &target_b, root.join("target/e2e/kik-b")),
+        // 服务端没有当前选择：缺 target 的远端操作必须拒绝，有 target 才能路由到对应设备。
+        assert_rejected(
+            &client
+                .request(None, Command::Exec("echo must-not-run".into()))
+                .await?,
+        )?;
+        assertions.push("remote operation without target is rejected");
+        // 同一个测试 Kik 在两个专属工作目录启动；用各自的 cd 结果证明目标没有串线。
+        // A 不再以仓库根目录运行，否则相对锁文件会落到源码目录。
+        for (target, expected) in [
+            (&target_a, root.join("target/e2e/kik-a")),
+            (&target_b, root.join("target/e2e/kik-b")),
         ] {
-            success_info(
-                &client
-                    .request(None, Command::Sys(SysCommand::Use(selected.clone())))
-                    .await?,
-            )?;
             let actual = success_info(
                 &client
                     .request(Some(target), Command::Exec("cd".into()))
@@ -174,19 +177,11 @@ async fn probe() -> Result<()> {
             )?;
             ensure!(
                 PathBuf::from(actual.trim()).canonicalize()? == expected.canonicalize()?,
-                "命令被错误地发往当前选择"
-            );
-            let now: SysNow = serde_json::from_str(&success_info(
-                &client.request(None, Command::Sys(SysCommand::Now)).await?,
-            )?)?;
-            ensure!(
-                matches!(now, SysNow::Kik(kik) if &kik.id == selected),
-                "显式目标命令不能改变会话默认选择"
+                "命令未发往显式指定的目标"
             );
         }
-        assertions.push(
-            "explicit A and B targets override the other current selection without changing it",
-        );
+        assertions
+            .push("explicit A and B targets route to their own Kik without server selection state");
         let path = root.join("target/e2e/directory with spaces 中文");
         let listing = success_info(
             &client
@@ -202,13 +197,6 @@ async fn probe() -> Result<()> {
         );
         assertions.push("target-bound directory preserves spaces and Unicode");
     } else if mode == "after" {
-        let now: SysNow = serde_json::from_str(&success_info(
-            &client.request(None, Command::Sys(SysCommand::Now)).await?,
-        )?)?;
-        ensure!(
-            matches!(now, SysNow::Kik(kik) if kik.id == target_b),
-            "故障后默认目标应为 B"
-        );
         let marker = root.join("target/e2e/unintended-target.txt");
         ensure!(!marker.exists(), "测试前意外执行标记必须不存在");
         let command = format!("echo unintended>\"{}\"", marker.display());

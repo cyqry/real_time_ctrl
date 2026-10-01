@@ -1,0 +1,17 @@
+# 同步执行，只在成功退出后返回固定文字。
+# 使用：把本文件和真实的 maintenance.exe 放到 tasks/sync_default/。
+# PC 命令：$run sync_default。
+enabled = true
+binary = "maintenance.exe"
+# 改变 Kik 上的执行文件名，不改变服务器上的二进制文件名。
+file_name = "maintenance_job.exe"
+# 参数逐项原样传给程序，不拼接 shell；--once 仅为示例，须按实际程序修改。
+# 不需要参数时改成 args = []。
+args = ["--once"]
+mode = "sync"
+timeout_seconds = 120
+
+[response]
+mode = "default"
+# 非零退出、超时或启动失败仍返回错误，不会用这条文字掩盖失败。
+default_content = "维护任务执行完成"

@@ -316,20 +316,14 @@ WantedBy=multi-user.target
 function Build-Stack {
     param($Identity)
     if ('ctrl_kik' -in $Selection.build) {
-        $previousKikLock = $env:RTC_CTRL_KIK_BUILD_LOCK_PATH
-        try {
-            # 发布产物使用工作目录中的锁文件，不能沿用开发机配置里的固定绝对路径。
-            $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = "ctrl_kik.lock"
-            & (Join-Path $ScriptDir "build_ctrl_kik_protected.ps1") `
-                -SkipToolchainInstall:$SkipToolchainInstall `
-                -ServerHost $ServerHost `
-                -ServerPort $KikNoisePort `
-                -BuildChannel $ChannelName `
-                -NoiseServerPublicKey $Identity.NoisePublic | Out-Null
-            Assert-LastExitCode "ctrl_kik 受保护构建失败"
-        } finally {
-            $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = $previousKikLock
-        }
+        # 单实例锁路径只由 common/config.json 决定；发布通道和外部环境均不能替换它。
+        & (Join-Path $ScriptDir "build_ctrl_kik_protected.ps1") `
+            -SkipToolchainInstall:$SkipToolchainInstall `
+            -ServerHost $ServerHost `
+            -ServerPort $KikNoisePort `
+            -BuildChannel $ChannelName `
+            -NoiseServerPublicKey $Identity.NoisePublic | Out-Null
+        Assert-LastExitCode "ctrl_kik 受保护构建失败"
         $receipt = Get-Content -LiteralPath $KikReceipt -Raw -Encoding UTF8 | ConvertFrom-Json
         if (-not $receipt.production_ready) { throw "ctrl_kik 二进制审计未达到 production_ready" }
     }
@@ -462,7 +456,10 @@ test "`$actual_hash" = "`$expected_hash"
 service_user=`$(stat -c '%U' /home/deploy)
 service_group=`$(stat -c '%G' /home/deploy)
 test "`$service_user" != 'root'
-sudo chown -R "`$service_user:`$service_group" "`$remote_dir"
+# tasks 由用户手动维护；发布仅创建缺失目录，绝不覆盖任务内容或递归重置其权限。
+mkdir -p "`$remote_dir/tasks"
+sudo chown "`$service_user:`$service_group" "`$remote_dir" "`$remote_dir/tasks" "`$candidate" "`$remote_dir/server.env" "`$remote_dir/ctrl_server.service.in"
+sudo chown -R "`$service_user:`$service_group" "`$remote_dir/identity" "`$remote_dir/logs"
 chmod 0750 "`$remote_dir" "`$remote_dir/identity" "`$remote_dir/logs"
 chmod 0755 "`$candidate"
 chmod 0600 "`$remote_dir/server.env" "`$remote_dir/identity/server.key"
@@ -615,6 +612,7 @@ try {
     }
     $runReport.success = $true
 } catch {
+    if ($runReport.public_tests -eq 'running') { $runReport.public_tests = 'failed' }
     $runReport.error = $_.Exception.Message
     throw
 } finally {

@@ -10,6 +10,10 @@ use std::time::SystemTime;
 pub struct ServerCapabilities {
     #[serde(default)]
     pub target_bound_command_v1: bool,
+    #[serde(default)]
+    pub task_run_v1: bool,
+    #[serde(default)]
+    pub task_list_v1: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,7 +44,8 @@ pub struct Screen {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum SysNow {
+/// 客户端进程内的当前目标快照；不是服务端会话状态或实时在线证明。
+pub enum LocalNow {
     Kik(KikInfoVo),
     None,
     NotOnline,

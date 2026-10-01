@@ -29,6 +29,7 @@ pub async fn execute(
     context: &Context,
     input_ctrl_cmd: InputCtrlCommand,
     origin_data: bool,
+    target: &str,
 ) -> anyhow::Result<RemoteResp> {
     if origin_data
         && matches!(
@@ -69,7 +70,10 @@ pub async fn execute(
     };
 
     let req_cmd = ReqCmd::new(id(), cmd_options, Command::Ctrl(cmd.clone()));
-    let response = match context.request_after_send(&req_cmd, transfer_start).await {
+    let response = match context
+        .request_after_send(&req_cmd, Some(target), transfer_start)
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             if let Some(task) = transfer_task {

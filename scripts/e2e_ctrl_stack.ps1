@@ -10,7 +10,11 @@ Add-Type -AssemblyName System.Net.Http
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir "..")).Path
+. (Join-Path $ScriptDir 'task_execution_checks.ps1')
+. (Join-Path $ScriptDir 'kik_test_fixture.ps1')
 $E2eDir = Join-Path $Root "target\e2e"
+$KikFixtureExe = Join-Path $E2eDir 'kik-fixture.exe'
+$script:KikFixtureEvidence = $null
 $CertDir = Join-Path $E2eDir "certs"
 $LogDir = Join-Path $E2eDir "logs"
 $ReportDir = Join-Path $Root "reports\e2e"
@@ -22,6 +26,12 @@ $RestrictedAccountSecret = "e2e-restricted-account-secret-0123456789abcdef"
 $SameAccountHttpPort = $HttpPort + 1
 $SecondAccountHttpPort = $HttpPort + 3
 
+# 创建目录、清理 trace 和写标记都是磁盘操作，必须先确认没有链接把这些路径引向项目外。
+foreach ($path in @($E2eDir, $CertDir, $LogDir, $ReportDir, $ReportPath,
+        (Join-Path $E2eDir 'ctrl_server_trace.log'), (Join-Path $E2eDir 'real_ctrl_trace.log'),
+        (Join-Path $E2eDir 'ctrl_ls_marker.txt'))) {
+    [void](Assert-KikFixturePath $path $Root)
+}
 New-Item -ItemType Directory -Force -Path $E2eDir, $CertDir, $LogDir, $ReportDir | Out-Null
 # Trace 使用追加写；每轮先删除旧文件，保证故障注入断言只统计本次运行产生的事件。
 Remove-Item -LiteralPath (Join-Path $E2eDir "ctrl_server_trace.log") -Force -ErrorAction SilentlyContinue
@@ -199,30 +209,39 @@ function Build-E2eBinaries {
     $previousKey = $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY
     $previousHost = $env:RTC_CTRL_KIK_BUILD_HOST
     $previousPort = $env:RTC_CTRL_KIK_BUILD_PORT
-    $previousLockPath = $env:RTC_CTRL_KIK_BUILD_LOCK_PATH
     try {
         # 公钥只在构建期进入 ctrl_kik；运行时不读取环境变量，也不接收服务端机器信息。
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $NoisePublicKey
         $env:RTC_CTRL_KIK_BUILD_HOST = "127.0.0.1"
         $env:RTC_CTRL_KIK_BUILD_PORT = "$KikNoisePort"
-        # 第二台真实 Kik 使用独立构建锁路径与工作目录；不能通过运行时开关改变 Kik 配置。
-        $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = Join-Path $E2eDir "ctrl_kik_b.lock"
-        & cargo build --locked -p ctrl_kik
-        Assert-CommandOk $LASTEXITCODE "Failed to build second E2E Kik"
-        Copy-Item -LiteralPath (Join-Path $Root "target\debug\ctrl_kik.exe") -Destination (Join-Path $E2eDir "ctrl_kik_b.exe") -Force
-        # E2E 使用仓库 target 下的独立锁文件，不能与用户正在运行的正式/灰度 Kik 互相排斥。
-        $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = Join-Path $E2eDir "ctrl_kik.lock"
-        & cargo build --locked -p ctrl_server -p ctrl_kik -p real_ctrl --bins
+        # 锁只读取 config.json。测试在项目 target 内复制源码并修改副本配置，原配置保持不动。
+        $script:KikFixtureEvidence = New-KikTestFixture -RepositoryRoot $Root -FixtureRoot (Join-Path $E2eDir 'kik-fixture')
+        & cargo build --locked --manifest-path (Join-Path $script:KikFixtureEvidence.workspace 'Cargo.toml') `
+            --target-dir $script:KikFixtureEvidence.cargo_target -p ctrl_kik
+        Assert-CommandOk $LASTEXITCODE "Failed to build isolated E2E Kik fixture"
+        [void](Assert-KikFixturePath $KikFixtureExe (Join-Path $Root 'target'))
+        Copy-Item -LiteralPath (Join-Path $script:KikFixtureEvidence.cargo_target 'debug/ctrl_kik.exe') -Destination $KikFixtureExe -Force
+        # 管理端及无常驻实例锁的测试 example 仍按原工作区构建，不替换正式配置的 Kik EXE。
+        & cargo build --locked -p ctrl_server -p real_ctrl --bins
         Assert-CommandOk $LASTEXITCODE "Failed to build E2E binaries"
         & cargo build --locked -p real_ctrl --example pipe_concurrency_probe
         Assert-CommandOk $LASTEXITCODE "Failed to build named-pipe concurrency probe"
         & cargo build --locked -p real_ctrl --example target_binding_probe
         Assert-CommandOk $LASTEXITCODE "Failed to build target-binding probe"
+        & cargo build --locked -p ctrl_kik --example task_fixture
+        Assert-CommandOk $LASTEXITCODE "Failed to build task fixture"
+        & cargo build --locked -p ctrl_kik --example task_binding_probe
+        Assert-CommandOk $LASTEXITCODE "Failed to build task binding network probe"
     } finally {
         $env:RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY = $previousKey
         $env:RTC_CTRL_KIK_BUILD_HOST = $previousHost
         $env:RTC_CTRL_KIK_BUILD_PORT = $previousPort
-        $env:RTC_CTRL_KIK_BUILD_LOCK_PATH = $previousLockPath
+        if ($null -ne $script:KikFixtureEvidence) {
+            $after = (Get-FileHash -LiteralPath $script:KikFixtureEvidence.source_config_path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $script:KikFixtureEvidence.source_config_sha256_after = $after
+            $script:KikFixtureEvidence.source_config_unchanged = $after -eq $script:KikFixtureEvidence.source_config_sha256_before
+            if (!$script:KikFixtureEvidence.source_config_unchanged) { throw 'E2E 构建期间原 config.json 发生变化，本轮验收无效。' }
+        }
     }
 }
 
@@ -668,6 +687,7 @@ try {
     $cert = New-E2eCertificate
     $noise = New-E2eNoiseIdentity
     Build-E2eBinaries -NoisePublicKey $noise.Public
+    $result.kik_fixture = $script:KikFixtureEvidence
     $result.tls_pin = $cert.Pin
 
     $accountsJson = @(
@@ -709,9 +729,13 @@ try {
         "CTRL_SERVER_ACCOUNTS_JSON_BASE64" = $accountsBase64
         "RUST_BACKTRACE" = "1"
     }
-    $kikEnv = @{ "LOG" = "DEBUG" }
+    $taskTempRoot = Join-Path $E2eDir 'task-temp'
+    [IO.Directory]::CreateDirectory($taskTempRoot) | Out-Null
+    $kikEnv = @{ "LOG" = "DEBUG"; 'TEMP' = $taskTempRoot; 'TMP' = $taskTempRoot }
     $realCtrlEnv = @{
         "REAL_CTRL_SERVER_HOST" = "127.0.0.1"
+        # 主实例也必须使用调用者指定的端口，否则自定义 HttpPort 时仍监听默认 9000。
+        "REAL_CTRL_HTTP_PORT" = "$HttpPort"
         "REAL_CTRL_TLS_PORT" = "$TlsPort"
         "REAL_CTRL_TLS_SERVER_NAME" = "real-ctrl-server"
         "REAL_CTRL_TLS_CA_CERT" = $cert.Cert
@@ -799,10 +823,6 @@ try {
     Assert-RealCtrlRejected -Name "real_ctrl_wrong_account_secret_probe" -EnvMap $wrongAccountEnv
     $result.assertions += "account identity is cryptographically bound to its own secret"
 
-    $kik = Start-E2eProcess -Name "ctrl_kik" -ExePath (Join-Path $Root "target\debug\ctrl_kik.exe") -EnvMap $kikEnv
-    $result.started += @{ name = "ctrl_kik"; pid = $kik.Proc.Id }
-    Start-Sleep -Seconds 2
-
     $realCtrl = Start-E2eProcess -Name "real_ctrl_invoker_http_service" -ExePath (Join-Path $Root "target\debug\real_ctrl_invoker_http_service.exe") -EnvMap $realCtrlEnv
     $result.started += @{ name = "real_ctrl_invoker_http_service"; pid = $realCtrl.Proc.Id }
     Wait-TcpPort -HostName "127.0.0.1" -Port $HttpPort -TimeoutSeconds 30
@@ -812,6 +832,15 @@ try {
         throw "Unexpected HTTP health response: $health"
     }
     $result.assertions += "real_ctrl http health ok"
+
+    # 先让客户端完成空列表初始化，再上线 Kik，验证不会发生延迟自动换机。
+    # 后面的两个新客户端会在 Kik 已就绪时启动，单独覆盖启动自动选择的正例。
+    $emptySelection = Invoke-ApiCommand -Command @{kind='local_now'} -RequestId 'startup-empty-selection'
+    if (!$emptySelection.ok -or $emptySelection.data.value -ne 'None') { throw 'Empty startup unexpectedly selected a Kik' }
+    $kikADirectory = Assert-KikFixturePath (Join-Path $E2eDir 'kik-a') (Join-Path $Root 'target')
+    [void][IO.Directory]::CreateDirectory($kikADirectory)
+    $kik = Start-E2eProcess -Name "ctrl_kik" -ExePath $KikFixtureExe -EnvMap $kikEnv -WorkingDirectory $kikADirectory
+    $result.started += @{ name = "ctrl_kik"; pid = $kik.Proc.Id }
 
     $unauthorizedOk = $false
     try {
@@ -874,7 +903,7 @@ try {
     $unknownField = Invoke-RawHttpRequest `
         -Method "POST" `
         -Path "/api/v1/commands" `
-        -Body '{"version":1,"request_id":"unknown-field","command":{"kind":"sys_now","typo":true}}' `
+        -Body '{"version":1,"request_id":"unknown-field","command":{"kind":"local_now","typo":true}}' `
         -Headers $authorizedHeaders
     $wrongMethod = Invoke-RawHttpRequest `
         -Method "GET" `
@@ -889,7 +918,7 @@ try {
     $unsupportedVersionBody = @{
         version = 65535
         request_id = "unsupported-version"
-        command = @{ kind = "sys_now" }
+        command = @{ kind = "local_now" }
     } | ConvertTo-Json -Compress
     $unsupportedVersion = Invoke-RawHttpRequest `
         -Method "POST" `
@@ -906,14 +935,14 @@ try {
     $nulRequestId = Invoke-RawHttpRequest `
         -Method "POST" `
         -Path "/api/v1/commands" `
-        -Body '{"version":1,"request_id":"safe\u0000forged","command":{"kind":"sys_now"}}' `
+        -Body '{"version":1,"request_id":"safe\u0000forged","command":{"kind":"local_now"}}' `
         -Headers $authorizedHeaders
     $nulEnvelope = $nulRequestId.Body | ConvertFrom-Json
     if ($nulRequestId.Status -ne 200 -or $nulEnvelope.ok -or $nulEnvelope.error.code -ne "bad_request") {
         throw "NUL request_id did not fail validation: $($nulRequestId.Body)"
     }
 
-    $oversizedBody = '{"version":1,"request_id":"oversized","command":{"kind":"sys_now"},"padding":"' +
+    $oversizedBody = '{"version":1,"request_id":"oversized","command":{"kind":"local_now"},"padding":"' +
         ("x" * (1MB + 4096)) + '"}'
     $oversized = Invoke-RawHttpRequest `
         -Method "POST" `
@@ -984,13 +1013,13 @@ try {
     }
     $result.assertions += "all initial CtrlData connections are forcibly disconnected while the main control session stays online"
 
-    $autoNow = Invoke-ApiCommand -Command @{ kind = "sys_now" } -RequestId "sys-now-auto"
+    $autoNow = Invoke-ApiCommand -Command @{ kind = "local_now" } -RequestId "sys-now-auto"
     if (-not ($autoNow.ok -and
-        $autoNow.data.kind -eq "sys_now" -and
-        [string]$autoNow.data.value.Kik.id -eq $kikId)) {
-        throw "First online Kik was not selected automatically: $($autoNow | ConvertTo-Json -Depth 12 -Compress)"
+        $autoNow.data.kind -eq "local_now" -and
+        $autoNow.data.value -eq 'None')) {
+        throw "Kik arriving after initialization changed local selection: $($autoNow | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $result.assertions += "first accessible online Kik is selected automatically"
+    $result.assertions += "empty startup stays unselected when a Kik arrives later"
 
     $history = Invoke-ApiCommand -Command @{ kind = "sys_history"; kik_id = $kikId } -RequestId "sys-history"
     if (-not ($history.ok -and $history.data.kind -eq "sys_history" -and $history.data.items.Count -eq 1 -and $history.data.items[0].online)) {
@@ -998,17 +1027,28 @@ try {
     }
     $result.assertions += "sys_history returns recent Kik online state"
 
-    $sysUse = Invoke-ApiCommand -Command @{ kind = "sys_use"; kik_id = $kikId } -RequestId "sys-use"
+    $sysUse = Invoke-ApiCommand -Command @{ kind = "local_use"; kik_id = $kikId } -RequestId "sys-use"
     if (-not ($sysUse.ok)) {
-        throw "sys_use failed: $($sysUse | ConvertTo-Json -Depth 12 -Compress)"
+        throw "local_use failed: $($sysUse | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $result.assertions += "sys_use selected ctrl_kik"
+    $result.assertions += "local_use selected ctrl_kik"
 
-    $sysNow = Invoke-ApiCommand -Command @{ kind = "sys_now" } -RequestId "sys-now"
+    $sysNow = Invoke-ApiCommand -Command @{ kind = "local_now" } -RequestId "sys-now"
     if (-not ($sysNow.ok)) {
-        throw "sys_now failed: $($sysNow | ConvertTo-Json -Depth 12 -Compress)"
+        throw "local_now failed: $($sysNow | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $result.assertions += "sys_now ok"
+    $result.assertions += "local_now ok"
+    foreach ($legacy in @('sys_use','sys_now')) {
+        $legacyCommand = if ($legacy -eq 'sys_use') { @{kind=$legacy;kik_id=$kikId} } else { @{kind=$legacy} }
+        $legacyBody = @{version=1;request_id="removed-$legacy";command=$legacyCommand} | ConvertTo-Json -Compress
+        $legacyReply = Invoke-RawHttpRequest -Method 'POST' -Path '/api/v1/commands' -Body $legacyBody -Headers $authorizedHeaders
+        # 未知命令种类由 Axum 的 Json 提取器拒绝；合法 JSON 的模式错误返回 422。
+        if ($legacyReply.Status -ne 422 -or $legacyReply.Body -notmatch 'unknown variant') {
+            throw "Removed API $legacy did not receive a schema rejection: HTTP $($legacyReply.Status)"
+        }
+    }
+    $result.assertions += 'removed sys_use/sys_now APIs are rejected as unknown variants (HTTP 422)'
+
 
     # 命名管道与 HTTP 共用 ApiRequest/ApiResponse 契约。畸形 magic 和声明超限长度必须
     # 返回结构化错误；随后同一管道入口仍应能执行合法请求。
@@ -1024,7 +1064,7 @@ try {
     $pipeJson = @{
         version = 1
         request_id = "pipe-valid-after-attacks"
-        command = @{ kind = "sys_now" }
+        command = @{ kind = "local_now" }
     } | ConvertTo-Json -Depth 8 -Compress
     [byte[]]$validPipePayload = [Text.Encoding]::UTF8.GetBytes("RTCAPI1`0$pipeJson")
     $validPipe = Invoke-PipePayload -Payload $validPipePayload
@@ -1062,9 +1102,9 @@ try {
     $result.started += @{ name = "real_ctrl_same_account_instance"; pid = $sameAccount.Proc.Id }
     Wait-TcpPort -HostName "127.0.0.1" -Port $SameAccountHttpPort -TimeoutSeconds 30
     $sameList = Invoke-ApiCommand @{ kind = "sys_list" } "same-account-list" $SameAccountHttpPort
-    $sameAutoNow = Invoke-ApiCommand @{ kind = "sys_now" } "same-account-auto-now" $SameAccountHttpPort
-    $sameUse = Invoke-ApiCommand @{ kind = "sys_use"; kik_id = $kikId } "same-account-use" $SameAccountHttpPort
-    $primaryStillAlive = Invoke-ApiCommand @{ kind = "sys_now" } "primary-after-secondary" $HttpPort
+    $sameAutoNow = Invoke-ApiCommand @{ kind = "local_now" } "same-account-auto-now" $SameAccountHttpPort
+    $sameUse = Invoke-ApiCommand @{ kind = "local_use"; kik_id = $kikId } "same-account-use" $SameAccountHttpPort
+    $primaryStillAlive = Invoke-ApiCommand @{ kind = "local_now" } "primary-after-secondary" $HttpPort
     if (-not ($sameList.ok -and
         $sameAutoNow.ok -and
         [string]$sameAutoNow.data.value.Kik.id -eq $kikId -and
@@ -1087,9 +1127,9 @@ try {
     $result.started += @{ name = "real_ctrl_second_account_instance"; pid = $secondAccount.Proc.Id }
     Wait-TcpPort -HostName "127.0.0.1" -Port $SecondAccountHttpPort -TimeoutSeconds 30
     $secondList = Invoke-ApiCommand @{ kind = "sys_list" } "second-account-list" $SecondAccountHttpPort
-    $secondAutoNow = Invoke-ApiCommand @{ kind = "sys_now" } "second-account-auto-now" $SecondAccountHttpPort
-    $secondUse = Invoke-ApiCommand @{ kind = "sys_use"; kik_id = $kikId } "second-account-use" $SecondAccountHttpPort
-    $secondNow = Invoke-ApiCommand @{ kind = "sys_now" } "second-account-now" $SecondAccountHttpPort
+    $secondAutoNow = Invoke-ApiCommand @{ kind = "local_now" } "second-account-auto-now" $SecondAccountHttpPort
+    $secondUse = Invoke-ApiCommand @{ kind = "local_use"; kik_id = $kikId } "second-account-use" $SecondAccountHttpPort
+    $secondNow = Invoke-ApiCommand @{ kind = "local_now" } "second-account-now" $SecondAccountHttpPort
     if (-not ($secondList.ok -and
         $secondAutoNow.ok -and
         [string]$secondAutoNow.data.value.Kik.id -eq $kikId -and
@@ -1217,7 +1257,7 @@ try {
     if ($burstWatch.ElapsedMilliseconds -ge 10000) {
         throw "Burst requests were queued instead of bounded: $($burstWatch.ElapsedMilliseconds) ms"
     }
-    $afterBurst = Invoke-ApiCommand -Command @{ kind = "sys_now" } -RequestId "after-burst"
+    $afterBurst = Invoke-ApiCommand -Command @{ kind = "local_now" } -RequestId "after-burst"
     if (-not $afterBurst.ok) {
         throw "HTTP control path did not recover after quota saturation"
     }
@@ -1231,7 +1271,7 @@ try {
     $stabilityCompleted = 0
     for ($batch = 0; $batch -lt 10; $batch++) {
         $batchResponses = Invoke-ParallelApiCommands `
-            -Commands @(0..9 | ForEach-Object { @{ kind = "sys_now" } }) `
+            -Commands @(0..9 | ForEach-Object { @{ kind = "local_now" } }) `
             -RequestIdPrefix "stability-$batch" `
             -TimeoutMilliseconds 10000
         for ($i = 0; $i -lt $batchResponses.Count; $i++) {
@@ -1343,10 +1383,10 @@ try {
     $result.assertions += "KikData supervisors recover from a complete data-pool outage before large-file transfer"
     $result.assertions += "CtrlData supervisors recover from a complete data-pool outage before large-file transfer"
 
-    $kikBDirectory = Join-Path $E2eDir 'kik-b'
+    $kikBDirectory = Assert-KikFixturePath (Join-Path $E2eDir 'kik-b') (Join-Path $Root 'target')
     New-Item -ItemType Directory -Force -Path $kikBDirectory | Out-Null
     Remove-Item -LiteralPath (Join-Path $E2eDir 'unintended-target.txt') -Force -ErrorAction SilentlyContinue
-    $kikB = Start-E2eProcess -Name 'ctrl_kik_b' -ExePath (Join-Path $E2eDir 'ctrl_kik_b.exe') -EnvMap $kikEnv -WorkingDirectory $kikBDirectory
+    $kikB = Start-E2eProcess -Name 'ctrl_kik_b' -ExePath $KikFixtureExe -EnvMap $kikEnv -WorkingDirectory $kikBDirectory
     $result.started += @{ name='ctrl_kik_b'; pid=$kikB.Proc.Id }
     $kikBId = $null
     for ($i=0; $i -lt 40; $i++) {
@@ -1383,17 +1423,33 @@ try {
     }
     $result.assertions += "sys_history records the real Kik offline transition"
 
-    $fallback = Invoke-ApiCommand -Command @{kind='sys_now'} -RequestId 'fallback-after-a-offline'
-    if (!$fallback.ok -or $fallback.data.value.Kik.id -ne $kikBId) { throw 'Original controller did not switch its default target to B' }
-    $result.assertions += 'original controller automatically selects B after A goes offline'
+    $fallback = Invoke-ApiCommand -Command @{kind='local_now'} -RequestId 'fallback-after-a-offline'
+    if (!$fallback.ok -or $fallback.data.value.Kik.id -ne $kikId) { throw 'Local selection changed after A went offline' }
+    $offlineCommand = Invoke-ApiCommand -Command @{kind='ctrl_ls';path='.'} -RequestId 'offline-a-does-not-reach-b'
+    if ($offlineCommand.ok) { throw 'Command for offline A unexpectedly succeeded on another device' }
+    $result.assertions += 'offline A remains locally selected; a subsequent command fails without falling back to B'
+    $useB = Invoke-ApiCommand -Command @{kind='local_use';kik_id=$kikBId} -RequestId 'explicit-local-b'
+    if (!$useB.ok) { throw 'Explicit local selection of B failed' }
+    $nowB = Invoke-ApiCommand -Command @{kind='local_now'} -RequestId 'after-explicit-b'
+    $stillA = Invoke-ApiCommand -Command @{kind='local_now'} -RequestId 'independent-secondary-a' -Port $SameAccountHttpPort
+    if ($nowB.data.value.Kik.id -ne $kikBId -or $stillA.data.value.Kik.id -ne $kikId) { throw 'Client-local selection crossed controller instances' }
+    $lsB = Invoke-ApiCommand -Command @{kind='ctrl_ls';path='.'} -RequestId 'explicit-b-command'
+    if (!$lsB.ok) { throw 'B did not execute after explicit local selection' }
+    $result.assertions += 'explicit local_use B succeeds and leaves another controller selected on A'
 
     $result.assertions += Assert-TargetBindingProbe -BaseEnvironment $realCtrlEnv -Phase after -TargetA $kikId -TargetB $kikBId
 
+    # 上面已验证各客户端的选择互不影响。任务回归需要两端都操作仍在线的 B，
+    # 因此这里显式切换第二个客户端；不能依赖已删除的服务端自动换机行为。
+    $secondaryUseB = Invoke-ApiCommand -Command @{kind='local_use';kik_id=$kikBId} -RequestId 'secondary-explicit-b-for-task-checks' -Port $SameAccountHttpPort
+    if (!$secondaryUseB.ok) { throw 'Secondary controller could not explicitly select B for task checks' }
+    $result.assertions += Invoke-TaskExecutionChecks -RepositoryRoot $Root -WorkRoot $E2eDir -SecondaryController $sameAccount -SecondaryPort $SameAccountHttpPort
     $result.success = $true
     $result.completed_at = (Get-Date).ToString("o")
     $result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $ReportPath -Encoding UTF8
     Write-Output ($result | ConvertTo-Json -Depth 12)
 } catch {
+    $result.kik_fixture = $script:KikFixtureEvidence
     $result.success = $false
     $result.error = $_.Exception.Message
     $result.completed_at = (Get-Date).ToString("o")

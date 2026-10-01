@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, timeout};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
@@ -97,11 +97,17 @@ pub async fn ctrl_data_conn(
     let context_clone = context.clone();
     let channel = channel_arc.clone();
     let handle = tokio::spawn(async move {
-        let heartbeat_task = tokio::spawn(heartbeat(channel.clone()));
+        let mut heartbeat_task = JoinSet::new();
+        heartbeat_task.spawn(heartbeat(channel.clone()));
         let error = loop {
             let read_result = {
                 let mut framed = framed_arc.lock().await;
-                timeout(DATA_CHANNEL_IO_TIMEOUT, framed.next()).await
+                tokio::select! {
+                    biased;
+                    // 写半边 shutdown 不保证对端及时关闭；心跳退出也必须唤醒本地监督器。
+                    _ = heartbeat_task.join_next() => break None,
+                    result = timeout(DATA_CHANNEL_IO_TIMEOUT, framed.next()) => result,
+                }
             };
             match read_result {
                 Ok(Some(Ok(msg))) => match handle_data_frame(&context_clone, msg).await {
@@ -113,8 +119,7 @@ pub async fn ctrl_data_conn(
                 Err(error) => break Some(error.into()),
             }
         };
-        heartbeat_task.abort();
-        let _ = heartbeat_task.await;
+        heartbeat_task.shutdown().await;
         if let Some(error) = error {
             handle_error(channel.clone(), error).await;
         }
@@ -156,17 +161,14 @@ async fn handle_data_frame(context: &Context, msg: BytesMut) -> anyhow::Result<(
 async fn heartbeat(channel: Arc<Mutex<Channel>>) {
     loop {
         time::sleep(Duration::from_secs(5)).await;
-        if channel.lock().await.is_closed() {
-            return;
-        }
-        let arc = channel.clone();
-        let mut guard = arc.lock().await;
-        if guard.channel_type != ChannelType::Unknown
-            && guard.write_and_flush(&ctrl_pong()).await.is_err()
+        let mut guard = channel.lock().await;
+        if guard.is_closed()
+            || (guard.channel_type != ChannelType::Unknown
+                && guard.write_and_flush(&ctrl_pong()).await.is_err())
         {
-            // 写失败后主动发送 FIN，使服务端和本地读循环尽快完成清理，缩短连接池缺口。
+            // 已有业务写失败或本次心跳失败都进入有界关闭，再结束读循环以触发补建。
             guard.try_write_half_close().await;
-            break;
+            return;
         }
     }
 }

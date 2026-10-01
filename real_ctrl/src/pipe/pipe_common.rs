@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn api_pipe_request_requires_magic() {
-        let req = ApiRequest::new(ApiCommand::SysNow {});
+        let req = ApiRequest::new(ApiCommand::LocalNow {});
         let bytes = serialize_api_request(&req).unwrap();
         let decoded = deserialize_pipe_request(&bytes).unwrap();
         assert_eq!(decoded.version, 1);

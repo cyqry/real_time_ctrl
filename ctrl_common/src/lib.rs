@@ -9,3 +9,4 @@ pub mod ctrl_protocol;
 pub mod ctrl_resp;
 pub mod entity;
 pub mod kik;
+pub mod task_catalog;

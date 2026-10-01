@@ -4,7 +4,7 @@
 //! 它们由 `real_ctrl::input_command` 单独维护。各变体中字符串的具体含义见根目录 `协议说明.md`。
 
 use crate::command::CtrlCommand::{GetBigFile, GetFile, Ls, Screen, SetBigFile, SetFile};
-use crate::command::SysCommand::{History, List, Use};
+use crate::command::SysCommand::{History, List};
 use crate::protocol::BufSerializable;
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,18 @@ pub enum Command {
     Sys(SysCommand),
     Ctrl(CtrlCommand),
     Exec(String),
+    /// 服务端目录中的命名任务；不接受程序路径和临时参数。
+    RunTask(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-/// 只在调用端进程内生效的生命周期命令，不参与 `BufSerializable`。
+/// 只在调用端进程内生效的命令，不参与 `BufSerializable`。
 pub enum LocalCommand {
     LocalExit,
+    /// 选择状态属于客户端；此操作不得编码成服务端选择命令。
+    LocalUse(String),
+    /// 查看本地保存的目标快照，不代表设备此刻仍在线。
+    LocalNow,
 }
 
 #[derive(Debug, Clone)]
@@ -44,8 +50,6 @@ pub enum CtrlCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SysCommand {
     List,
-    Use(String),
-    Now,
     /// 查询当前服务进程记录的最近上下线状态；`None` 返回全部有界历史。
     History(Option<String>),
 }
@@ -59,13 +63,6 @@ impl BufSerializable for Command {
                 match sys {
                     List => {
                         bytes_mut.put_u8(0);
-                    }
-                    Use(kik) => {
-                        bytes_mut.put_u8(1);
-                        bytes_mut.put_slice(kik.as_bytes())
-                    }
-                    SysCommand::Now => {
-                        bytes_mut.put_u8(2);
                     }
                     History(kik_id) => {
                         bytes_mut.put_u8(3);
@@ -123,6 +120,10 @@ impl BufSerializable for Command {
                 bytes_mut.put_u8(2);
                 bytes_mut.put_slice(e.as_bytes());
             }
+            Command::RunTask(name) => {
+                bytes_mut.put_u8(3);
+                bytes_mut.put_slice(name.as_bytes());
+            }
         };
         bytes_mut
     }
@@ -140,10 +141,8 @@ impl BufSerializable for Command {
                 let second_code = bys.get_u8();
                 match second_code {
                     0 if bys.is_empty() => Some(Command::Sys(List)),
-                    1 if !bys.is_empty() && bys.len() <= MAX_KIK_ID_BYTES => {
-                        Some(Command::Sys(Use(String::from_utf8(bys.to_vec()).ok()?)))
-                    }
-                    2 if bys.is_empty() => Some(Command::Sys(SysCommand::Now)),
+                    // 旧服务端选择命令的 1/2 编号永久保留；拒绝旧请求，不能复用为其他操作。
+                    1 | 2 => None,
                     3 => {
                         if bys.is_empty() {
                             return None;
@@ -246,6 +245,10 @@ impl BufSerializable for Command {
                 }
             }
             2 if !bys.is_empty() => Some(Command::Exec(String::from_utf8(bys.to_vec()).ok()?)),
+            3 => {
+                let name = String::from_utf8(bys.to_vec()).ok()?;
+                crate::task::valid_task_name(&name).then_some(Command::RunTask(name))
+            }
             _ => None,
         }
     }
@@ -286,4 +289,32 @@ fn sys_history_round_trip_and_rejects_invalid_presence_flag() {
 
     let mut invalid = BytesMut::from(&[0_u8, 3, 2][..]);
     assert!(Command::from_buf(invalid.split()).is_none());
+}
+
+#[test]
+fn removed_server_selection_opcodes_are_never_accepted() {
+    for old_command in [&[0_u8, 1, b'a'][..], &[0_u8, 2][..]] {
+        assert!(Command::from_buf(BytesMut::from(old_command)).is_none());
+    }
+}
+
+#[test]
+fn run_task_has_its_own_opcode_and_rejects_non_names() {
+    let encoded = Command::RunTask("task_A-1".into()).to_buf();
+    assert_eq!(encoded[0], 3);
+    assert!(
+        matches!(Command::from_buf(encoded), Some(Command::RunTask(name)) if name == "task_A-1")
+    );
+    for name in [
+        "",
+        "../task",
+        "task.exe",
+        "task arg",
+        "task\0hidden",
+        "任务",
+    ] {
+        assert!(Command::from_buf(Command::RunTask(name.into()).to_buf()).is_none());
+    }
+    assert!(Command::from_buf(Command::RunTask("a".repeat(65)).to_buf()).is_none());
+    assert!(Command::from_buf(Command::RunTask("a".repeat(64)).to_buf()).is_some());
 }

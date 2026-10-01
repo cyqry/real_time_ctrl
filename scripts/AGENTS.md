@@ -1,5 +1,10 @@
 # 发布与验收脚本维护规则
 
+## Kik 部署规范入口
+
+- 构建、归档、保留或分发 Kik 时遵循 [Kik 端程序通用规范](../Kik端程序规范.md)，具体入口见 [ctrl_kik 部署适配说明](../ctrl_kik/部署规范.md)。
+  修改脚本不得扩大 Kik 获知的远端信息、引入运行时配置覆盖或绕过对应产物审计。
+
 ## 文件边界
 
 - `target/` 只放 Cargo 中间产物和一次性测试工作文件，必须允许用户随时整目录删除。
@@ -11,6 +16,8 @@
 ## 构建
 
 - `ctrl_kik` 必须调用 `build_ctrl_kik_protected.ps1`，并检查 receipt 的 `production_ready=true`。
+- Kik 单实例锁路径仅来自 `common/config.json`，发布脚本禁止覆盖。回执记录实际配置来源与锁路径；自动测试启动前检查锁文件位于项目内。
+  本地多实例 E2E 使用独立测试源码副本的配置文件，原仓库配置不得为测试临时改写；测试副本不可混入发布 artifact。
 - `real_ctrl` 和 `ctrl_server` 使用 `production` profile，保留 PDB/DWARF；服务端必须通过 `cross` 构建 musl 目标。
 - 构建 ctrl_server 时必须先以 `docker info` 校验 Docker；跳过服务端时不要求 Docker，也不连接远端。
 - 普通发布必须运行 `audit_production_dependencies.ps1`。Cargo.lock 中只属于冻结 `start` 或

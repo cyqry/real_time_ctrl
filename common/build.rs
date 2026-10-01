@@ -1,3 +1,6 @@
+//! 将集中配置中的非秘密字符串加密后写入 Cargo OUT_DIR，供各 crate 编译进单文件程序。
+//! 仅允许发布脚本覆盖连接所需的公开部署参数，单实例锁路径始终来自 config.json。
+
 #[path = "string_obfuscation_key.rs"]
 mod key_material;
 
@@ -21,7 +24,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_HOST");
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_PORT");
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_CHANNEL");
-    println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_BUILD_LOCK_PATH");
     println!("cargo:rerun-if-env-changed=RTC_CTRL_KIK_NOISE_SERVER_PUBLIC_KEY");
 
     let config_content =
@@ -58,6 +60,7 @@ fn main() {
 
 /// 发布脚本只通过构建期环境变量覆盖 ctrl_kik 的公开部署参数。Cargo 会追踪这些变量，
 /// 因此不同灰度/正式构建不会错误复用旧缓存；认证秘密和服务端私钥绝不能进入这里。
+/// LOCK_FILE_PATH 不提供覆盖入口：普通构建、测试和发布都以 config.json 为唯一来源。
 fn apply_build_overrides(strings: &mut BTreeMap<String, String>) {
     apply_override(strings, "RTC_CTRL_KIK_BUILD_HOST", "HOST", |value| {
         !value.is_empty()
@@ -80,12 +83,6 @@ fn apply_build_overrides(strings: &mut BTreeMap<String, String>) {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         },
-    );
-    apply_override(
-        strings,
-        "RTC_CTRL_KIK_BUILD_LOCK_PATH",
-        "LOCK_FILE_PATH",
-        |value| value.len() <= 1024 && !value.contains('\0'),
     );
     apply_override(
         strings,

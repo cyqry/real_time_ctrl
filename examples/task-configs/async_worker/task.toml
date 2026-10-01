@@ -1,0 +1,17 @@
+# 异步执行：只等待操作系统成功创建进程，不等待程序结束。
+# 使用：本文件放到 tasks/async_worker/task.toml，程序放到 tasks/async_worker/bin/worker.exe。
+# PC 命令：$run async_worker；Android 同样选择该任务并确认执行。
+enabled = true
+# binary 相对于本任务目录，使用 / 表示子目录。
+binary = "bin/worker.exe"
+# Kik 执行和缓存检查都使用这个最终名称；删除本行则保留 worker.exe。
+file_name = "report_worker.exe"
+# --once 仅为示例参数，须按程序实际支持的参数修改；无参数时使用 []。
+args = ["--once"]
+mode = "async"
+# 异步任务必须省略 timeout_seconds，不能写成 0，也不支持 output 响应。
+
+[response]
+mode = "default"
+# 这条响应仅表示已启动，不代表程序已完成或业务处理成功。
+default_content = "任务已启动"
