@@ -1,1 +1,3 @@
 cargo.exe build --bin real_ctrl_invoker_http_service --profile release --manifest-path D:\Code\Rust\my\real_time_ctrl\real_ctrl\Cargo.toml
+
+cross +1.90.0 build --release -p ctrl_server --target x86_64-unknown-linux-musl

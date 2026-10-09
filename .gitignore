@@ -6,3 +6,4 @@ rust-toolchain.toml
 Cargo.lock
 **/Cargo.lock
 **/encrypted_strings.rs
+SSHTOOL_AI_MANUAL.md
